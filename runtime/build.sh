@@ -27,7 +27,11 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -Wl,--export=lerrlen -Wl,--export=lerrcopy -Wl,--export=linbuf \
   -Wl,--export=lnamebuf -Wl,--export=lmalloctest -Wl,--export=ldiag_newstate \
   -Wl,--export=ldiag_openlibs -Wl,--export=ldiag_shims -Wl,--export=ldiag_stage \
-  -Wl,--export=ldiag_lstate -Wl,--export=ldiag_sj"
+  -Wl,--export=ldiag_lstate -Wl,--export=ldiag_sj \
+  -Wl,--export=rt_abi_version -Wl,--export=rt_set_state -Wl,--export=rt_mknumber \
+  -Wl,--export=rt_mkbool -Wl,--export=rt_mknil -Wl,--export=rt_intern \
+  -Wl,--export=rt_newtable -Wl,--export=rt_gettable -Wl,--export=rt_settable \
+  -Wl,--export=rt_err_pending -Wl,--export=rt_err_clear -Wl,--export=rt_err_stage_copy"
 
 # ---- lua51_sjlj.wasm: native EH setjmp, runs on wasmtime ----
 
@@ -38,7 +42,7 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -lsetjmp \
   $EXPORTS \
   -Wl,-z,stack-size=8388608 -Wl,--strip-all \
-  -o lua51_sjlj.wasm luawasm.c $SRC
+  -o lua51_sjlj.wasm luawasm.c rt_abi.c $SRC
 
 # ---- asyncify variants (documentation path; wazero-compatible) ----
 

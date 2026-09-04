@@ -58,6 +58,11 @@ type importFunc struct {
 
 type limitsDecl struct{ min, max uint32 } // max==0 means unbounded
 
+type importMem struct {
+	module, name string
+	limits       limitsDecl
+}
+
 type globalDecl struct {
 	typ     ValueType
 	mutable bool
@@ -93,6 +98,7 @@ type Module struct {
 	types    []funcType
 	typeIdx  map[string]uint32
 	imports  []importFunc
+	imem     *importMem
 	nImports uint32 // number of imported functions
 	funcs    []*Function
 	table    *limitsDecl
@@ -152,6 +158,13 @@ func (m *Module) NewFunction(params, results []ValueType) *Function {
 	return f
 }
 
+// ImportMemory imports linear memory from another module instance. An
+// imported memory is memory 0: data segments and load/store instructions
+// address it; Data() requires either this or a declared Memory.
+func (m *Module) ImportMemory(module, name string, min, max uint32) {
+	m.imem = &importMem{module, name, limitsDecl{min, max}}
+}
+
 // Table declares the (single) funcref table. max==0 means unbounded.
 func (m *Module) Table(min, max uint32) { m.table = &limitsDecl{min, max} }
 
@@ -190,9 +203,9 @@ func (m *Module) Element(offset uint32, funcs ...uint32) {
 }
 
 // Data appends an active data segment (memory 0) at offset. The bytes are
-// copied; declaring data requires Memory to be declared.
+// copied; declaring data requires an imported or declared Memory.
 func (m *Module) Data(offset uint32, b []byte) {
-	if m.memory == nil {
+	if m.memory == nil && m.imem == nil {
 		panic("wasm: Data segment requires a declared Memory")
 	}
 	m.datas = append(m.datas, dataSegment{offset, append([]byte(nil), b...)})
@@ -248,14 +261,24 @@ func (m *Module) Encode() []byte {
 	}
 
 	// 2 Import
-	if len(m.imports) > 0 {
+	if len(m.imports) > 0 || m.imem != nil {
+		n := uint32(len(m.imports))
+		if m.imem != nil {
+			n++
+		}
 		var c []byte
-		c = AppendU32(c, uint32(len(m.imports)))
+		c = AppendU32(c, n)
 		for _, im := range m.imports {
 			c = AppendName(c, im.module)
 			c = AppendName(c, im.name)
 			c = append(c, 0x00) // func import
 			c = AppendU32(c, im.typeIdx)
+		}
+		if m.imem != nil {
+			c = AppendName(c, m.imem.module)
+			c = AppendName(c, m.imem.name)
+			c = append(c, 0x02) // memory import
+			c = appendLimits(c, m.imem.limits.min, m.imem.limits.max)
 		}
 		out = appendSection(out, 2, c)
 	}
@@ -279,7 +302,11 @@ func (m *Module) Encode() []byte {
 		out = appendSection(out, 4, c)
 	}
 
-	// 5 Memory
+	// 5 Memory (an imported memory satisfies the requirement; a module
+	// may have only one memory, imported or declared, never both)
+	if m.imem != nil && m.memory != nil {
+		panic("wasm: both imported and declared memory")
+	}
 	if m.memory != nil {
 		var c []byte
 		c = AppendU32(c, 1)

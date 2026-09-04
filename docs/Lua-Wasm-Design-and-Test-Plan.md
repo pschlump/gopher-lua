@@ -353,6 +353,8 @@ The differential harness logs an opcode histogram per script (interpreter side).
 
 ## 9. Milestones — each with a hard test gate
 
+> **Status (2026-09-03): M0 complete.** `wasm/` package (wasm.go, instr.go, leb128.go — 685 lines source + 566 lines tests), wazero v1.12.0 as test-only dependency. Gates: 13 tests green (LEB128 spec vectors, section-framing walk, golden-bytes stability, and wazero execution of arith/loop/br_table/memory+data/call/call_indirect/globals/host-roundtrip); `wasm2wat` (wabt 1.0.41) validates emitted modules. M0 open questions answered on darwin/arm64 (M4 Max): instantiation ≈ **7.4 µs** (compiled module) / 8.3 µs compile+instantiate for a tiny module → **fresh-instance-per-run is viable** (v1 lifecycle decision); exported-call overhead ≈ **21 ns**; wasm recursion reached the **2,000,000-frame safety cap without trapping** (re-probe on linux/compiler engine at M3 — darwin/arm64 uses wazero's interpreter engine, so these numbers are the conservative case).
+
 | M | Deliverable | Gate (tests that must be green) | Est. |
 |---|---|---|---|
 | **M0** | Spike: `wasm/` emitter core (sections, LEB128, mov/arith/branch/call), host↔guest roundtrip on wazero | Emitter micro-modules execute correctly on wazero; `wasm2wat` validates; round-trip byte-identical | 1 wk |

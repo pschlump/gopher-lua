@@ -26,10 +26,12 @@ func main() {
 	var engines []testdiff.Engine
 	for i, name := range strings.Split(*enginesFlag, ",") {
 		switch name {
+		case "clua":
+			engines = append(engines, testdiff.NewCLua(fmt.Sprintf("clua-%c", 'a'+i)))
 		case "interp":
 			engines = append(engines, testdiff.NewInterp(fmt.Sprintf("interp-%c", 'a'+i)))
 		default:
-			fmt.Fprintf(os.Stderr, "unknown engine %q (known: interp)\n", name)
+			fmt.Fprintf(os.Stderr, "unknown engine %q (known: interp, clua)\n", name)
 			os.Exit(2)
 		}
 	}

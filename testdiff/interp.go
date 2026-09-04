@@ -44,8 +44,12 @@ func (e *Interp) Run(c Case) []string {
 	})
 	defer L.Close()
 	installShim(L, emit)
-	const tmpName = "testdiff.tmp"
-	defer os.Remove(filepath.Join(c.Dir, tmpName))
+	defer func() {
+		matches, _ := filepath.Glob(filepath.Join(c.Dir, "testdiff.tmp.*"))
+		for _, m := range matches {
+			os.Remove(m)
+		}
+	}()
 
 	fn, err := L.Load(strings.NewReader(string(c.Source)), c.Name)
 	if err != nil {
@@ -158,11 +162,13 @@ func installShim(L *lua.LState, emit func(event, payload string)) {
 	L.SetField(L.GetGlobal("math"), "random", L.NewFunction(mathRandom))
 	L.SetField(L.GetGlobal("math"), "randomseed", L.NewFunction(mathRandomseed))
 
-	// os.tmpname: fixed relative name (real tmpname embeds a process-unique
-	// path); the engine removes the file after the run.
-	const tmpName = "testdiff.tmp"
+	// os.tmpname: unique per call (files.lua renames tmpname() A to
+	// tmpname() B — a constant would rename onto itself), deterministic
+	// per run; the engine removes the leftovers after the run.
+	tmpCounter := 0
 	L.SetField(L.GetGlobal("os"), "tmpname", L.NewFunction(func(L *lua.LState) int {
-		L.Push(lua.LString(tmpName))
+		tmpCounter++
+		L.Push(lua.LString(fmt.Sprintf("testdiff.tmp.%d", tmpCounter)))
 		return 1
 	}))
 }

@@ -3,6 +3,7 @@ module github.com/pschlump/gopher-lua
 go 1.27.0
 
 require (
+	github.com/bytecodealliance/wasmtime-go/v48 v48.0.0
 	github.com/chzyer/readline v1.5.1
 	github.com/tetratelabs/wazero v1.12.0
 )

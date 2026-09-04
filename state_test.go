@@ -510,7 +510,7 @@ func TestRegistryFixedOverflow(t *testing.T) {
 		rcv := recover()
 		if rcv != nil {
 			if expectedPanic {
-				errorIfFalse(t, rcv.(error).Error() != "registry overflow", "expected registry overflow exception, got "+rcv.(error).Error())
+				errorIfFalse(t, rcv.(error).Error() != "registry overflow", "expected registry overflow exception, got %s", rcv.(error).Error())
 			} else {
 				t.Errorf("did not expect registry overflow")
 			}
@@ -530,7 +530,7 @@ func TestRegistryAutoGrow(t *testing.T) {
 		rcv := recover()
 		if rcv != nil {
 			if expectedPanic {
-				errorIfFalse(t, rcv.(error).Error() != "registry overflow", "expected registry overflow exception, got "+rcv.(error).Error())
+				errorIfFalse(t, rcv.(error).Error() != "registry overflow", "expected registry overflow exception, got %s", rcv.(error).Error())
 			} else {
 				t.Errorf("did not expect registry overflow")
 			}

@@ -50,7 +50,7 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 		cf.Pc++
 		select {
 		case <-L.ctx.Done():
-			L.RaiseError(L.ctx.Err().Error())
+			L.RaiseError("%s", L.ctx.Err().Error())
 			return
 		default:
 			if jumpTable[int(inst>>26)](L, inst, baseframe) == 1 {
@@ -921,8 +921,8 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
 			return numberArith(L, opcode, LNumber(v1), LNumber(v2))
 		}
 	}
-	L.RaiseError(fmt.Sprintf("cannot perform %v operation between %v and %v",
-		strings.TrimLeft(event, "_"), lhs.Type().String(), rhs.Type().String()))
+	L.RaiseError("cannot perform %v operation between %v and %v",
+		strings.TrimLeft(event, "_"), lhs.Type().String(), rhs.Type().String())
 
 	return LNil
 }

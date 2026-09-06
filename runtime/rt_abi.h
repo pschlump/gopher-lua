@@ -34,14 +34,25 @@
 
 #define LUA_RT_ABI 1
 
+/* rt_addr: the pointer-carrying parameter type. On wasm32 it is i32 —
+   this IS the frozen ABI. The native test build (RT_ABI_NATIVE64)
+   compiles the same logic with pointer-width addressing to validate
+   semantics on a 64-bit host. */
+#ifdef RT_ABI_NATIVE64
+typedef long long rt_addr;
+#else
+typedef int32_t rt_addr;
+#endif
+
 /* statuses (i32 return of every rt_*) */
 #define RT_OK 0
 #define RT_ERR 1 /* error staged; see rt_err_len/rt_err_copy/rt_err_clear */
 
 /* frozen Lua 5.1 type tags as stored in TValue.tt (lobject.h) */
 #define RT_TNIL 0
-#define RT_TFALSE 1
-#define RT_TTRUE (1 | 64)
+/* booleans are NOT collectable: tt is LUA_TBOOLEAN(1) for both, and the
+   truth lives in value.b (the low 4 bytes at offset 0) */
+#define RT_TBOOL 1
 #define RT_TNUMBER 3
 #define RT_TSTRING (4 | 64)
 #define RT_TTABLE (5 | 64)
@@ -57,5 +68,6 @@
 #define RT_OP_DIV 18
 #define RT_OP_MOD 19
 #define RT_OP_POW 20
+#define RT_OP_UNM 21
 
 #endif /* RT_ABI_H */

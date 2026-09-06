@@ -28,3 +28,40 @@
 
   Everything is in the plan doc's M3 status note and project memory. Worth noting: this was the last milestone gate that could change the ABI's shape — everything from M4 onward is filling in a
   proven structure. Next session picks up the remaining rt_* surface and the native tests.
+
+
+---
+
+
+⏺ M3 complete. The session's final state:
+
+  What's now in place
+
+  The full rt_* ABI — runtime/rt_abi.h (the frozen LUA_RT_ABI=1 contract) and runtime/rt_abi.c (24 exports compiled into
+  lua51_sjlj.wasm): value construction, intern, newtable, protected gettable/settable, all seven arith ops (with string coercion and
+  metamethods), len, eq/lt/le, concat, rt_call — the universal call fallback where the runtime's lvm interprets Lua closures and C
+  functions run directly — forprep, error raise, frame allocation, and the complete error-staging protocol with script:LINE: prefixes
+  applied in the buffer.
+
+  Three independent gates, all green:
+  - runtime/tests/run.sh — native unit tests PASS on plain, ASan, and UBSan (the plan's L1/L2 runtime gate)
+  - TestRTSeamSmoke — an emitted module drives the real ABI against the real C runtime through shared memory (the M3 milestone
+    validation)
+  - M1 self-diff, M2 conformance (100%), M0 emitter gates — all unaffected; full go test ./... green
+
+  The debugging haul (now ABI documentation)
+
+  Getting the seam green surfaced six real contract-level lessons, each recorded in the plan doc: luaV_tonumber returns a value
+  pointer, not a boolean; luaV_concat leaves the result in the first window slot and you adjust top -= n-1, not n; boolean TValues
+  aren't collectable; ABI cells must be genuine contiguous arrays (two locals aren't adjacent — this one masqueraded as a GC bug for
+  a while); callables need a GC-visible reference while their cell is live — a standing backend obligation; and LUA_CORE gates
+  luai_num*.
+
+  Also recorded in memory: the two meta-traps that repeatedly cost time — go test caching env-var changes, and stdout buffering
+  making print ordering lie (fprintf(stderr) for truthful sequencing).
+
+  Carried to M4
+
+  The closures/upvalues ABI (with the Proto-struct layout freeze for emitted protos — the last piece of the ABI), setlist, and the
+  big.lua yield investigation. M4 itself — the backend, FunctionProto → wasm — now starts with a proven seam on both sides: an
+  emitter that can express what's needed, and a runtime ABI that's tested three ways.

@@ -15,7 +15,11 @@
 ** storage. All pointers are i32 addresses in the shared linear memory.
 */
 
+#ifndef LUA_CORE
+#define LUA_CORE /* we link core internals; ltm/lvm/luai_num* need it */
+#endif
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "rt_abi.h"
@@ -23,7 +27,20 @@
 #include "lua51/src/ldo.h"
 #include "lua51/src/lobject.h"
 #include "lua51/src/lstate.h"
+#include "lua51/src/ldebug.h"
 #include "lua51/src/lstring.h"
+#include "lua51/src/ltm.h"
+
+/* lvm.c's l_strcmp is static; same semantics (Lua 5.1.5) */
+static int rt_strcmp(const TString *ls, const TString *rs) {
+  const char *a = getstr(ls), *b = getstr(rs);
+  size_t la = ls->tsv.len, lb = rs->tsv.len;
+  size_t n = la < lb ? la : lb;
+  int c = memcmp(a, b, n);
+  if (c != 0) return c;
+  return la < lb ? -1 : (la > lb ? 1 : 0);
+}
+#include "lua51/src/lua.h"
 #include "lua51/src/ltable.h"
 #include "lua51/src/lvm.h"
 
@@ -55,7 +72,7 @@ static void stage_error(void) {
 
 int32_t rt_abi_version(void) { return LUA_RT_ABI; }
 
-void rt_set_state(int32_t p) {
+void rt_set_state(rt_addr p) {
   curL = (lua_State *)(size_t)p;
   err_pending = 0;
   err_buf_len = 0;
@@ -69,7 +86,7 @@ void rt_err_clear(void) {
   err_buf_len = 0;
 }
 
-int32_t rt_err_stage_copy(int32_t dst, int32_t cap) {
+int32_t rt_err_stage_copy(rt_addr dst, int32_t cap) {
   int32_t n = err_buf_len < cap ? err_buf_len : cap;
   if (n > 0) memcpy((void *)(size_t)dst, err_buf, (size_t)n);
   return n;
@@ -77,24 +94,24 @@ int32_t rt_err_stage_copy(int32_t dst, int32_t cap) {
 
 /* ---- value construction (backend inlines these; kept for tests) ---- */
 
-void rt_mknumber(int32_t cell, double v) {
+void rt_mknumber(rt_addr cell, double v) {
   setnvalue((TValue *)(size_t)cell, v);
 }
 
-void rt_mkbool(int32_t cell, int32_t b) {
+void rt_mkbool(rt_addr cell, int32_t b) {
   setbvalue((TValue *)(size_t)cell, b);
 }
 
-void rt_mknil(int32_t cell) { setnilvalue((TValue *)(size_t)cell); }
+void rt_mknil(rt_addr cell) { setnilvalue((TValue *)(size_t)cell); }
 
-int32_t rt_intern(int32_t cell, int32_t ptr, int32_t len) {
+int32_t rt_intern(rt_addr cell, rt_addr ptr, int32_t len) {
   if (err_pending) return RT_ERR;
   TString *ts = luaS_newlstr(curL, (const char *)(size_t)ptr, (size_t)len);
   setsvalue(curL, (TValue *)(size_t)cell, ts);
   return RT_OK;
 }
 
-int32_t rt_newtable(int32_t cell, int32_t narr, int32_t nrec) {
+int32_t rt_newtable(rt_addr cell, int32_t narr, int32_t nrec) {
   if (err_pending) return RT_ERR;
   Table *t = luaH_new(curL, (int)narr, (int)nrec);
   sethvalue(curL, (TValue *)(size_t)cell, t);
@@ -122,12 +139,20 @@ static int rt_run(body_fn fn, int32_t line) {
   int status = luaD_rawrunprotected(curL, protect_trampoline, NULL);
   lua_unlock(curL);
   if (status != 0) {
+    stage_error(); /* message bytes into err_buf */
     if (line != 0) {
-      /* prefix .. message (stack: msg) */
-      luaO_pushfstring(curL, "%s:%d: ", "script", (int)line);
-      luaV_concat(curL, 2, 0); /* stack: prefix..msg */
+      /* position prefix, like luaG_runerror's — done in the buffer, not
+         on the Lua stack: post-error stack discipline is fragile */
+      char tmp[sizeof err_buf];
+      int w = snprintf(tmp, sizeof tmp, "script:%d: %s", (int)line, err_buf);
+      if (w > 0) {
+        size_t n = (size_t)w;
+        if (n >= sizeof tmp) n = sizeof tmp - 1;
+        memcpy(err_buf, tmp, n);
+        err_buf[n] = '\0';
+        err_buf_len = (int)n;
+      }
     }
-    stage_error();
     return RT_ERR;
   }
   return RT_OK;
@@ -144,7 +169,7 @@ static void gettable_body(void) {
   curL->top -= 2;
 }
 
-int32_t rt_gettable(int32_t tblcell, int32_t keycell, int32_t dstcell, int32_t line) {
+int32_t rt_gettable(rt_addr tblcell, rt_addr keycell, rt_addr dstcell, int32_t line) {
   gt_t = *(TValue *)(size_t)tblcell;
   gt_k = *(TValue *)(size_t)keycell;
   gt_dst = (TValue *)(size_t)dstcell;
@@ -162,9 +187,265 @@ static void settable_body(void) {
   curL->top -= 3;
 }
 
-int32_t rt_settable(int32_t tblcell, int32_t keycell, int32_t valcell, int32_t line) {
+int32_t rt_settable(rt_addr tblcell, rt_addr keycell, rt_addr valcell, int32_t line) {
   st_t = *(TValue *)(size_t)tblcell;
   st_k = *(TValue *)(size_t)keycell;
   st_v = *(TValue *)(size_t)valcell;
   return rt_run(settable_body, line);
+}
+
+
+/* ---- arithmetic (OP_*-coded; number fast path, string coercion,
+   metamethods through the runtime's own dispatch) ---- */
+
+static TValue ar_l, ar_r, *ar_dst;
+static int ar_op;
+
+static void arith_body(void) {
+  TValue ln, rn;
+  /* luaV_tonumber returns the converted value (the original cell when
+     already a number, the temp only for strings) or NULL */
+  const TValue *x = luaV_tonumber(&ar_l, &ln);
+  const TValue *y = luaV_tonumber(&ar_r, &rn);
+  if (x != NULL && y != NULL) {
+    lua_Number a = nvalue(x), b = nvalue(y), res;
+    switch (ar_op) {
+    case RT_OP_ADD: res = a + b; break;
+    case RT_OP_SUB: res = a - b; break;
+    case RT_OP_MUL: res = a * b; break;
+    case RT_OP_DIV: res = a / b; break;
+    case RT_OP_MOD: res = luai_nummod(a, b); break;
+    case RT_OP_POW: res = luai_numpow(a, b); break;
+    case RT_OP_UNM: res = -a; break;
+    default: luaG_runerror(curL, "rt_abi: bad arith op %d", ar_op); return;
+    }
+    setnvalue(ar_dst, res);
+    return;
+  }
+  /* non-numbers: metamethod, else the standard arith error (raises) */
+  TMS tm = (TMS)(ar_op - RT_OP_ADD + TM_ADD);
+  const TValue *tmf = luaT_gettmbyobj(curL, &ar_l, tm);
+  if (ttisnil(tmf)) tmf = luaT_gettmbyobj(curL, &ar_r, tm);
+  if (ttisnil(tmf)) luaG_aritherror(curL, &ar_l, &ar_r);
+  else {
+    luaD_checkstack(curL, 4);
+    setobj2s(curL, curL->top, tmf); curL->top++;
+    setobj2s(curL, curL->top, &ar_l); curL->top++;
+    setobj2s(curL, curL->top, &ar_r); curL->top++;
+    luaD_call(curL, curL->top - 3, 1);
+    *ar_dst = *(TValue *)(curL->top - 1);
+    curL->top -= 1;
+  }
+}
+
+int32_t rt_arith(int32_t op, rt_addr lhscell, rt_addr rhscell, rt_addr dstcell, int32_t line) {
+  ar_op = (int)op;
+  ar_l = *(TValue *)(size_t)lhscell;
+  ar_r = *(TValue *)(size_t)rhscell;
+  ar_dst = (TValue *)(size_t)dstcell;
+  return rt_run(arith_body, line);
+  ar_l = *(TValue *)(size_t)lhscell;
+  ar_r = *(TValue *)(size_t)rhscell;
+  ar_dst = (TValue *)(size_t)dstcell;
+  return rt_run(arith_body, line);
+}
+
+/* ---- length (#) ---- */
+
+static TValue len_v, *len_dst;
+
+static void len_body(void) {
+  switch (ttype(&len_v)) {
+  case LUA_TTABLE:
+    setnvalue(len_dst, cast_num(luaH_getn(hvalue(&len_v))));
+    return;
+  case LUA_TSTRING:
+    setnvalue(len_dst, cast_num(tsvalue(&len_v)->len));
+    return;
+  default: {
+    const TValue *tm = luaT_gettmbyobj(curL, &len_v, TM_LEN);
+    if (ttisnil(tm)) luaG_typeerror(curL, &len_v, "get length of");
+    luaD_checkstack(curL, 3);
+    setobj2s(curL, curL->top, tm); curL->top++;
+    setobj2s(curL, curL->top, &len_v); curL->top++;
+    luaD_call(curL, curL->top - 2, 1);
+    *len_dst = *(TValue *)(curL->top - 1);
+    curL->top -= 1;
+  }
+  }
+}
+
+int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line) {
+  len_v = *(TValue *)(size_t)cell;
+  len_dst = (TValue *)(size_t)dstcell;
+  return rt_run(len_body, line);
+}
+
+/* ---- comparisons (dst gets a boolean TValue) ---- */
+
+static TValue cmp_a, cmp_b, *cmp_dst;
+static int cmp_op; /* 0 = ==, 1 = <, 2 = <= */
+
+static int call_tm2(const TValue *tm, const TValue *a, const TValue *b) {
+  /* call tm(a,b) and return its truthiness; stack restored */
+  int res;
+  luaD_checkstack(curL, 4);
+  setobj2s(curL, curL->top, tm); curL->top++;
+  setobj2s(curL, curL->top, a); curL->top++;
+  setobj2s(curL, curL->top, b); curL->top++;
+  luaD_call(curL, curL->top - 3, 1);
+  res = !l_isfalse(curL->top - 1);
+  curL->top -= 1;
+  return res;
+}
+
+static void cmp_body(void) {
+  int res;
+  switch (cmp_op) {
+  case 0:
+    res = (ttype(&cmp_a) == ttype(&cmp_b)) ? luaV_equalval(curL, &cmp_a, &cmp_b) : 0;
+    break;
+  case 1:
+    res = luaV_lessthan(curL, &cmp_a, &cmp_b);
+    break;
+  default: /* <= : 5.1 semantics — __le, else mirrored __lt, else error */
+    if (ttype(&cmp_a) != ttype(&cmp_b)) {
+      res = luaG_ordererror(curL, &cmp_a, &cmp_b);
+    } else if (ttisnumber(&cmp_a)) {
+      res = nvalue(&cmp_a) <= nvalue(&cmp_b);
+    } else if (ttisstring(&cmp_a)) {
+      res = rt_strcmp(rawtsvalue(&cmp_a), rawtsvalue(&cmp_b)) <= 0;
+    } else {
+      const TValue *tm = luaT_gettmbyobj(curL, &cmp_a, TM_LE);
+      if (!ttisnil(tm)) res = call_tm2(tm, &cmp_a, &cmp_b);
+      else {
+        tm = luaT_gettmbyobj(curL, &cmp_b, TM_LT);
+        if (ttisnil(tm)) res = luaG_ordererror(curL, &cmp_a, &cmp_b);
+        else res = !call_tm2(tm, &cmp_b, &cmp_a);
+      }
+    }
+  }
+  setbvalue(cmp_dst, res);
+}
+
+static int cmp_entry(int op, rt_addr acell, rt_addr bcell, rt_addr dstcell, int32_t line) {
+  cmp_a = *(TValue *)(size_t)acell;
+  cmp_b = *(TValue *)(size_t)bcell;
+  cmp_dst = (TValue *)(size_t)dstcell;
+  cmp_op = op;
+  return rt_run(cmp_body, line);
+}
+
+int32_t rt_eq(rt_addr a, rt_addr b, rt_addr dst, int32_t line) { return cmp_entry(0, a, b, dst, line); }
+int32_t rt_lt(rt_addr a, rt_addr b, rt_addr dst, int32_t line) { return cmp_entry(1, a, b, dst, line); }
+int32_t rt_le(rt_addr a, rt_addr b, rt_addr dst, int32_t line) { return cmp_entry(2, a, b, dst, line); }
+
+/* ---- concat: cells contiguous, lowest first ---- */
+
+static TValue *cc_cells;
+static int cc_n;
+static TValue *cc_dst;
+
+static void concat_body(void) {
+  int i;
+  luaD_checkstack(curL, cc_n + 1);
+  for (i = 0; i < cc_n; i++) {
+    setobj2s(curL, curL->top, &cc_cells[i]);
+    curL->top++;
+  }
+  luaV_concat(curL, cc_n, cast_int(curL->top - curL->base) - 1); /* top n -> one */
+  /* the result occupies the FIRST slot of the window; luaV_concat does
+     not adjust L->top (its callers in lvm do): n values -> 1 result */
+  *cc_dst = *(TValue *)(curL->top - cc_n);
+  curL->top -= cc_n - 1;
+}
+
+int32_t rt_concat(rt_addr cells, int32_t count, rt_addr dstcell, int32_t line) {
+  if (count < 2) {
+    if (count == 1) *(TValue *)(size_t)dstcell = *(TValue *)(size_t)cells;
+    return RT_OK;
+  }
+  cc_cells = (TValue *)(size_t)cells;
+  cc_n = (int)count;
+  cc_dst = (TValue *)(size_t)dstcell;
+  return rt_run(concat_body, line);
+}
+
+/* ---- calls: the universal fallback for dynamic callees. The callee may
+   be a Lua closure (proto in shared memory; the runtime's lvm interprets
+   it) or a C function. Results overwrite the arg cells; want<0 means
+   multret and the negative result count is returned ---- */
+
+static TValue ca_f;
+static TValue *ca_args;
+static int ca_n, ca_w, ca_nres;
+
+static void call_body(void) {
+  int i;
+  StkId base;
+  luaD_checkstack(curL, ca_n + 1);
+  setobj2s(curL, curL->top, &ca_f); curL->top++;
+  for (i = 0; i < ca_n; i++) {
+      setobj2s(curL, curL->top, &ca_args[i]);
+    curL->top++;
+  }
+  base = curL->top - ca_n - 1;
+  luaD_call(curL, base, ca_w < 0 ? LUA_MULTRET : ca_w);
+  ca_nres = cast_int(curL->top - base);
+  if (ca_w >= 0) ca_nres = ca_w;
+  for (i = 0; i < ca_nres; i++) ca_args[i] = base[i];
+  curL->top = base;
+}
+
+int32_t rt_call(rt_addr funcell, rt_addr argcells, int32_t nargs, int32_t want, int32_t line) {
+  ca_f = *(TValue *)(size_t)funcell;
+  ca_args = (TValue *)(size_t)argcells;
+  ca_n = (int)nargs;
+  ca_w = (int)want;
+  ca_nres = 0;
+  int st = rt_run(call_body, line);
+  if (st != RT_OK) return RT_ERR;
+  return ca_w < 0 ? -(ca_nres + 1) : RT_OK; /* encode count; -1 means zero */
+}
+
+/* the count encoded by a multret rt_call */
+int32_t rt_call_count(int32_t encoded) { return -(encoded + 1); }
+
+/* ---- numeric-for preparation: coerce 3 cells in place; messages match
+   the interpreter's (_vm.go OP_FORPREP) ---- */
+
+static TValue *fp_cells;
+
+static void forprep_body(void) {
+  static const char *names[3] = {"init", "limit", "step"};
+  int i;
+  for (i = 0; i < 3; i++) {
+    TValue nv;
+    if (luaV_tonumber(&fp_cells[i], &nv) == NULL)
+      luaG_runerror(curL, "for statement %s must be a number", names[i]);
+    setnvalue(&fp_cells[i], nvalue(&nv));
+  }
+}
+
+int32_t rt_forprep(rt_addr cells, int32_t line) {
+  fp_cells = (TValue *)(size_t)cells;
+  return rt_run(forprep_body, line);
+}
+
+/* ---- scratch: frame/cell regions in the shared heap. v1: malloc-backed;
+   the arena-reset lifecycle arrives with the host integration (M7) ---- */
+
+int32_t rt_frame_alloc(int32_t bytes) {
+  void *p = malloc((size_t)bytes);
+  return (int32_t)(size_t)p;
+}
+
+/* ---- raising from emitted code ---- */
+
+void rt_error(rt_addr msgptr, int32_t msglen, int32_t line) {
+  int w = snprintf(err_buf, sizeof err_buf, "script:%d: %.*s",
+                   (int)line, (int)msglen, (const char *)(size_t)msgptr);
+  err_buf_len = w > 0 ? w : 0;
+  err_pending = 1;
+  setnilvalue(&err_value);
 }

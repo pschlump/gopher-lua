@@ -109,6 +109,10 @@ func newFunctionProto(name string) *FunctionProto {
 	}
 }
 
+// StringConstants exposes the string-constants table used by the
+// *KS opcodes and SETGLOBAL (backend access).
+func (fp *FunctionProto) StringConstants() []string { return fp.stringConstants }
+
 func (fp *FunctionProto) String() string {
 	return fp.str(1, 0)
 }

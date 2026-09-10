@@ -20,6 +20,7 @@
 #endif
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "rt_abi.h"
@@ -50,6 +51,11 @@ _Static_assert(sizeof(lua_Number) == 8, "numbers are f64");
 
 static lua_State *curL;
 
+/* staged-error position prefix: the real chunk name (parity with the
+   interpreter's "name:line:" format) */
+static char chunk_name[256] = "script";
+static int chunk_name_len = 6;
+
 /* staged error: sticky until rt_err_clear; bytes for the frame chain */
 static TValue err_value;
 static char err_buf[1024];
@@ -69,6 +75,14 @@ static void stage_error(void) {
 }
 
 /* ---- ABI surface ---- */
+
+static int rt_diag_lastfn = 0;
+static int rt_diag_laststatus = -1;
+static int rt_diag_errpending_entry = -1;
+static int rt_diag_failfn = 0; /* fn id that FIRST returned RT_ERR */
+int32_t rt_lastfn(void) { return rt_diag_lastfn; }
+int32_t rt_failfn(void) { return rt_diag_failfn; }
+int32_t rt_laststatus(void) { return rt_diag_laststatus; }
 
 int32_t rt_abi_version(void) { return LUA_RT_ABI; }
 
@@ -130,21 +144,31 @@ static void protect_trampoline(lua_State *L, void *ud) {
   cur_body();
 }
 
+static int rt_run_raw(body_fn fn, int32_t line);
+
+static int rt_run(body_fn fn, int32_t line) {
+  int st = rt_run_raw(fn, line);
+  rt_diag_laststatus = st;
+  return st;
+}
+
 /* returns RT_OK, or RT_ERR with the error staged (message gets the
    script-position prefix, matching the oracle's error format) */
-static int rt_run(body_fn fn, int32_t line) {
+static int rt_run_raw(body_fn fn, int32_t line) {
   if (err_pending) return RT_ERR;
   cur_body = fn;
   lua_lock(curL);
   int status = luaD_rawrunprotected(curL, protect_trampoline, NULL);
   lua_unlock(curL);
   if (status != 0) {
+    if (rt_diag_failfn == 0) rt_diag_failfn = rt_diag_lastfn;
     stage_error(); /* message bytes into err_buf */
     if (line != 0) {
       /* position prefix, like luaG_runerror's — done in the buffer, not
          on the Lua stack: post-error stack discipline is fragile */
       char tmp[sizeof err_buf];
-      int w = snprintf(tmp, sizeof tmp, "script:%d: %s", (int)line, err_buf);
+      int w = snprintf(tmp, sizeof tmp, "%.*s:%d: %s", chunk_name_len,
+                       chunk_name, (int)line, err_buf);
       if (w > 0) {
         size_t n = (size_t)w;
         if (n >= sizeof tmp) n = sizeof tmp - 1;
@@ -169,7 +193,18 @@ static void gettable_body(void) {
   curL->top -= 2;
 }
 
+static int rt_diag_gtcalls = 0;
+static int rt_diag_gt[4] = {-1, -1, -1, -1}; /* obj tag, key tag, dst tag, line */
+int32_t rt_gtcalls(void) { return rt_diag_gtcalls; }
+int32_t rt_gt(int32_t i) { return i >= 0 && i < 4 ? rt_diag_gt[i] : -1; }
+
 int32_t rt_gettable(rt_addr tblcell, rt_addr keycell, rt_addr dstcell, int32_t line) {
+  rt_diag_lastfn = 1;
+  rt_diag_gtcalls++;
+  rt_diag_gt[0] = (int)ttype((TValue *)(size_t)tblcell);
+  rt_diag_gt[1] = (int)ttype((TValue *)(size_t)keycell);
+  rt_diag_gt[2] = (int)ttype((TValue *)(size_t)dstcell);
+  rt_diag_gt[3] = line;
   gt_t = *(TValue *)(size_t)tblcell;
   gt_k = *(TValue *)(size_t)keycell;
   gt_dst = (TValue *)(size_t)dstcell;
@@ -188,6 +223,7 @@ static void settable_body(void) {
 }
 
 int32_t rt_settable(rt_addr tblcell, rt_addr keycell, rt_addr valcell, int32_t line) {
+  rt_diag_lastfn = 2;
   st_t = *(TValue *)(size_t)tblcell;
   st_k = *(TValue *)(size_t)keycell;
   st_v = *(TValue *)(size_t)valcell;
@@ -239,6 +275,7 @@ static void arith_body(void) {
 }
 
 int32_t rt_arith(int32_t op, rt_addr lhscell, rt_addr rhscell, rt_addr dstcell, int32_t line) {
+  rt_diag_lastfn = 3;
   ar_op = (int)op;
   ar_l = *(TValue *)(size_t)lhscell;
   ar_r = *(TValue *)(size_t)rhscell;
@@ -276,6 +313,7 @@ static void len_body(void) {
 }
 
 int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line) {
+  rt_diag_lastfn = 4;
   len_v = *(TValue *)(size_t)cell;
   len_dst = (TValue *)(size_t)dstcell;
   return rt_run(len_body, line);
@@ -336,7 +374,8 @@ static int cmp_entry(int op, rt_addr acell, rt_addr bcell, rt_addr dstcell, int3
   return rt_run(cmp_body, line);
 }
 
-int32_t rt_eq(rt_addr a, rt_addr b, rt_addr dst, int32_t line) { return cmp_entry(0, a, b, dst, line); }
+int32_t rt_eq(rt_addr a, rt_addr b, rt_addr dst, int32_t line) {
+  rt_diag_lastfn = 5; return cmp_entry(0, a, b, dst, line); }
 int32_t rt_lt(rt_addr a, rt_addr b, rt_addr dst, int32_t line) { return cmp_entry(1, a, b, dst, line); }
 int32_t rt_le(rt_addr a, rt_addr b, rt_addr dst, int32_t line) { return cmp_entry(2, a, b, dst, line); }
 
@@ -361,6 +400,7 @@ static void concat_body(void) {
 }
 
 int32_t rt_concat(rt_addr cells, int32_t count, rt_addr dstcell, int32_t line) {
+  rt_diag_lastfn = 8;
   if (count < 2) {
     if (count == 1) *(TValue *)(size_t)dstcell = *(TValue *)(size_t)cells;
     return RT_OK;
@@ -397,7 +437,21 @@ static void call_body(void) {
   curL->top = base;
 }
 
+static int rt_diag_ccalls = 0;
+static int rt_diag_cargs[8] = {0};
+int32_t rt_ccalls(void) { return rt_diag_ccalls; }
+int32_t rt_carg(int32_t i) { return i >= 0 && i < 8 ? rt_diag_cargs[i] : -1; }
+
 int32_t rt_call(rt_addr funcell, rt_addr argcells, int32_t nargs, int32_t want, int32_t line) {
+  rt_diag_lastfn = 9;
+  rt_diag_ccalls++;
+  {
+    int n = nargs < 4 ? nargs : 4;
+    rt_diag_cargs[0] = (int)ttype((TValue *)(size_t)funcell);
+    for (int i = 0; i < n; i++)
+      rt_diag_cargs[i + 1] = (int)ttype(&((TValue *)(size_t)argcells)[i]);
+    for (int i = n + 1; i < 8; i++) rt_diag_cargs[i] = -1;
+  }
   ca_f = *(TValue *)(size_t)funcell;
   ca_args = (TValue *)(size_t)argcells;
   ca_n = (int)nargs;
@@ -421,14 +475,29 @@ static void forprep_body(void) {
   int i;
   for (i = 0; i < 3; i++) {
     TValue nv;
-    if (luaV_tonumber(&fp_cells[i], &nv) == NULL)
+    /* luaV_tonumber returns the converted value as a POINTER (the cell
+       itself when already a number; the temp only for strings) — the
+       value must be read through it, never from the unfilled temp */
+    const TValue *x = luaV_tonumber(&fp_cells[i], &nv);
+    if (x == NULL)
       luaG_runerror(curL, "for statement %s must be a number", names[i]);
-    setnvalue(&fp_cells[i], nvalue(&nv));
+    setnvalue(&fp_cells[i], nvalue(x));
   }
 }
 
+static int rt_diag_fpcalls = 0;
+static double rt_diag_fpin[3] = {-999, -999, -999};
+int32_t rt_fpcalls(void) { return rt_diag_fpcalls; }
+double rt_fpin(int32_t i) { return i >= 0 && i < 3 ? rt_diag_fpin[i] : -999; }
+
 int32_t rt_forprep(rt_addr cells, int32_t line) {
+  rt_diag_lastfn = 10;
+  rt_diag_fpcalls++;
   fp_cells = (TValue *)(size_t)cells;
+  for (int i = 0; i < 3; i++) {
+    const TValue *v = luaV_tonumber(&fp_cells[i], &(TValue){0});
+    rt_diag_fpin[i] = v ? nvalue(v) : -777;
+  }
   return rt_run(forprep_body, line);
 }
 
@@ -443,9 +512,95 @@ int32_t rt_frame_alloc(int32_t bytes) {
 /* ---- raising from emitted code ---- */
 
 void rt_error(rt_addr msgptr, int32_t msglen, int32_t line) {
-  int w = snprintf(err_buf, sizeof err_buf, "script:%d: %.*s",
-                   (int)line, (int)msglen, (const char *)(size_t)msgptr);
+  int w = snprintf(err_buf, sizeof err_buf, "%.*s:%d: %.*s",
+                   chunk_name_len, chunk_name, (int)line,
+                   (int)msglen, (const char *)(size_t)msgptr);
   err_buf_len = w > 0 ? w : 0;
   err_pending = 1;
   setnilvalue(&err_value);
 }
+
+/* ---- globals (ABI v2) ---- */
+
+static TValue gg_k, *gg_dst, sg_k, sg_v;
+
+static void getglobal_body(void) {
+  luaD_checkstack(curL, 2);
+  const char *name = svalue(&gg_k);
+  lua_getglobal(curL, name);
+  *gg_dst = *(TValue *)(curL->top - 1);
+  curL->top -= 1;
+}
+
+static int rt_diag_ggcalls = 0;
+static char rt_diag_ggname[64] = {0};
+static int rt_diag_ggresult = -1; /* tag of the fetched value, -2 = error */
+int32_t rt_ggcalls(void) { return rt_diag_ggcalls; }
+const char *rt_ggname(void) { return rt_diag_ggname; }
+int32_t rt_ggresult(void) { return rt_diag_ggresult; }
+
+int32_t rt_getglobal(rt_addr dstcell, rt_addr keycell, int32_t line) {
+  rt_diag_lastfn = 11;
+  rt_diag_ggcalls++;
+  {
+    TValue *kv = (TValue *)(size_t)keycell;
+    if (ttisstring(kv)) {
+      size_t n = tsvalue(kv)->len;
+      if (n > 63) n = 63;
+      memcpy(rt_diag_ggname, svalue(kv), n);
+      rt_diag_ggname[n] = 0;
+    } else {
+      strcpy(rt_diag_ggname, "<nonstring>");
+    }
+  }
+  gg_k = *(TValue *)(size_t)keycell;
+  gg_dst = (TValue *)(size_t)dstcell;
+  int st = rt_run(getglobal_body, line);
+  rt_diag_ggresult = st != 0 ? -2 : (int)ttype(gg_dst);
+  return st;
+}
+
+static void setglobal_body(void) {
+  luaD_checkstack(curL, 2);
+  const char *name = svalue(&sg_k);
+  setobj2s(curL, curL->top, &sg_v); curL->top++;
+  lua_setglobal(curL, name); /* pops the value itself */
+}
+
+static int rt_diag_sgcalls = 0;
+static int rt_diag_sgvaltag = -1;
+static char rt_diag_sgname[64] = {0};
+int32_t rt_sgvaltag(void) { return rt_diag_sgvaltag; }
+int32_t rt_sgcalls(void) { return rt_diag_sgcalls; }
+const char *rt_sgname(void) { return rt_diag_sgname; }
+
+int32_t rt_setglobal(rt_addr keycell, rt_addr valcell, int32_t line) {
+  rt_diag_lastfn = 12;
+  rt_diag_sgcalls++;
+  {
+    TValue *kv = (TValue *)(size_t)keycell;
+    if (ttisstring(kv)) {
+      size_t n = tsvalue(kv)->len;
+      if (n > 63) n = 63;
+      memcpy(rt_diag_sgname, svalue(kv), n);
+      rt_diag_sgname[n] = 0;
+    } else {
+      strcpy(rt_diag_sgname, "<nonstring>");
+    }
+  }
+  rt_diag_sgvaltag = (int)ttype((TValue *)(size_t)valcell);
+  sg_k = *(TValue *)(size_t)keycell;
+  sg_v = *(TValue *)(size_t)valcell;
+  return rt_run(setglobal_body, line);
+}
+
+void rt_set_chunkname(rt_addr ptr, int32_t len) {
+  int32_t n = len;
+  if (n > (int32_t)sizeof chunk_name - 1) n = (int32_t)sizeof chunk_name - 1;
+  memcpy(chunk_name, (const void *)(size_t)ptr, (size_t)n);
+  chunk_name[n] = '\0';
+  chunk_name_len = (int)n;
+}
+
+const char *rt_chunkname_ptr(void) { return chunk_name; }
+int32_t rt_chunkname_len(void) { return chunk_name_len; }

@@ -216,6 +216,11 @@ func (m *Module) ExportFunc(name string, idx uint32) {
 	m.exports = append(m.exports, exportEntry{name, ExportKindFunc, idx})
 }
 
+// ExportGlobal exports the global idx under name.
+func (m *Module) ExportGlobal(name string, idx uint32) {
+	m.exports = append(m.exports, exportEntry{name, ExportKindGlobal, idx})
+}
+
 // ExportMemory exports linear memory under name.
 func (m *Module) ExportMemory(name string) {
 	m.exports = append(m.exports, exportEntry{name, ExportKindMem, 0})

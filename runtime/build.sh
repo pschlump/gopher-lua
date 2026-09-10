@@ -34,7 +34,9 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -Wl,--export=rt_err_pending -Wl,--export=rt_err_clear -Wl,--export=rt_err_stage_copy \
   -Wl,--export=rt_arith -Wl,--export=rt_len -Wl,--export=rt_eq -Wl,--export=rt_lt \
   -Wl,--export=rt_le -Wl,--export=rt_concat -Wl,--export=rt_call -Wl,--export=rt_call_count \
-  -Wl,--export=rt_forprep -Wl,--export=rt_error -Wl,--export=rt_frame_alloc"
+  -Wl,--export=rt_forprep -Wl,--export=rt_error -Wl,--export=rt_frame_alloc \
+  -Wl,--export=rt_getglobal -Wl,--export=rt_setglobal -Wl,--export=rt_set_chunkname \
+  -Wl,--export=lglobals -Wl,--export=rt_sgcalls -Wl,--export=rt_sgname -Wl,--export=rt_sgvaltag -Wl,--export=rt_ggcalls -Wl,--export=rt_ggname -Wl,--export=rt_ggresult -Wl,--export=rt_ccalls -Wl,--export=rt_carg -Wl,--export=rt_gtcalls -Wl,--export=rt_gt -Wl,--export=rt_lastfn -Wl,--export=rt_laststatus -Wl,--export=rt_failfn -Wl,--export=rt_fpcalls -Wl,--export=rt_fpin"
 
 # ---- lua51_sjlj.wasm: native EH setjmp, runs on wasmtime ----
 

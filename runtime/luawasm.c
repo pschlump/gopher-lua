@@ -472,13 +472,20 @@ static void install_shims(lua_State *L) {
   lua_pop(L, 1);
 }
 
+static lua_State *g_state; /* for lglobals after the entry returns */
+
 int32_t lnewstate(void) {
   lua_State *L = luaL_newstate();
   if (L == NULL) return 0;
   luaL_openlibs(L);
   install_shims(L);
   host_randomseed(42); /* harness contract: every run starts at seed 42 */
+  g_state = L;
   return (int32_t)(size_t)L;
+}
+
+void lglobals(void) {
+  if (g_state != NULL) emit_globals(g_state);
 }
 
 /* diagnostics: bisect lnewstate (must also run inside the driver —

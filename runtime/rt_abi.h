@@ -32,7 +32,7 @@
 
 #include "lua51/src/lua.h"
 
-#define LUA_RT_ABI 1
+#define LUA_RT_ABI 2
 
 /* rt_addr: the pointer-carrying parameter type. On wasm32 it is i32 —
    this IS the frozen ABI. The native test build (RT_ABI_NATIVE64)
@@ -48,17 +48,18 @@ typedef int32_t rt_addr;
 #define RT_OK 0
 #define RT_ERR 1 /* error staged; see rt_err_len/rt_err_copy/rt_err_clear */
 
-/* frozen Lua 5.1 type tags as stored in TValue.tt (lobject.h) */
+/* frozen Lua 5.1 type tags as stored in TValue.tt (lobject.h). Lua 5.1
+   stores RAW type numbers — no collectable bit (that is 5.2+;
+   collectability is tt >= LUA_TSTRING). Booleans carry the truth in
+   value.b (the low 4 bytes at offset 0). */
 #define RT_TNIL 0
-/* booleans are NOT collectable: tt is LUA_TBOOLEAN(1) for both, and the
-   truth lives in value.b (the low 4 bytes at offset 0) */
 #define RT_TBOOL 1
 #define RT_TNUMBER 3
-#define RT_TSTRING (4 | 64)
-#define RT_TTABLE (5 | 64)
-#define RT_TFUNCTION (6 | 64)
-#define RT_TUSERDATA (7 | 64)
-#define RT_TTHREAD (8 | 64)
+#define RT_TSTRING 4
+#define RT_TTABLE 5
+#define RT_TFUNCTION 6
+#define RT_TUSERDATA 7
+#define RT_TTHREAD 8
 
 /* arith op codes: identical to the Lua 5.1 / gopher-lua opcode numbers
 ** the backend compiles from (OP_ADD=15 .. OP_POW=20) */

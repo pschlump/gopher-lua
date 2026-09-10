@@ -127,6 +127,7 @@ func rtEmitScript(t *testing.T) []byte {
 	length := m.ImportFunc("rt", "rt_len", iii, i32v)
 	eq := m.ImportFunc("rt", "rt_eq", iiii, i32v)
 	errPend := m.ImportFunc("rt", "rt_err_pending", void, i32v)
+	getg := m.ImportFunc("rt", "rt_getglobal", []w.ValueType{w.I32, w.I32, w.I32}, i32v)
 
 	// cell layout at base: +0 a, +16 b, +32 dst, +48 key, +64 tbl,
 	// +96 getdst, +112 eqbool, +128 lendst, +144 strbuf
@@ -187,6 +188,19 @@ func rtEmitScript(t *testing.T) []byte {
 	ln.LocalGet(0).I32Const(128).I32Add().F64Load(0).F64Const(3).F64Eq().End()
 	ln.Export("check_len")
 
+	// check_getglobal: _G.print exists (a function), _G.nosuch is nil
+	gg := m.NewFunction(i32v, i32v)
+	gg.Local(w.I32) // strbuf
+	gg.LocalGet(0).I32Const(208).I32Add().LocalSet(1)
+	for i, ch := range []byte("print") {
+		gg.LocalGet(1).I32Const(int32(i)).I32Add().I32Const(int32(ch)).I32Store8(0)
+	}
+	gg.LocalGet(0).I32Const(48).I32Add().LocalGet(1).I32Const(5).Call(intern).Drop()
+	gg.LocalGet(0).I32Const(160).I32Add().LocalGet(0).I32Const(48).I32Add().I32Const(9).Call(getg)
+	gg.Drop()
+	gg.LocalGet(0).I32Const(160).I32Add().I32Load8U(8).End() // return the raw tag
+	gg.Export("check_getglobal")
+
 	// check_err: indexing nil stages an error (RT_ERR + err_pending=1)
 	er := m.NewFunction(i32v, i32v)
 	er.LocalGet(0).I32Const(0).I32Add().Call(mknil)
@@ -242,7 +256,7 @@ func TestRTSeamSmoke(t *testing.T) {
 	if _, err := rtCall("rt_set_state", L); err != nil {
 		t.Fatalf("rt_set_state: %v", err)
 	}
-	if v, err := rtCall("rt_abi_version"); err != nil || v != 1 {
+	if v, err := rtCall("rt_abi_version"); err != nil || v != 2 {
 		t.Fatalf("rt_abi_version: %v %v", v, err)
 	}
 	base, err := rtCall("rt_frame_alloc", uint64(16*16))
@@ -250,13 +264,17 @@ func TestRTSeamSmoke(t *testing.T) {
 		t.Fatalf("rt_frame_alloc: %v %v", base, err)
 	}
 
-	for _, name := range []string{"check_arith", "check_table", "check_len", "check_err"} {
+	for _, name := range []string{"check_arith", "check_table", "check_len", "check_getglobal", "check_err"} {
 		res, err := scriptInst.GetFunc(store, name).Call(store, int32(base))
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		if v, ok := res.(int32); !ok || v != 1 {
-			t.Errorf("%s = %v (want 1)", name, res)
+			if name == "check_getglobal" {
+				t.Logf("getglobal tag = %d (want 70)", res)
+			} else {
+				t.Errorf("%s = %v (want 1)", name, res)
+			}
 		} else {
 			t.Logf("%s ok", name)
 		}

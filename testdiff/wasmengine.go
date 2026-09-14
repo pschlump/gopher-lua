@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -24,6 +25,43 @@ import (
 	"github.com/pschlump/gopher-lua/luawasm"
 	"github.com/pschlump/gopher-lua/parse"
 )
+
+// gcStop runs collectgarbage('stop') in the runtime state via the M2
+// driver's ldostring (v1 mitigation — see the Run comment).
+func (e *WasmEngine) gcStop(store *wt.Store, rtInst *wt.Instance, call func(*wt.Instance, string, ...interface{}) (interface{}, error), L interface{}, name string) error {
+	inAddr, err := call(rtInst, "linbuf")
+	if err != nil {
+		return err
+	}
+	nameAddr, err := call(rtInst, "lnamebuf")
+	if err != nil {
+		return err
+	}
+	src := []byte("collectgarbage('stop')")
+	if len(name) > 500 {
+		name = name[:500]
+	}
+	mem := rtInst.GetExport(store, "memory").Memory().UnsafeData(store)
+	in, nameA := uint32(toI32(inAddr)), uint32(toI32(nameAddr))
+	copy(mem[in:], src)
+	copy(mem[nameA:], []byte(name))
+	_, err = call(rtInst, "ldostring", L, int(in), len(src), int(nameA), 1)
+	return err
+}
+
+func toI32(v interface{}) int32 {
+	switch x := v.(type) {
+	case int32:
+		return x
+	case uint64:
+		return int32(x)
+	case int64:
+		return int32(x)
+	case float64:
+		return int32(x)
+	}
+	return 0
+}
 
 // CompileSource runs the frontend and the backend: source → script.wasm.
 // This is what cmd/luawasmc saves to disk.
@@ -56,8 +94,14 @@ func NewWasmEngine(name string) *WasmEngine { return &WasmEngine{name: name} }
 
 func (e *WasmEngine) Name() string { return e.name }
 
-func (e *WasmEngine) Run(c Case) []string {
-	var log []string
+func (e *WasmEngine) Run(c Case) (log []string) {
+	defer func() {
+		if p := recover(); p != nil {
+			log = []string{fmt.Sprintf("ENGINE-PANIC\t%v\t%s", p, debug.Stack())}
+		}
+	}()
+	var log2 []string
+	log = log2
 	emit := func(event, payload string) {
 		log = append(log, event+"\t"+payload)
 	}
@@ -70,7 +114,9 @@ func (e *WasmEngine) Run(c Case) []string {
 			if e.SkipUnsupported && strings.Contains(err.Error(), "backend v1") {
 				return []string{"SKIP-UNSUPPORTED\t" + err.Error()}
 			}
-			return []string{"ENGINE-ERROR\tcompile: " + err.Error()}
+			// parse/compile failures are script-level ERRORs (the interp
+			// engine reports them the same way), not engine errors
+			return []string{"ERROR\t" + strconv.Quote(err.Error())}
 		}
 	}
 
@@ -188,7 +234,6 @@ func (e *WasmEngine) Run(c Case) []string {
 		return []string{"ENGINE-ERROR\tscript instantiate: " + err.Error()}
 	}
 
-	emit("STEP", "pre-lnewstate")
 	L, err := call(rtInst, "lnewstate")
 	if err != nil {
 		return []string{"ENGINE-ERROR\tlnewstate: " + err.Error()}
@@ -198,7 +243,14 @@ func (e *WasmEngine) Run(c Case) []string {
 	if _, err := call(rtInst, "rt_set_state", L); err != nil {
 		return []string{"ENGINE-ERROR\trt_set_state: " + err.Error()}
 	}
-	emit("STEP", "lnewstate done")
+	// v1 GC stop: register cells are not GC roots (the M3 ABI obligation —
+	// a full GC-rooted frame arrives with the M6 arena lifecycle); any
+	// luaC_checkGC inside library calls (e.g. table.sort's stack churn)
+	// would collect tables referenced only from cells. Arena-reset replaces
+	// GC for script runs anyway.
+	if err := e.gcStop(store, rtInst, call, L, c.Name); err != nil {
+		return []string{"ENGINE-ERROR\tgc stop: " + err.Error()}
+	}
 	av, err := call(rtInst, "rt_abi_version")
 	if err != nil {
 		return []string{"ENGINE-ERROR\tABI version: " + err.Error()}
@@ -210,11 +262,9 @@ func (e *WasmEngine) Run(c Case) []string {
 	if v := os.Getenv("INITSTEP"); v != "" {
 		fmt.Sscanf(v, "%d", &initStep)
 	}
-	emit("STEP", "pre-init")
 	if _, err := call(scriptInst, "luawasm_init", initStep); err != nil {
 		return append(log, "ENGINE-ERROR\tinit: "+err.Error())
 	}
-	emit("STEP", "init done")
 	gv := scriptInst.GetExport(store, "gFrameCells").Global().Get(store)
 	frameCells := gv.I32()
 	frame, err := call(rtInst, "rt_frame_alloc", int(frameCells)*16)
@@ -222,9 +272,7 @@ func (e *WasmEngine) Run(c Case) []string {
 		return []string{"ENGINE-ERROR\tframe: " + err.Error()}
 	}
 
-	emit("STEP", fmt.Sprintf("pre-main frame=%v cells=%v", frame, frameCells))
 	status, err := call(scriptInst, "lua_main", frame)
-	emit("STEP", "post-main")
 	if err != nil {
 		return append(log, "ENGINE-ERROR\ttrap: "+err.Error())
 	}

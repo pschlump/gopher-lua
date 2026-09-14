@@ -52,9 +52,10 @@ func (fe *funcEmitter) cellAddr(k int) *wasm.Function {
 	return fe.f.LocalGet(0).I32Const(int32(cellSize * k)).I32Add()
 }
 
-// scratch cell k (past the registers)
+// scratch cell k — above the registers AND the 2-cell register margin
+// (see the gFrameCells note in emitBody)
 func (fe *funcEmitter) scratchAddr(k int) *wasm.Function {
-	return fe.f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + k))).I32Add()
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + 2 + k))).I32Add()
 }
 
 // constant cell: i in Constants
@@ -165,8 +166,12 @@ func (fe *funcEmitter) line(pc int) int32 {
 func (fe *funcEmitter) emitBody() {
 	f := fe.f
 
-	// exported frame size: registers + 2 scratch cells
-	fe.b.m.ExportGlobal("gFrameCells", fe.b.m.GlobalI32(int32(fe.nregs+2), false))
+	// exported frame size: registers + 2 margin + 2 scratch cells. The
+	// interpreter can write 2 cells past NumUsedRegisters (TFORLOOP stages
+	// its triple at R(A+3..A+5), and the compiler doesn't always reserve
+	// those); the margin absorbs that, and scratch lives above it so the
+	// two windows can never alias.
+	fe.b.m.ExportGlobal("gFrameCells", fe.b.m.GlobalI32(int32(fe.nregs+4), false))
 
 	// nil-fill all registers (v1 entry: no arguments)
 	for k := 0; k < fe.nregs; k++ {
@@ -177,9 +182,13 @@ func (fe *funcEmitter) emitBody() {
 
 	fe.partitionBlocks()
 
-	// flattened dispatch
+	// flattened dispatch. N+1 blocks: the innermost is a dummy so EVERY
+	// body is enclosed by a dispatch block — copy-loops inside a body exit
+	// with BrIf(1) to "the rest of this body", which must never resolve to
+	// the dispatch LOOP itself (that would re-dispatch with a stale lBlk
+	// and loop forever — the {1,2,3} constructor OOM).
 	f.Loop(wasm.Void)
-	for i := 0; i < len(fe.blockPC); i++ {
+	for i := 0; i <= len(fe.blockPC); i++ {
 		f.Block(wasm.Void)
 	}
 	depths := make([]uint32, len(fe.blockPC))
@@ -188,15 +197,16 @@ func (fe *funcEmitter) emitBody() {
 	}
 	f.LocalGet(fe.lBlk).BrTable(depths, uint32(len(fe.blockPC)-1))
 	for k := 0; k < len(fe.blockPC); k++ {
-		f.End() // close block k
+		f.End() // close the dummy (k=0) / dispatch block N-1-k (k>0)
 		start := fe.blockPC[k]
 		end := len(fe.code)
 		if k+1 < len(fe.blockPC) {
 			end = fe.blockPC[k+1]
 		}
 		fe.emitBlockBody(start, end)
-		f.Br(uint32(len(fe.blockPC) - 1 - k)) // continue dispatch loop
+		f.Br(uint32(len(fe.blockPC) - k)) // → the dispatch loop (past B0..B(N-1-k))
 	}
+	f.End() // close B0
 	f.End() // close loop
 	f.I32Const(0)
 	f.End() // unreachable; wasm requires a result
@@ -223,7 +233,7 @@ func (fe *funcEmitter) partitionBlocks() {
 				leaders[pc+2] = true
 			}
 		case lua.OP_MOVEN:
-			pc += int(inst & 0x1ff) // consume the fused MOVEs
+			pc += int(inst>>9) & 0x1ff // consume the C fused MOVEs
 		}
 	}
 	ids := []int{}
@@ -397,19 +407,23 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.truth(A)
 			fe.f.LocalSet(fe.lT0)
 			fe.f.LocalGet(fe.lT0).I32Const(int32(C)).I32Eq().If(wasm.Void)
-			fe.setBlk(fe.blockOf(fe.jumpTarget(pc + 1)))
-			fe.f.Else()
+			// falsiness == C ⟺ truthiness == (C==0): pc++ (skip the JMP)
 			fe.setBlk(fe.blockOf(pc + 2))
+			fe.f.Else()
+			// the JMP runs → its target
+			fe.setBlk(fe.blockOf(fe.jumpTarget(pc + 1)))
 			fe.f.End()
 			terminal = true
 		case lua.OP_TESTSET:
 			fe.truth(B)
 			fe.f.LocalSet(fe.lT0)
-			fe.f.LocalGet(fe.lT0).I32Const(int32(C)).I32Eq().If(wasm.Void)
+			fe.f.LocalGet(fe.lT0).I32Const(int32(C)).I32Ne().If(wasm.Void)
+			// falsiness != C ⟺ truthiness != (C==0): R(A) := R(B), JMP runs
 			fe.copyCell(func() { fe.cellAddr(A) }, func() { fe.cellAddr(B) })
 			fe.bumpTop(A + 1)
 			fe.setBlk(fe.blockOf(fe.jumpTarget(pc + 1)))
 			fe.f.Else()
+			// falsiness == C: pc++ (skip the JMP) → pc+2
 			fe.setBlk(fe.blockOf(pc + 2))
 			fe.f.End()
 			terminal = true
@@ -447,6 +461,12 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			panic(fmt.Sprintf("luawasm: unhandled opcode %d", op))
 		}
 		pc++
+		if terminal {
+			// the instruction routed all successors itself (JMP, branches,
+			// TFORLOOP's pseudo-JMP, returns) — emitting anything after it
+			// would overwrite lBlk at runtime
+			break
+		}
 	}
 	if !terminal {
 		fe.setBlk(fe.blockOf(end))

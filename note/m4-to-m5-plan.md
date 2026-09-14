@@ -1,19 +1,48 @@
-# M4 → M5 Plan & Status — UPDATE 2026-09-09 (session 4: bug family RESOLVED, smoke green)
+# M4 → M5 Plan & Status — UPDATE 2026-09-10 (session 4: bring-up bugs RESOLVED, CLIs built, emitCall fix IN FLIGHT)
 
-## Session 4 state (supersedes the session-3 section below)
+## READ FIRST — exact tree state at this checkpoint
 
-**ALL M4 bring-up bugs fixed; full testdiff suite GREEN (mini matrix, smoke, seam, M1, M2):**
+Nothing committed (as always). `luawasm/ops.go` contains an **IN-FLIGHT, UNCOMPILED emitCall rewrite with one KNOWN BUG** (details below) — tests will NOT be green until the one-line fix lands. Everything else in this section was verified green on the last full run (`go test ./testdiff/` → ok, 66.9s, which includes the M1 + M2 corpus gates).
 
-1. **CONCAT lower was missing its `Call(rt_concat)`** — pushed 4 args then `checkStatus()` consumed the *line number* (1) as the status → `return 1` with no rt_ call, no failfn, no staged error (the "status=1, empty error" mystery). One-line fix in emit.go; concat + CALL now work end-to-end (`print('a'..'b')` → PRINT ab).
-2. **for-loop infinite spin: `forprep_body` read the conversion from the UNFILLED temp** — `luaV_tonumber` returns the converted value as a POINTER (the cell itself for numbers; the temp only for strings); the body did `nvalue(&nv)` on the unfilled temp → on wasm that's 0.0 → coerced {1,3,1} into {0,0,0} → step=0 → `0>=0` loops forever. Exactly the M3 lesson; fixed to `nvalue(x)` through the returned pointer. Diagnosed via fuel instrumentation (`SetConsumeFuel`) + an rt_forprep input-capture diag: fpin=1,3,1 while the final cells read 0.0.
-3. **FORLOOP never set R(A+3)'s TAG** — stored the f64 value but the tag stayed nil from the entry fill → `print(i)` would see nil. Added the tag store.
-4. rt_laststatus was missing from build.sh's export list (diag read "missing export"); zz_test had a stale slice-bounds panic.
+## Verified fixes this session (full suite green before the in-flight edit)
 
-**Debug tooling added this session (all REMOVE at cleanup):** fuel-instrumented probe testdiff/forfuel_test.go (own store, SetConsumeFuel + refuel before diag reads — fuel is store-wide, diag reads trap when the tank is empty), rt_forprep input diag (rt_fpcalls/rt_fpin), formini_test.go (for-loop bisection with watchdog), dump_test.go bytecode dump with op names + jump targets.
+1. **CONCAT lower was missing its `Call(rt_concat)`** — pushed 4 args then `checkStatus()` consumed the *line number* (1) as the status → `return 1` with no rt_ call, no failfn, no staged error (the "status=1, empty error" mystery). One-line fix in emit.go; `print('a'..'b')` → PRINT ab.
+2. **for-loop infinite spin: `forprep_body` read the conversion from the UNFILLED temp** — `luaV_tonumber` returns the converted value as a POINTER (the cell itself for numbers; the temp only for strings); the body did `nvalue(&nv)` on the unfilled temp → on wasm that's 0.0 → coerced {1,3,1} into {0,0,0} → step=0 → `0>=0` loops forever. Exactly the M3 lesson; fixed to `nvalue(x)` through the returned pointer (rt_abi.c). Diagnosed via fuel instrumentation + an rt_forprep input-capture diag: fpin=1,3,1 while the final cells read 0.0.
+3. **FORLOOP never set R(A+3)'s TAG** (ops.go) — stored the f64 value but the tag stayed nil from the entry fill → `print(i)` would see nil. Added the tag store (`I32Const(3).I32Store8(8)`).
+4. rt_laststatus was missing from build.sh's export list (diag read "missing export"); zz_test had a stale slice-bounds panic (clamped).
 
-**Remaining M4 (in order):** cmd/luawasmc + cmd/luawasm-run (Philip's explicit save-to-file request) → ~200-case differential subset gate (SkipUnsupported) → cleanup (diag exports + triage tests) → M4 status block in docs + ledger.
+Result: mini matrix 8/8 (`zz=print`, `print(42)`, locals, `40+2`, `x+y`, `t.k` tables, `for i=1,3 do print('i',i) end` → PRINT i 1/i 2/i 3, `'a'..'b'` → PRINT ab), TestWasmBackendSmoke, seam (TestRTSeamSmoke + TestRTDirectABI), M1, M2 — all green.
 
-**Meta-lessons added:** (a) `//go:embed lua51_sjlj.wasm` — `go clean -testcache` alone may not re-embed a rebuilt blob; `touch testdiff/clua.go` forces it; (b) fuel is store-wide — refill before post-trap diag reads; (c) wasmtime-go v48 fuel API = `cfg.SetConsumeFuel(true)` + `store.SetFuel/GetFuel`.
+## CLIs built (Philip's save-to-file request — functionally complete, one bug found by their demo)
+
+- **cmd/luawasmc** — `.lua` → `.wasm`; flags `-o` (output path, default input basename), `-name` (chunkname, default input path). Verified: 132-byte demo source → 3245-byte module.
+- **cmd/luawasm-run** — loads a saved artifact (`WasmEngine{Precompiled}`), PRINT/STDOUT payloads → stdout, ERROR/ENGINE-ERROR/SKIP-UNSUPPORTED → stderr + exit 1, `-v` prints the full event log. Chunkname is `@<basename>` for error parity.
+- Round-trip demo verified working for: table construction `t[#t+1]='item-'..i`, `#t`, numeric for, concat, setglobal.
+
+## IN FLIGHT: emitCall results off-by-one (the ipairs bug) — NEXT ACTION
+
+**Symptom (found by the CLI demo):** `for i, v in ipairs(t) do` → `"bad argument #1 to '?' (table expected, got function)"`. `ipairs(t)` returns (next, t, nil); rt_call wrote results over the arg cells at &R(A+1), but OP_CALL semantics put results at R(A).. — everything one cell too high, so TFORLOOP called `next(next, …)`. `print(42)` masked this for weeks: want=0 → no results written.
+
+**Fix design (LANDED in ops.go `emitCall`, has one known bug):**
+- callee `R(A)` → scratch cell 0;
+- args shifted down one cell: `R(A+i) ← R(A+1+i)` ascending (B>0: static copies; B==0: dynamic loop over nargs);
+- `rt_call(scratch0, &R(A), nargs, want, line)` → results land exactly at R(A) for static AND multret; tailcall/top-adjust paths unchanged and now correct.
+
+**KNOWN BUG IN THE LANDED EDIT — fix before anything else:** the B==0 dynamic shift uses `lT1` as its loop index (ops.go ~line 156), but `lT1` holds `want`, which is still passed to rt_call after the loop → breaks `f(g())` shapes (B==0 && C>0). **Fix: use `lSt` as the shift index instead** (free until the rt_call result lands there) and change `dynCellAddrAlt` to index via `lSt`; `lT0` (nargs) stays the loop bound. Then: `go build ./...`, rerun the demo (ipairs must print), mini matrix + smoke + full testdiff.
+
+## Ordered plan to close M4
+
+0. **Land the lT1→lSt fix** (above); rebuild; demo + mini + smoke + full suite green.
+1. **TFORLOOP audit:** `emitTForloop` passes funcell=&R(A), argcells=&R(A+1) (rt_call semantics → results at R(A+1)) then moves C cells to R(A+3). Verify against vm.go OP_TFORLOOP; the fixed demo exercises it immediately.
+2. **Wire "wasm" into cmd/testdiff's `-engines` switch** (currently interp/clua only). Check normalize.go handles the engine's STEP lines (interp emits none — comparison layer must filter them or the gate false-fails).
+3. **Differential gate:** ~200-case subset, interp vs `WasmEngine{SkipUnsupported:true}`, goal 100% log match on the compilable subset; SKIP-UNSUPPORTED expected on closures/varargs (M5 work).
+4. **Cleanup:** remove ALL diag exports from rt_abi.c + build.sh (rt_sgcalls/sgname/sgvaltag, rt_ggcalls/ggname/ggresult, rt_ccalls/carg, rt_gtcalls/gt, rt_lastfn/laststatus/failfn, rt_fpcalls/fpin) and their C bodies; delete triage tests (zz, zz2, b2–b5, dump, initprobe, steplog, modcmp, protoconst, engcopy, bisect, forfuel, formini; keep trapiso harness + mini matrix + wasmbackend smoke + rtseam; calldiag's kcell/frame dump is generally useful — fold a trimmed version into mini or keep). After blob rebuild: `touch testdiff/clua.go` + `go clean -testcache` (embed staleness!).
+5. **Docs:** M4 status block in docs/Lua-Wasm-Design-and-Test-Plan.md §9; ledger rows for anything DIVERGE surfaced by step 3.
+6. **Carried (post-M4):** interp os.time/date shim alignment (ledger row 5) before M5; big.lua yield investigation.
+
+## Meta-lessons (new this session)
+
+(a) `//go:embed lua51_sjlj.wasm` — `go clean -testcache` alone may not re-embed a rebuilt blob; `touch testdiff/clua.go` forces it. (b) wasmtime fuel: set BEFORE instantiation (ctors consume); fuel is store-wide — refill before post-trap diag reads; v48 API = `cfg.SetConsumeFuel(true)` + `store.SetFuel/GetFuel`. (c) The luaV_tonumber pointer-return lesson bit AGAIN (forprep_body) — and the NATIVE M3 tests still passed because benign stack garbage hid it → native ABI tests must assert exact coerced values, not just RT_OK. (d) The CLI demo found in minutes a bug the mini matrix couldn't see (multi-result calls) — run a richer script through luawasmc/luawasm-run whenever emitCall changes.
 
 ---
 

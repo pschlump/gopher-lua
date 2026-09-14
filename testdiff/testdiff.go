@@ -99,7 +99,11 @@ func RunCorpus(cases []Case, engines []Engine) []Result {
 		r := Result{Name: c.Name, Logs: map[string][]string{}}
 		for _, e := range engines {
 			r.Engines = append(r.Engines, e.Name())
-			r.Logs[e.Name()] = e.Run(c)
+			log := e.Run(c)
+			if log == nil { // an engine paniced — keep the corpus running
+				log = []string{"ENGINE-PANIC\t" + e.Name()}
+			}
+			r.Logs[e.Name()] = log
 		}
 		results = append(results, r)
 	}
@@ -122,8 +126,13 @@ func (r Result) Diff() string {
 }
 
 // DiffLogs returns a description of the first difference between two event
-// logs ("" when equal).
+// logs ("" when equal). GLOBALS lines are excluded: the engines' library
+// sets differ by construction (gopher-lua vs C Lua 5.1 — ledger row: the
+// globals surface aligns with the host module in M7); the differential
+// contract covers script-observable PRINT/ERROR/STDOUT events.
 func DiffLogs(a, b []string) string {
+	a, b = dropGlobals(a), dropGlobals(b)
+	a, b = stripTracebacks(a), stripTracebacks(b)
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
@@ -154,6 +163,34 @@ func diffAt(a, b []string, i int) string {
 	return sb.String()
 }
 
+func dropGlobals(log []string) []string {
+	out := make([]string, 0, len(log))
+	for _, l := range log {
+		if strings.HasPrefix(l, "GLOBALS\t") {
+			continue
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
+// stripTracebacks: the interp engine's uncaught errors carry a Go-side
+// "stack traceback:" tail the C engines cannot produce — engine surface,
+// not semantics. Removed from cross-engine comparison (M5's byte-exact
+// gate compares message HEADS, before the traceback).
+func stripTracebacks(log []string) []string {
+	out := make([]string, 0, len(log))
+	for _, l := range log {
+		if strings.HasPrefix(l, "ERROR\t") {
+			if i := strings.Index(l, "\\nstack traceback:"); i >= 0 {
+				l = l[:i] + `"`
+			}
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
 func lineAt(log []string, i int) string {
 	if i < len(log) {
 		return log[i]
@@ -164,12 +201,16 @@ func lineAt(log []string, i int) string {
 // Summary renders a one-line-per-case report; used by the gate test and CLI.
 func Summary(results []Result, skipped []string) string {
 	var sb strings.Builder
-	diffCount := 0
+	okCount, diffCount := 0, 0
 	for _, r := range results {
+		if r.Skipped {
+			continue
+		}
 		if d := r.Diff(); d != "" {
 			diffCount++
 			fmt.Fprintf(&sb, "DIFF    %s\n%s", r.Name, indent(d))
 		} else {
+			okCount++
 			fmt.Fprintf(&sb, "ok      %s (%d events)\n", r.Name, len(r.Logs[r.Engines[0]]))
 		}
 	}
@@ -177,7 +218,7 @@ func Summary(results []Result, skipped []string) string {
 		fmt.Fprintf(&sb, "skip    %s\n", s)
 	}
 	fmt.Fprintf(&sb, "%d/%d cases, %d diffs, %d skips\n",
-		len(results)-diffCount, len(results), diffCount, len(skipped))
+		okCount, len(results), diffCount, len(skipped))
 	return sb.String()
 }
 

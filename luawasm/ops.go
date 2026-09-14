@@ -103,9 +103,10 @@ func (fe *funcEmitter) emitCompare(op, A, B, C, pc int) {
 	default:
 		fn = "rt_le"
 	}
-	fe.scratchAddr(0)
+	// rt_eq/rt_lt/rt_le(a, b, dst, line) — dst THIRD
 	fe.rkAddr(B)
 	fe.rkAddr(C)
+	fe.scratchAddr(0)
 	f.I32Const(fe.line(pc))
 	f.Call(fe.b.imp(fn))
 	fe.checkStatus()
@@ -122,6 +123,13 @@ func (fe *funcEmitter) emitCompare(op, A, B, C, pc int) {
 // emitCall: OP_CALL (tailcall=false) and OP_TAILCALL (tailcall=true).
 // The callee executes through rt_call — the runtime's lvm runs Lua
 // closures and C functions alike.
+//
+// rt_call(funcell, argcells, nargs, want, line) reads args from argcells
+// and writes results back over the SAME cells. OP_CALL has the callee at
+// R(A), args at R(A+1).., and results at R(A).. — so before the call the
+// callee is saved to a scratch cell and the args are shifted one cell
+// down into R(A)..; results then land exactly where the VM expects them
+// (static and multret alike).
 func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	f := fe.f
 	// nargs
@@ -138,11 +146,33 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 		f.I32Const(int32(C - 1))
 	}
 	f.LocalSet(fe.lT1)
-	// rt_call(&R(A), &R(A+1), nargs, want, line): the callee occupies R(A),
-	// arguments start at R(A+1), and results are written back over the
-	// argument cells (then the caller moves them where they belong)
+
+	// save the callee: scratch0 := R(A)
+	fe.copyCell(func() { fe.scratchAddr(0) }, func() { fe.cellAddr(A) })
+
+	// shift args down one cell: R(A+i) := R(A+1+i), ascending (each src is
+	// read before the next step overwrites it)
+	if B == 0 {
+		// dynamic count = nargs (lT0); index lives in lSt — free until the
+		// rt_call result lands there. lT1 must survive: it holds want.
+		f.I32Const(0).LocalSet(fe.lSt)
+		f.Block(wasm.Void)
+		f.Loop(wasm.Void)
+		f.LocalGet(fe.lSt).LocalGet(fe.lT0).I32GeS().BrIf(1)
+		fe.copyCell(func() { fe.dynCellAddrSt(A) }, func() { fe.dynCellAddrSt(A + 1) })
+		f.LocalGet(fe.lSt).I32Const(1).I32Add().LocalSet(fe.lSt)
+		f.Br(0)
+		f.End()
+		f.End()
+	} else {
+		for i := 0; i < B-1; i++ {
+			fe.copyCell(func() { fe.cellAddr(A + i) }, func() { fe.cellAddr(A + 1 + i) })
+		}
+	}
+
+	// rt_call(scratch0, &R(A), nargs, want, line)
+	fe.scratchAddr(0)
 	fe.cellAddr(A)
-	fe.cellAddr(A + 1)
 	f.LocalGet(fe.lT0)
 	f.LocalGet(fe.lT1)
 	f.I32Const(fe.line(pc))
@@ -157,11 +187,13 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 		// the v2 structured emitter
 		f.LocalGet(fe.lSt).Call(fe.b.imp("rt_call_count")).LocalSet(fe.lT0)
 		f.I32Const(0).LocalSet(fe.lT1)
+		f.Block(wasm.Void)
 		f.Loop(wasm.Void)
 		f.LocalGet(fe.lT1).LocalGet(fe.lT0).I32GeS().BrIf(1)
 		fe.copyDyn(A)
 		f.LocalGet(fe.lT1).I32Const(1).I32Add().LocalSet(fe.lT1)
 		f.Br(0)
+		f.End()
 		f.End()
 		f.LocalGet(fe.lT0).Return()
 		return
@@ -174,6 +206,13 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	} else {
 		f.I32Const(int32(A + C - 1)).LocalSet(fe.lTop)
 	}
+}
+
+// dynCellAddrSt: like dynCellAddr but indexed by lSt — for copy loops
+// where lT0/lT1 hold live values (nargs/want).
+func (fe *funcEmitter) dynCellAddrSt(baseReg int) *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * baseReg)).I32Add().
+		LocalGet(fe.lSt).I32Const(16).I32Mul().I32Add()
 }
 
 // copyDyn: full 16-byte copy of dynCellAddr(A) → frameDynCell()
@@ -212,11 +251,13 @@ func (fe *funcEmitter) emitReturn(A, B int) {
 	// B == 0: count = top - A, dynamic copy
 	f.LocalGet(fe.lTop).I32Const(int32(A)).I32Sub().LocalSet(fe.lT0)
 	f.I32Const(0).LocalSet(fe.lT1)
+	f.Block(wasm.Void)
 	f.Loop(wasm.Void)
 	f.LocalGet(fe.lT1).LocalGet(fe.lT0).I32GeS().BrIf(1)
 	fe.copyDyn(A)
 	f.LocalGet(fe.lT1).I32Const(1).I32Add().LocalSet(fe.lT1)
 	f.Br(0)
+	f.End()
 	f.End()
 	f.LocalGet(fe.lT0).Return()
 }
@@ -258,13 +299,31 @@ func (fe *funcEmitter) emitForloop(A, pc int) {
 	f.End()
 }
 
-// emitTForloop: results of the iterator call at R(A+3)..; on non-nil
-// control, skip the following JMP (loop body runs).
+// emitTForloop: generic for. The bytecode is `TFORLOOP A C; JMP sBx` where
+// the JMP is a pseudo-instruction — TFORLOOP's encoded back-edge to the
+// loop body, never executed on its own (vm.go applies the FOLLOWING
+// instruction's sBx to continue; exit falls through past it).
+//
+// Mirrors the interpreter: stage the iterator triple at R(A+3..A+5) (so
+// the call's results cannot clobber the loop's state/control cells), call
+// R(A+3)(R(A+4), R(A+5)) with C results at R(A+3)..; continue iff the
+// first result (new control) is non-nil — then R(A+2) = R(A+3) and jump
+// to the pseudo-JMP's target (the body); else fall to pc+2.
 func (fe *funcEmitter) emitTForloop(A, C, pc int) {
 	f := fe.f
-	// call R(A)(R(A+1), R(A+2)) → C results at R(A+3)
-	fe.cellAddr(A)
-	fe.cellAddr(A + 1)
+	// stage the triple at R(A+3..A+5), then apply the OP_CALL shape: the
+	// callee goes to scratch and the two args shift down one cell, so
+	// rt_call's results (written over argcells) land at R(A+3).. — where
+	// callR(2, nret, RA+3) puts them in the interpreter
+	fe.copyCell(func() { fe.cellAddr(A + 3) }, func() { fe.cellAddr(A) })     // iterator
+	fe.copyCell(func() { fe.cellAddr(A + 4) }, func() { fe.cellAddr(A + 1) }) // state
+	fe.copyCell(func() { fe.cellAddr(A + 5) }, func() { fe.cellAddr(A + 2) }) // control
+	fe.copyCell(func() { fe.scratchAddr(0) }, func() { fe.cellAddr(A + 3) })  // callee → scratch
+	fe.copyCell(func() { fe.cellAddr(A + 3) }, func() { fe.cellAddr(A + 4) }) // args ↓ 1
+	fe.copyCell(func() { fe.cellAddr(A + 4) }, func() { fe.cellAddr(A + 5) })
+	// rt_call(scratch0, &R(A+3), 2, C, line) → C results at R(A+3)..
+	fe.scratchAddr(0)
+	fe.cellAddr(A + 3)
 	f.I32Const(2)
 	f.I32Const(int32(C))
 	f.I32Const(fe.line(pc))
@@ -272,17 +331,14 @@ func (fe *funcEmitter) emitTForloop(A, C, pc int) {
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
 	f.I32Const(1).Return()
 	f.End()
-	// results landed at R(A+1); move C cells to R(A+3)
-	for i := 0; i < C; i++ {
-		fe.copyCell(func() { fe.cellAddr(A + 3 + i) }, func() { fe.cellAddr(A + 1 + i) })
-	}
-	// if R(A+3) ~= nil → pc++ (skip JMP) and R(A+2)=R(A+3)
+	fe.bumpTop(A + 3 + C)
+	// continue iff R(A+3) ~= nil (raw tag byte != 0)
 	fe.cellAddr(A + 3)
 	f.I32Load8U(8).I32Const(0).I32Ne().If(wasm.Void)
 	fe.copyCell(func() { fe.cellAddr(A + 2) }, func() { fe.cellAddr(A + 3) })
-	fe.setBlk(fe.blockOf(pc + 2))
+	fe.setBlk(fe.blockOf(fe.jumpTarget(pc + 1))) // body (pseudo-JMP target)
 	f.Else()
-	fe.setBlk(fe.blockOf(fe.jumpTarget(pc + 1)))
+	fe.setBlk(fe.blockOf(pc + 2)) // exit: past the pseudo-JMP
 	f.End()
 }
 
@@ -296,6 +352,7 @@ func (fe *funcEmitter) emitSetlist(A, B, C, pc int) {
 		f.I32Const(int32(B)).LocalSet(fe.lT0)
 	}
 	f.I32Const(0).LocalSet(fe.lT1)
+	f.Block(wasm.Void)
 	f.Loop(wasm.Void)
 	f.LocalGet(fe.lT1).LocalGet(fe.lT0).I32GeS().BrIf(1)
 	// key = mknumber(base + i + 1) into scratch 0
@@ -313,5 +370,6 @@ func (fe *funcEmitter) emitSetlist(A, B, C, pc int) {
 	f.End()
 	f.LocalGet(fe.lT1).I32Const(1).I32Add().LocalSet(fe.lT1)
 	f.Br(0)
+	f.End()
 	f.End()
 }

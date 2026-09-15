@@ -134,6 +134,7 @@ Proto *luaF_newproto (lua_State *L) {
   f->linedefined = 0;
   f->lastlinedefined = 0;
   f->source = NULL;
+  f->wasm_idx = -1;  /* interpreted unless the backend registers it (M5a patch) */
   return f;
 }
 

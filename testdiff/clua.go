@@ -257,6 +257,12 @@ func (e *CLua) Run(c Case) []string {
 		func(seed int64) { rng = rand.New(rand.NewSource(seed)) }); err != nil {
 		return []string{"ENGINE-ERROR\thost randomseed: " + err.Error()}
 	}
+	// ABI v3 reverse seam (M5a): the oracle never registers wasm protos,
+	// so a refusing stub satisfies the import (the adapter re-raises -3)
+	if err := linker.DefineFunc(store, "host", "wasm_dispatch",
+		func(idx, frame, cl, nargs, want int32) int32 { return -3 }); err != nil {
+		return []string{"ENGINE-ERROR\thost wasm_dispatch: " + err.Error()}
+	}
 
 	wasi := wt.NewWasiConfig()
 	if err := wasi.PreopenDir(c.Dir, "/", true); err != nil {

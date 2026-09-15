@@ -32,7 +32,7 @@
 
 #include "lua51/src/lua.h"
 
-#define LUA_RT_ABI 2
+#define LUA_RT_ABI 3 /* v3 (M5a): wasm dispatch/closures/upvalue registry/frame stack */
 
 /* rt_addr: the pointer-carrying parameter type. On wasm32 it is i32 —
    this IS the frozen ABI. The native test build (RT_ABI_NATIVE64)

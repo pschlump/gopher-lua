@@ -43,6 +43,11 @@ func trapEnvNamedBin(t *testing.T, wasi, script bool, chunkName string, binOverr
 	if err := linker.DefineFunc(store, "host", "randomseed", func(int64) {}); err != nil {
 		t.Fatal(err)
 	}
+	// ABI v3 reverse seam (M5a): refusing stub, per the plan
+	if err := linker.DefineFunc(store, "host", "wasm_dispatch",
+		func(idx, frame, cl, nargs, want int32) int32 { return -3 }); err != nil {
+		t.Fatal(err)
+	}
 	if wasi {
 		w := wt.NewWasiConfig()
 		if err := w.PreopenDir(t.TempDir(), "/", true); err != nil {

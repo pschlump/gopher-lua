@@ -26,11 +26,13 @@
 #include "rt_abi.h"
 #include "lua51/src/lauxlib.h"
 #include "lua51/src/ldo.h"
+#include "lua51/src/lfunc.h"
 #include "lua51/src/lobject.h"
 #include "lua51/src/lstate.h"
 #include "lua51/src/ldebug.h"
 #include "lua51/src/lstring.h"
 #include "lua51/src/ltm.h"
+#include "rt_wasm.h"
 
 /* lvm.c's l_strcmp is static; same semantics (Lua 5.1.5) */
 static int rt_strcmp(const TString *ls, const TString *rs) {
@@ -50,13 +52,17 @@ _Static_assert(sizeof(TValue) == 16, "TValue must be 16 bytes on wasm32");
 _Static_assert(sizeof(lua_Number) == 8, "numbers are f64");
 
 static lua_State *curL;
+static int rt_wasm_depth; /* adapter nesting (RTW_MAX_DEPTH guard, v3) */
 
 /* staged-error position prefix: the real chunk name (parity with the
    interpreter's "name:line:" format) */
 static char chunk_name[256] = "script";
 static int chunk_name_len = 6;
 
-/* staged error: sticky until rt_err_clear; bytes for the frame chain */
+/* staged error: sticky until rt_err_clear. err_value carries the EXACT
+   error TValue (the M5a fix — the adapter re-raises from it, so non-string
+   objects survive); err_buf holds message bytes, filled only when the
+   value is a string (the typed protocol for other tags is M5d). */
 static TValue err_value;
 static char err_buf[1024];
 static int err_buf_len, err_pending;
@@ -65,12 +71,16 @@ static void stage_error(void) {
   const TValue *ev = curL->top - 1;
   err_value = *ev;
   curL->top -= 1;
-  const char *s = svalue(ev);
-  size_t n = strlen(s);
-  if (n > sizeof err_buf - 1) n = sizeof err_buf - 1;
-  memcpy(err_buf, s, n);
-  err_buf[n] = '\0';
-  err_buf_len = (int)n;
+  err_buf_len = 0;
+  err_buf[0] = '\0';
+  if (ttisstring(ev)) {
+    const char *s = svalue(ev);
+    size_t n = strlen(s);
+    if (n > sizeof err_buf - 1) n = sizeof err_buf - 1;
+    memcpy(err_buf, s, n);
+    err_buf[n] = '\0';
+    err_buf_len = (int)n;
+  }
   err_pending = 1;
 }
 
@@ -83,6 +93,7 @@ void rt_set_state(rt_addr p) {
   err_pending = 0;
   err_buf_len = 0;
   setnilvalue(&err_value);
+  rt_wasm_depth = 0;
 }
 
 int32_t rt_err_pending(void) { return err_pending; }
@@ -504,3 +515,281 @@ void rt_set_chunkname(rt_addr ptr, int32_t len) {
 
 const char *rt_chunkname_ptr(void) { return chunk_name; }
 int32_t rt_chunkname_len(void) { return chunk_name_len; }
+
+/* ---- ABI v3 (M5a): the wasm-proto registry, frame stack, closures ----
+**
+** Everything C-initiated (pcall, sort comparators, gsub replacements,
+** __index on wasm closures) funnels through luaD_call → luaD_precall →
+** precall_wasm (ldo.c), which pushes a frame here and dispatches through
+** the host into the script module's lua_dispatch.
+*/
+
+struct rt_wasm_md {
+  int numparams, isvararg, nupvalues, framecells;
+  struct { int instack, idx; } *uv; /* capture descriptors (nupvalues) */
+  Proto *proto;                     /* the registered C Proto (wasm_idx) */
+};
+
+static struct rt_wasm_md *rt_md;
+static int rt_md_n, rt_md_cap;
+
+int32_t rt_wasm_enter(void) {
+  if (rt_wasm_depth >= RTW_MAX_DEPTH) {
+    /* the interpreter's message (state.go:1141); M5d pins wording and
+       the depth divergence is ledgered (plan §7) */
+    TString *ts = luaS_newlstr(curL, "stack overflow", 13);
+    err_pending = 1;
+    setsvalue(curL, &err_value, ts);
+    err_buf_len = 13;
+    memcpy(err_buf, "stack overflow", 14);
+    return 1;
+  }
+  rt_wasm_depth++;
+  return 0;
+}
+
+void rt_wasm_leave(void) {
+  if (rt_wasm_depth > 0) rt_wasm_depth--;
+}
+
+/* frame stack: chunked bump region in shared memory; the M6 arena
+   lifecycle replaces this. Chunks are malloc'd — never realloc'd — so
+   live frames below the cursor can never move. */
+struct rt_frchunk {
+  struct rt_frchunk *prev;
+  rt_addr base;
+  uint32_t cap, used;
+};
+static struct rt_frchunk *rt_fr;
+
+rt_addr rt_wasm_push_frame(lua_State *L, StkId base, int mdidx, int nargs) {
+  struct rt_wasm_md *m;
+  uint32_t need;
+  rt_addr frame;
+  int np, nv, i;
+
+  (void)L;
+  m = &rt_md[mdidx];
+  nv = (m->isvararg && nargs > m->numparams) ? nargs - m->numparams : 0;
+  need = (uint32_t)sizeof(TValue) * (uint32_t)(m->framecells + 1 + nv);
+  if (rt_fr == NULL || rt_fr->cap - rt_fr->used < need) {
+    uint32_t cap = need > (1u << 20) ? need * 2 : (1u << 20);
+    struct rt_frchunk *ch = (struct rt_frchunk *)malloc(sizeof *ch);
+    void *mem = malloc(cap);
+    if (ch == NULL || mem == NULL) {
+      free(ch);
+      free(mem);
+      return 0;
+    }
+    ch->prev = rt_fr;
+    ch->base = (rt_addr)(size_t)mem;
+    ch->cap = cap;
+    ch->used = 0;
+    rt_fr = ch;
+  }
+  frame = rt_fr->base + rt_fr->used;
+  rt_fr->used += need;
+
+  /* copy args: params → frame+0.., extras → varargBase (above the
+     nregs+4 register window; plan §3.2). Non-vararg protos drop extras,
+     like stock luaD_precall. */
+  np = nargs < m->numparams ? nargs : m->numparams;
+  for (i = 0; i < np; i++)
+    *(TValue *)(size_t)(frame + (rt_addr)sizeof(TValue) * i) = base[i];
+  if (m->isvararg) {
+    rt_addr vb = frame + (rt_addr)sizeof(TValue) * m->framecells;
+    for (i = 0; i < nv; i++)
+      *(TValue *)(size_t)(vb + (rt_addr)sizeof(TValue) * i) =
+          base[m->numparams + i];
+  }
+  return frame;
+}
+
+rt_addr rt_frame_cursor(void) {
+  return rt_fr ? rt_fr->base + (rt_addr)rt_fr->used : 0;
+}
+
+void rt_frame_restore(rt_addr saved) {
+  while (rt_fr != NULL && saved < rt_fr->base) {
+    struct rt_frchunk *p = rt_fr->prev;
+    free((void *)(size_t)rt_fr->base);
+    free(rt_fr);
+    rt_fr = p;
+  }
+  if (rt_fr != NULL)
+    rt_fr->used = (uint32_t)(saved - rt_fr->base);
+}
+
+int32_t rt_wasm_proto(int32_t idx, int32_t numparams, int32_t isvararg,
+                      int32_t nupvalues, int32_t framecells) {
+  struct rt_wasm_md *m;
+  Proto *p;
+  if (err_pending) return RT_ERR;
+  if (idx < 0) return RT_ERR;
+  if (idx >= rt_md_cap) {
+    int ncap = rt_md_cap ? rt_md_cap * 2 : 16;
+    while (ncap <= idx) ncap *= 2;
+    struct rt_wasm_md *nm =
+        (struct rt_wasm_md *)realloc(rt_md, (size_t)ncap * sizeof *nm);
+    if (nm == NULL) return RT_ERR;
+    rt_md = nm;
+    rt_md_cap = ncap;
+  }
+  p = luaF_newproto(curL); /* GC-linked; can only raise on OOM */
+  p->wasm_idx = (int)idx;
+  p->source = luaS_newlstr(curL, chunk_name, (size_t)chunk_name_len);
+  p->numparams = (lu_byte)numparams;
+  p->is_vararg = (lu_byte)isvararg;
+  p->nups = (lu_byte)nupvalues;
+  /* maxstacksize is a lu_byte; framecells can exceed 255 (nregs+4). The
+     ADAPTER sizes frames from the registry (full int); the Proto field
+     is C-invariant bookkeeping only (checkstack/ci->top). */
+  p->maxstacksize = (lu_byte)(framecells > 255 ? 255 : framecells);
+  m = &rt_md[idx];
+  m->numparams = numparams;
+  m->isvararg = isvararg;
+  m->nupvalues = nupvalues;
+  m->framecells = framecells;
+  m->uv = NULL;
+  if (nupvalues > 0) {
+    m->uv = (void *)calloc((size_t)nupvalues, sizeof *m->uv);
+    if (m->uv == NULL) return RT_ERR;
+  }
+  m->proto = p;
+  if (idx >= rt_md_n) rt_md_n = idx + 1;
+  return RT_OK;
+}
+
+void rt_wasm_upval(int32_t protoidx, int32_t uvidx, int32_t instack,
+                   int32_t idx) {
+  if (protoidx < 0 || protoidx >= rt_md_n) return;
+  struct rt_wasm_md *m = &rt_md[protoidx];
+  if (uvidx < 0 || uvidx >= m->nupvalues) return;
+  m->uv[uvidx].instack = instack;
+  m->uv[uvidx].idx = idx;
+}
+
+int32_t rt_wasm_count(void) { return rt_md_n; }
+
+/* rt-owned open-upvalue registry (NOT L->openupval: ldo.c's correctstack
+   re-bases every pointer in that list on stack growth, which would
+   corrupt wasm frame addresses; luaF_close's numeric ordering would
+   prematurely close outer wasm activations — plan §3.4). Address-ordered
+   descending, like luaF_findupval's list discipline. UpVals themselves
+   are luaF_newupval objects (GC-visible; registry-not-scanned is the
+   ledgered v1 posture with GC stopped). */
+struct rt_uvlink {
+  struct rt_uvlink *next;
+  rt_addr v;
+  UpVal *uv;
+};
+static struct rt_uvlink *rt_openupval;
+
+static UpVal *rt_findupval(rt_addr addr) {
+  struct rt_uvlink **pp = &rt_openupval, *n;
+  while (*pp != NULL && (*pp)->v >= addr) {
+    if ((*pp)->v == addr) return (*pp)->uv;
+    pp = &(*pp)->next;
+  }
+  n = (struct rt_uvlink *)malloc(sizeof *n);
+  if (n == NULL) return NULL;
+  n->uv = luaF_newupval(curL); /* closed-nil, GC-linked */
+  n->uv->v = (StkId)(size_t)addr; /* open: points into the wasm frame */
+  n->v = addr;
+  n->next = *pp;
+  *pp = n;
+  return n->uv;
+}
+
+static void rt_closeuv(struct rt_uvlink *node) {
+  setobj(curL, &node->uv->u.value, node->uv->v);
+  node->uv->v = &node->uv->u.value; /* closed: the value lives here now */
+  free(node);
+}
+
+void rt_close_upvals(rt_addr level) {
+  while (rt_openupval != NULL && rt_openupval->v >= level) {
+    struct rt_uvlink *n = rt_openupval->next;
+    rt_closeuv(rt_openupval);
+    rt_openupval = n;
+  }
+}
+
+int32_t rt_newclosure(rt_addr dstcell, int32_t protoidx, rt_addr parentcl,
+                      rt_addr frameaddr, int32_t line) {
+  struct rt_wasm_md *m;
+  Closure *parent = parentcl ? (Closure *)(size_t)parentcl : NULL;
+  Closure *cl;
+  int i;
+  (void)line;
+  if (err_pending || protoidx < 0 || protoidx >= rt_md_n) return RT_ERR;
+  m = &rt_md[protoidx];
+  cl = luaF_newLclosure(curL, m->nupvalues,
+                        parent ? parent->l.env : hvalue(&curL->l_gt));
+  for (i = 0; i < m->nupvalues; i++) {
+    if (m->uv[i].instack) {
+      UpVal *uv = rt_findupval(frameaddr + (rt_addr)sizeof(TValue) * m->uv[i].idx);
+      if (uv == NULL) return RT_ERR;
+      cl->l.upvals[i] = uv;
+    } else if (parent != NULL) {
+      cl->l.upvals[i] = parent->l.upvals[m->uv[i].idx];
+    } else {
+      return RT_ERR; /* upvalue-of-main capture without a parent closure */
+    }
+  }
+  setclvalue(curL, (TValue *)(size_t)dstcell, cl);
+  return RT_OK;
+}
+
+void rt_getupval(rt_addr cl, int32_t idx, rt_addr cell) {
+  UpVal *uv = ((Closure *)(size_t)cl)->l.upvals[idx];
+  *(TValue *)(size_t)cell = *uv->v;
+}
+
+void rt_setupval(rt_addr cl, int32_t idx, rt_addr cell) {
+  UpVal *uv = ((Closure *)(size_t)cl)->l.upvals[idx];
+  *uv->v = *(TValue *)(size_t)cell; /* write-through: open → the frame cell */
+}
+
+/* the 5.0-compat `arg` table: {1..n, n=n} (state.go's initCallFrame) */
+static TValue *ca_dst;
+static rt_addr ca_vb;
+static int ca_n;
+
+static void compat_arg_body(void) {
+  Table *t = luaH_new(curL, ca_n > 0 ? ca_n : 0, 1);
+  int i;
+  for (i = 0; i < ca_n; i++)
+    setobj2t(curL, luaH_setnum(curL, t, i + 1),
+             (TValue *)(size_t)(ca_vb + (rt_addr)sizeof(TValue) * i));
+  {
+    TValue v;
+    setnvalue(&v, ca_n);
+    setobj2t(curL, luaH_setstr(curL, t, luaS_newliteral(curL, "n")), &v);
+  }
+  sethvalue(curL, ca_dst, t);
+}
+
+int32_t rt_compat_arg(rt_addr dstcell, rt_addr varargbase, int32_t nvarargs) {
+  if (err_pending) return RT_ERR;
+  ca_dst = (TValue *)(size_t)dstcell;
+  ca_vb = varargbase;
+  ca_n = (int)nvarargs;
+  return rt_run(compat_arg_body, 0);
+}
+
+int32_t rt_clidx(rt_addr funcell) {
+  const TValue *f = (const TValue *)(size_t)funcell;
+  if (ttisfunction(f) && !clvalue(f)->c.isC &&
+      clvalue(f)->l.p->wasm_idx >= 0)
+    return clvalue(f)->l.p->wasm_idx;
+  return -1;
+}
+
+rt_addr rt_err_value_ptr(void) { return (rt_addr)(size_t)&err_value; }
+
+int32_t rt_err_stage_value(rt_addr dst, int32_t cap) {
+  if (cap < (int32_t)sizeof(TValue)) return 0;
+  memcpy((void *)(size_t)dst, &err_value, sizeof err_value);
+  return (int32_t)sizeof(TValue);
+}

@@ -174,6 +174,35 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		func(seed int64) { rng = rand.New(rand.NewSource(seed)) }); err != nil {
 		return []string{"ENGINE-ERROR\t" + err.Error()}
 	}
+	// host.wasm_dispatch: the M5a reverse seam — the C runtime's
+	// precall_wasm adapter dispatches compiled protos through the host
+	// into the script module's exported lua_dispatch (same store, nested
+	// call). scriptInst is wired below once instantiated; until then (and
+	// for stub hosts) this refuses with -3, which the adapter re-raises
+	// as a Lua error.
+	var scriptInst *wt.Instance
+	dispatch := func(idx, frame, cl, nargs, want int32) int32 {
+		if scriptInst == nil {
+			return -3
+		}
+		fn := scriptInst.GetFunc(store, "lua_dispatch")
+		if fn == nil {
+			return -3
+		}
+		res, err := fn.Call(store, idx, frame, cl, nargs, want)
+		if err != nil {
+			// a trap inside the dispatch must not unwind through wasm:
+			// surface as a refused dispatch; the adapter raises it
+			return -3
+		}
+		if n, ok := res.(int32); ok {
+			return n
+		}
+		return -3
+	}
+	if err := linker.DefineFunc(store, "host", "wasm_dispatch", dispatch); err != nil {
+		return []string{"ENGINE-ERROR\t" + err.Error()}
+	}
 
 	wasi := wt.NewWasiConfig()
 	if err := wasi.PreopenDir(c.Dir, "/", true); err != nil {
@@ -229,10 +258,11 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	if err != nil {
 		return []string{"ENGINE-ERROR\tscript module: " + err.Error()}
 	}
-	scriptInst, err := linker.Instantiate(store, scriptMod)
+	si, err := linker.Instantiate(store, scriptMod)
 	if err != nil {
 		return []string{"ENGINE-ERROR\tscript instantiate: " + err.Error()}
 	}
+	scriptInst = si
 
 	L, err := call(rtInst, "lnewstate")
 	if err != nil {
@@ -255,8 +285,8 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	if err != nil {
 		return []string{"ENGINE-ERROR\tABI version: " + err.Error()}
 	}
-	if avv, ok := av.(int32); !ok || avv != 2 {
-		return []string{fmt.Sprintf("ENGINE-ERROR\tABI version %v (need 2)", av)}
+	if avv, ok := av.(int32); !ok || avv != 3 {
+		return []string{fmt.Sprintf("ENGINE-ERROR\tABI version %v (need 3)", av)}
 	}
 	initStep := int32(2)
 	if v := os.Getenv("INITSTEP"); v != "" {

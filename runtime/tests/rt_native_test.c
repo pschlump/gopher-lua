@@ -15,6 +15,15 @@
 /* pull the ABI in directly (single translation unit with Lua core) */
 #include "../rt_abi.c"
 
+/* wasm_dispatch_host is a host import on wasm; native tests have no
+   script module, so stub it host-refused (nothing registers a wasm proto
+   here, so precall_wasm never dispatches) */
+int32_t wasm_dispatch_host(int32_t idx, rt_addr frame, rt_addr cl,
+                           int32_t nargs, int32_t want) {
+  (void)idx; (void)frame; (void)cl; (void)nargs; (void)want;
+  return RTW_REFUSED;
+}
+
 static int failures = 0;
 #define CHECK(cond) do { \
 	if (!(cond)) { failures++; printf("FAIL %d: %s\n", __LINE__, #cond); } \

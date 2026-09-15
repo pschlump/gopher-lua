@@ -28,6 +28,8 @@
 #include "ltm.h"
 #include "lundump.h"
 #include "lvm.h"
+
+#include "rt_wasm.h"  /* M5a patch: the Lua→wasm precall adapter (built with -I.) */
 #include "lzio.h"
 
 
@@ -262,6 +264,127 @@ static StkId tryfuncTM (lua_State *L, StkId func) {
    (condhardstacktests(luaD_reallocCI(L, L->size_ci)), ++L->ci))
 
 
+/*
+** {======================================================
+** M5a patch: the Lua→wasm precall adapter (rt_wasm.h, plan §4).
+**
+** A closure whose Proto carries wasm_idx >= 0 executes as compiled
+** script-module code. The script module shares this module's linear
+** memory but is a separate instance, so the runtime dispatches through
+** the HOST (wasm_dispatch_host → the script's exported lua_dispatch) —
+** a nested call into the same store.
+**
+** Error-safety law: a longjmp NEVER crosses the Go boundary. Wasm-side
+** errors come back as nret == -1 with the exact TValue staged in the
+** runtime; each adapter level rawrunprotects its dispatch and restores
+** frame-cursor/CallInfo/base before re-raising, so a deeper luaD_throw
+** unwinds watertightly to the nearest setjmp (pcall's or rt_run's).
+** ======================================================= }
+*/
+
+struct rtw_ctx {
+  int32_t idx;
+  rt_addr frame, cl;
+  int32_t nargs, want, nret;
+};
+
+static void rtw_dispatch_body (lua_State *L, void *ud) {
+  struct rtw_ctx *c = (struct rtw_ctx *)ud;
+  (void)L;
+  c->nret = wasm_dispatch_host(c->idx, c->frame, c->cl, c->nargs, c->want);
+}
+
+static int precall_wasm (lua_State *L, StkId func, int nresults,
+                         LClosure *cl, Proto *p) {
+  ptrdiff_t funcr = savestack(L, func);
+  ptrdiff_t old_ci = saveci(L, L->ci);
+  ptrdiff_t old_base = savestack(L, L->base);
+  ptrdiff_t old_top = savestack(L, L->top);
+  rt_addr saved_cursor = rt_frame_cursor();
+  struct rtw_ctx ctx;
+  CallInfo *ci;
+  int nargs = cast_int(L->top - func) - 1;
+  int status;
+
+  if (rt_wasm_enter() != 0) {  /* over RTW_MAX_DEPTH: staged error */
+    TValue *ev = (TValue *)(size_t)rt_err_value_ptr();
+    setobj2s(L, L->top, ev);
+    incr_top(L);
+    luaD_throw(L, LUA_ERRRUN);
+  }
+
+  L->ci->savedpc = L->savedpc;  /* like both stock paths */
+  luaD_checkstack(L, p->maxstacksize + 1);
+  func = restorestack(L, funcr);  /* checkstack may have moved the stack */
+
+  /* enter the function: CallInfo shaped like a Lua frame so tracebacks,
+     poscall and nested C activity see a consistent state */
+  ci = inc_ci(L);
+  ci->func = func;
+  L->base = ci->base = func + 1;
+  ci->top = L->base + p->maxstacksize;
+  ci->tailcalls = 0;
+  ci->nresults = nresults;
+
+  ctx.idx = p->wasm_idx;
+  ctx.frame = rt_wasm_push_frame(L, func + 1, p->wasm_idx, nargs);
+  ctx.cl = (rt_addr)(size_t)cl;
+  ctx.nargs = nargs;
+  ctx.want = nresults;
+  if (ctx.frame == 0) {  /* frame region exhausted */
+    rt_wasm_leave();
+    luaD_throw(L, LUA_ERRMEM);
+  }
+
+  status = luaD_rawrunprotected(L, rtw_dispatch_body, &ctx);
+  rt_wasm_leave();
+  if (status != 0) {
+    /* a deeper luaD_throw crossed the boundary (C-side throw inside the
+       dispatch): restore this level and re-raise. The error object stays
+       wherever the thrower left it (L->top-1) — luaD_seterrorobj reads
+       it there; restoring L->top now would lose it. */
+    rt_frame_restore(saved_cursor);
+    L->ci = restoreci(L, old_ci);
+    L->base = restorestack(L, old_base);
+    luaD_throw(L, status);
+  }
+  if (ctx.nret == RTW_ERR || ctx.nret == RTW_REFUSED) {
+    /* wasm-side error (or a stub host): re-raise the staged TValue */
+    TValue *ev = (TValue *)(size_t)rt_err_value_ptr();
+    rt_frame_restore(saved_cursor);
+    L->ci = restoreci(L, old_ci);
+    L->base = restorestack(L, old_base);
+    L->top = restorestack(L, old_top);
+    setobj2s(L, L->top, ev);
+    incr_top(L);
+    luaD_throw(L, LUA_ERRRUN);
+  }
+  if (ctx.nret == RTW_TAIL) {
+    /* M5c: unreachable — nothing stages -2 yet (the restage loop arrives
+       with the tailcall trampoline) */
+    rt_frame_restore(saved_cursor);
+    L->ci = restoreci(L, old_ci);
+    L->base = restorestack(L, old_base);
+    L->top = restorestack(L, old_top);
+    luaD_throw(L, LUA_ERRRUN);
+  }
+  /* success: nret results staged at frame+0.. — copy to func.. and let
+     poscall trim per nresults (it also pops our CallInfo) */
+  {
+    StkId first = restorestack(L, funcr);
+    int i;
+    for (i = 0; i < ctx.nret; i++)
+      setobjs2s(L, first + i, (StkId)(size_t)(ctx.frame + (rt_addr)16 * i));
+    L->top = first + ctx.nret;
+  }
+  rt_frame_restore(saved_cursor);
+  luaD_poscall(L, restorestack(L, funcr));
+  return PCRC;
+}
+
+/* }====================================================== */
+
+
 int luaD_precall (lua_State *L, StkId func, int nresults) {
   LClosure *cl;
   ptrdiff_t funcr;
@@ -274,6 +397,8 @@ int luaD_precall (lua_State *L, StkId func, int nresults) {
     CallInfo *ci;
     StkId st, base;
     Proto *p = cl->p;
+    if (p->wasm_idx >= 0)  /* compiled Lua→wasm function: the M5a adapter */
+      return precall_wasm(L, func, nresults, cl, p);
     luaD_checkstack(L, p->maxstacksize);
     func = restorestack(L, funcr);
     if (!p->is_vararg) {  /* no varargs? */

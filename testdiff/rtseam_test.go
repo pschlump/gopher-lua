@@ -53,6 +53,13 @@ func rtSetup(t *testing.T, scriptBin []byte) (*wt.Store, *wt.Instance, func(stri
 	if err := linker.DefineFunc(store, "host", "randomseed", func(int64) {}); err != nil {
 		t.Fatal(err)
 	}
+	// ABI v3: the runtime imports the wasm-dispatch seam (M5a). The seam
+	// tests don't register wasm protos, so a refusing stub suffices; the
+	// reentry spike defines the real trampoline itself.
+	if err := linker.DefineFunc(store, "host", "wasm_dispatch",
+		func(idx, frame, cl, nargs, want int32) int32 { return -3 }); err != nil {
+		t.Fatal(err)
+	}
 	store.SetWasi(wt.NewWasiConfig())
 	inst, err := linker.Instantiate(store, module)
 	if err != nil {
@@ -256,7 +263,7 @@ func TestRTSeamSmoke(t *testing.T) {
 	if _, err := rtCall("rt_set_state", L); err != nil {
 		t.Fatalf("rt_set_state: %v", err)
 	}
-	if v, err := rtCall("rt_abi_version"); err != nil || v != 2 {
+	if v, err := rtCall("rt_abi_version"); err != nil || v != 3 {
 		t.Fatalf("rt_abi_version: %v %v", v, err)
 	}
 	base, err := rtCall("rt_frame_alloc", uint64(16*16))

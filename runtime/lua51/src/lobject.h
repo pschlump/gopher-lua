@@ -250,6 +250,7 @@ typedef struct Proto {
   lu_byte numparams;
   lu_byte is_vararg;
   lu_byte maxstacksize;
+  int wasm_idx;  /* Lua→wasm backend: dispatch index (rt_wasm_proto), -1 = interpreted (M5a patch) */
 } Proto;
 
 

@@ -36,6 +36,7 @@ static const char *getfuncname (lua_State *L, CallInfo *ci, const char **name);
 
 static int currentpc (lua_State *L, CallInfo *ci) {
   if (!isLua(ci)) return -1;  /* function is not a Lua function? */
+  if (rt_wasm_ciframe(ci)) return -1;  /* M5d: wasm frames carry no C code */
   if (ci == L->ci)
     ci->savedpc = L->savedpc;
   return pcRel(ci->savedpc, ci_func(ci)->l.p);
@@ -547,6 +548,8 @@ static const char *getfuncname (lua_State *L, CallInfo *ci, const char **name) {
   if ((isLua(ci) && ci->tailcalls > 0) || !isLua(ci - 1))
     return NULL;  /* calling function is not Lua (or is unknown) */
   ci--;  /* calling function */
+  if (rt_wasm_ciframe(ci))
+    return NULL;  /* M5d: registered protos have no C code — p->code is NULL */
   i = ci_func(ci)->l.p->code[currentpc(L, ci)];
   if (GET_OPCODE(i) == OP_CALL || GET_OPCODE(i) == OP_TAILCALL ||
       GET_OPCODE(i) == OP_TFORLOOP)

@@ -87,6 +87,7 @@ int rt_line_depth(void);     /* activation line-stack (per live rt_run) */
 int rt_line_at(int32_t from_top); /* 0 = top */
 void rt_gindex_error(lua_State *L, const TValue *t, const TValue *k);
 int rt_wasm_ci(lua_State *L); /* current CallInfo is a wasm frame */
+int rt_wasm_ciframe(CallInfo *ci);
 
 /* ---- internal helpers (rt_abi.c; called from ldo.c's adapter) ---- */
 

@@ -148,10 +148,16 @@ void rt_gindex_error(lua_State *L, const TValue *t, const TValue *k) {
                 rt_gtypename_safe(t), kb);
 }
 int rt_wasm_ci(lua_State *L) {
-  Closure *cl;
-  if (L->ci == NULL || L->ci == L->base_ci - 1 || !ttisfunction(L->ci->func))
+  if (L->ci == NULL)
     return 0;
-  cl = clvalue(L->ci->func);
+  return rt_wasm_ciframe(L->ci);
+}
+
+int rt_wasm_ciframe(CallInfo *ci) {
+  Closure *cl;
+  if (ci == NULL || !ttisfunction(ci->func))
+    return 0;
+  cl = clvalue(ci->func);
   return !cl->c.isC && cl->l.p->wasm_idx >= 0;
 }
 
@@ -423,6 +429,16 @@ static TValue len_v, *len_dst;
 
 static void len_body(void) {
   TValue *dst = len_dst; /* reentrancy (metamethod) */
+  const TValue *tm = luaT_gettmbyobj(curL, &len_v, TM_LEN);
+  if (!ttisnil(tm)) {  /* __len metamethod wins for any type (OP_LEN) */
+    luaD_checkstack(curL, 3);
+    setobj2s(curL, curL->top, tm); curL->top++;
+    setobj2s(curL, curL->top, &len_v); curL->top++;
+    luaD_call(curL, curL->top - 2, 1);
+    *dst = *(TValue *)(curL->top - 1);
+    curL->top -= 1;
+    return;
+  }
   switch (ttype(&len_v)) {
   case LUA_TTABLE:
     setnvalue(dst, cast_num(luaH_getn(hvalue(&len_v))));
@@ -430,16 +446,8 @@ static void len_body(void) {
   case LUA_TSTRING:
     setnvalue(dst, cast_num(tsvalue(&len_v)->len));
     return;
-  default: {
-    const TValue *tm = luaT_gettmbyobj(curL, &len_v, TM_LEN);
-    if (ttisnil(tm)) luaG_typeerror(curL, &len_v, "get length of");
-    luaD_checkstack(curL, 3);
-    setobj2s(curL, curL->top, tm); curL->top++;
-    setobj2s(curL, curL->top, &len_v); curL->top++;
-    luaD_call(curL, curL->top - 2, 1);
-    *dst = *(TValue *)(curL->top - 1);
-    curL->top -= 1;
-  }
+  default:
+    luaG_typeerror(curL, &len_v, "get length of");
   }
 }
 

@@ -178,7 +178,7 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	f.I32Const(fe.line(pc))
 	f.Call(fe.b.imp("rt_call")).LocalSet(fe.lSt)
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
-	f.I32Const(1).Return()
+	f.I32Const(-1).Return()
 	f.End()
 
 	if tail {
@@ -329,7 +329,7 @@ func (fe *funcEmitter) emitTForloop(A, C, pc int) {
 	f.I32Const(fe.line(pc))
 	f.Call(fe.b.imp("rt_call")).LocalSet(fe.lSt)
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
-	f.I32Const(1).Return()
+	f.I32Const(-1).Return()
 	f.End()
 	fe.bumpTop(A + 3 + C)
 	// continue iff R(A+3) ~= nil (raw tag byte != 0)
@@ -366,7 +366,7 @@ func (fe *funcEmitter) emitSetlist(A, B, C, pc int) {
 	f.I32Const(fe.line(pc))
 	f.Call(fe.b.imp("rt_settable")).LocalSet(fe.lSt)
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
-	f.I32Const(1).Return()
+	f.I32Const(-1).Return()
 	f.End()
 	f.LocalGet(fe.lT1).I32Const(1).I32Add().LocalSet(fe.lT1)
 	f.Br(0)

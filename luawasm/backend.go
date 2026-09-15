@@ -1,19 +1,25 @@
-// Package luawasm is the Lua→wasm backend (design doc §4, milestone M4):
+// Package luawasm is the Lua→wasm backend (design doc §4, milestones M4–M5):
 // FunctionProto trees from the gopher-lua frontend become wasm modules
 // that share linear memory with the C runtime and call down through the
 // frozen rt_* ABI (runtime/rt_abi.h).
 //
-// v1 shape: one wasm function for the main proto, registers as TValue
-// cells in a frame allocated from the runtime heap, flattened control
-// flow (loop + br_table over basic blocks), every opcode lowered via the
-// ABI with inline fast paths for number arithmetic and the numeric for
-// loop. Calls (OP_CALL/OP_TAILCALL) go through rt_call — the runtime's
-// lvm executes the callee — so correctness never depends on the compiled
-// path (the M3 architecture law).
+// M5a A3 shape: EVERY proto compiles to a wasm function with the common
+// signature (frame, cl, nargs, want) -> nret — registers as TValue cells
+// in a shared-memory frame the C adapter allocates and arg-fills
+// (precall_wasm in ldo.c), flattened control flow, every opcode lowered
+// via the ABI with inline fast paths for number arithmetic and the
+// numeric for loop. lua_dispatch br_table-dispatches proto idx to its
+// function; the C runtime reaches it through the host trampoline
+// (host.wasm_dispatch) — the A2-proven reentrancy seam. Calls
+// (OP_CALL/OP_TAILCALL) go through rt_call; when the callee is a wasm
+// closure, luaD_precall's adapter loops it back into compiled code.
 //
-// Not yet lowered (v1): OP_CLOSURE (needs the Proto-struct emission +
-// closures ABI, carried to M5) and OP_VARARG; encountering them fails
-// the compile with a clear error.
+// nret convention (ABI v3): >= 0 results at frame+0.., -1 error (the
+// exact TValue staged in the runtime), -2 tailcall sentinel (M5c),
+// -3 host-refused.
+//
+// Not yet lowered: OP_VARARG (M5b) and — until A4 — OP_CLOSURE and the
+// upvalue opcodes; encountering them fails the compile with a clear error.
 package luawasm
 
 import (
@@ -28,6 +34,14 @@ const (
 	rtNumTag = 3  // LUA_TNUMBER in TValue.tt
 )
 
+// protoInfo: one proto's slot in the module (dispatch index = order).
+type protoInfo struct {
+	proto *lua.FunctionProto
+	koff  int // global constant-pool index of Constants[0]
+	nc    int // len(Constants)
+	nsc   int // len(StringConstants)
+}
+
 // Compile emits a wasm module for the FunctionProto tree rooted at main.
 func Compile(main *lua.FunctionProto, chunkName string) ([]byte, error) {
 	protos := collectProtos(main)
@@ -35,21 +49,26 @@ func Compile(main *lua.FunctionProto, chunkName string) ([]byte, error) {
 		for _, inst := range p.Code {
 			switch int(inst >> 26) {
 			case lua.OP_CLOSURE:
-				return nil, fmt.Errorf("luawasm: OP_CLOSURE not supported in backend v1 (closures arrive with the closures ABI)")
+				return nil, fmt.Errorf("luawasm: OP_CLOSURE not supported in backend v1 (closures arrive with the A4 lowering)")
 			case lua.OP_VARARG:
-				return nil, fmt.Errorf("luawasm: OP_VARARG not supported in backend v1")
+				return nil, fmt.Errorf("luawasm: OP_VARARG not supported in backend v1 (M5b)")
 			case lua.OP_GETUPVAL, lua.OP_SETUPVAL:
-				return nil, fmt.Errorf("luawasm: upvalue opcodes require closures (backend v1)")
+				return nil, fmt.Errorf("luawasm: upvalue opcodes require closures (backend v1, A4)")
 			}
 		}
 	}
 
 	b := &backend{m: wasm.NewModule(), main: main, chunkName: chunkName}
+	b.layoutProtos(protos)
 	b.declareImports()
 	b.emitInit()
-	fe := b.newFuncEmitter()
-	fe.emitBody()
-	fe.f.Export("lua_main")
+	for _, pi := range b.protos {
+		fe := b.newFuncEmitter(pi.proto)
+		fe.emitBody()
+		b.protoFuncs = append(b.protoFuncs, fe.f)
+	}
+	b.emitDispatch()
+	b.emitMain()
 	return b.m.Encode(), nil
 }
 
@@ -62,14 +81,28 @@ func collectProtos(p *lua.FunctionProto) []*lua.FunctionProto {
 }
 
 type backend struct {
-	m         *wasm.Module
-	main      *lua.FunctionProto
-	chunkName string
-	imports   map[string]uint32
-	gKCells   uint32 // mutable global: constants cells base
+	m          *wasm.Module
+	main       *lua.FunctionProto
+	chunkName  string
+	imports    map[string]uint32
+	gKCells    uint32 // mutable global: constants cells base
+	protos     []protoInfo
+	protoFuncs []*wasm.Function // dispatch idx → wasm function
+	dispatchFn uint32            // lua_dispatch's function index
 }
 
 func (b *backend) imp(name string) uint32 { return b.imports[name] }
+
+// layoutProtos assigns dispatch indices (preorder) and one global
+// constant pool: each proto's Constants followed by its StringConstants.
+func (b *backend) layoutProtos(protos []*lua.FunctionProto) {
+	off := 0
+	for _, p := range protos {
+		pi := protoInfo{proto: p, koff: off, nc: len(p.Constants), nsc: len(p.StringConstants())}
+		b.protos = append(b.protos, pi)
+		off += pi.nc + pi.nsc
+	}
+}
 
 func (b *backend) declareImports() {
 	m := b.m
@@ -102,16 +135,19 @@ func (b *backend) declareImports() {
 		"rt_set_chunkname": m.ImportFunc("rt", "rt_set_chunkname", ii, nil),
 		"rt_err_pending":   m.ImportFunc("rt", "rt_err_pending", nil, i32v),
 		"rt_call_count":    m.ImportFunc("rt", "rt_call_count", i32v, i32v),
+		"rt_wasm_proto":    m.ImportFunc("rt", "rt_wasm_proto", iiiii, i32v),
 	}
 	b.gKCells = m.GlobalI32(0, true)
 	m.ExportGlobal("gKCells", b.gKCells)
 	m.ImportMemory("rt", "memory", 1, 0)
 }
 
-// emitInit writes luawasm_init: interns all constants into a cells area
-// (base stored in the gKCells global) and installs the chunk name. All
-// bytes are written with i64 stores into one rt_frame_alloc buffer, so
-// the module needs no data segments and cannot collide with the runtime.
+// emitInit writes luawasm_init: interns the global constant pool into a
+// cells area (base stored in the gKCells global), installs the chunk
+// name, and registers every proto with the runtime (rt_wasm_proto — the
+// dispatch registry the C adapter reads). All bytes are written with i64
+// stores into one rt_frame_alloc buffer, so the module needs no data
+// segments and cannot collide with the runtime.
 func (b *backend) emitInit() {
 	m := b.m
 	f := m.NewFunction([]wasm.ValueType{wasm.I32}, nil)
@@ -120,17 +156,17 @@ func (b *backend) emitInit() {
 	const (lS, lK, lC uint32 = 1, 2, 3)
 	f.Local(wasm.I32).Local(wasm.I32).Local(wasm.I32)
 
-	main := b.main
-	nc := len(main.Constants)
-	nsc := len(main.StringConstants())
-	total := nc + nsc
 	strBytes := len(b.chunkName)
-	for _, s := range main.StringConstants() {
-		strBytes += len(s)
-	}
-	for _, cv := range main.Constants {
-		if s, ok := cv.(lua.LString); ok {
+	total := 0
+	for _, pi := range b.protos {
+		total += pi.nc + pi.nsc
+		for _, s := range pi.proto.StringConstants() {
 			strBytes += len(s)
+		}
+		for _, cv := range pi.proto.Constants {
+			if s, ok := cv.(lua.LString); ok {
+				strBytes += len(s)
+			}
 		}
 	}
 
@@ -140,39 +176,112 @@ func (b *backend) emitInit() {
 	f.I32Const(0).LocalSet(lC)
 
 	// staged by the step parameter (0 = allocs only, 1 = +chunkname,
-	// 2 = +interns) — a compile-time debug aid kept for triage
+	// 2 = +interns +proto registration) — a compile-time debug aid kept
+	// for triage
 	f.LocalGet(lStep).I32Const(2).I32GeS().If(wasm.Void)
 
 	// chunk name
 	writeStrBytes(f, lS, lC, b.chunkName)
 	f.LocalGet(lS).I32Const(int32(len(b.chunkName))).Call(b.imp("rt_set_chunkname"))
 
-	// string constants (cells at offset nc+i). NOTE: writeStrBytes
-	// advances the cursor past s, so the pointer is cursor-len(s)
-	for i, s := range main.StringConstants() {
-		writeStrBytes(f, lS, lC, s)
-		f.LocalGet(lK).I32Const(int32(cellSize*(nc+i))).I32Add()
-		f.LocalGet(lS).LocalGet(lC).I32Const(int32(len(s))).I32Sub().I32Add()
-		f.I32Const(int32(len(s))).Call(b.imp("rt_intern")).Drop()
-	}
-	// value constants
-	for i, cv := range main.Constants {
-		switch v := cv.(type) {
-		case lua.LNumber:
-			f.LocalGet(lK).I32Const(int32(cellSize*i)).I32Add().F64Const(float64(v)).
-				Call(b.imp("rt_mknumber"))
-		case lua.LString:
-			writeStrBytes(f, lS, lC, string(v))
-			f.LocalGet(lK).I32Const(int32(cellSize*i)).I32Add()
-			f.LocalGet(lS).LocalGet(lC).I32Const(int32(len(v))).I32Sub().I32Add()
-			f.I32Const(int32(len(v))).Call(b.imp("rt_intern")).Drop()
-		default:
-			panic(fmt.Sprintf("luawasm: unsupported constant type %T", cv))
+	for _, pi := range b.protos {
+		// string constants (cells at koff+nc+i). NOTE: writeStrBytes
+		// advances the cursor past s, so the pointer is cursor-len(s)
+		for i, s := range pi.proto.StringConstants() {
+			writeStrBytes(f, lS, lC, s)
+			f.LocalGet(lK).I32Const(int32(cellSize*(pi.koff+pi.nc+i))).I32Add()
+			f.LocalGet(lS).LocalGet(lC).I32Const(int32(len(s))).I32Sub().I32Add()
+			f.I32Const(int32(len(s))).Call(b.imp("rt_intern")).Drop()
+		}
+		// value constants
+		for i, cv := range pi.proto.Constants {
+			switch v := cv.(type) {
+			case lua.LNumber:
+				f.LocalGet(lK).I32Const(int32(cellSize*(pi.koff+i))).I32Add().F64Const(float64(v)).
+					Call(b.imp("rt_mknumber"))
+			case lua.LString:
+				writeStrBytes(f, lS, lC, string(v))
+				f.LocalGet(lK).I32Const(int32(cellSize*(pi.koff+i))).I32Add()
+				f.LocalGet(lS).LocalGet(lC).I32Const(int32(len(v))).I32Sub().I32Add()
+				f.I32Const(int32(len(v))).Call(b.imp("rt_intern")).Drop()
+			default:
+				panic(fmt.Sprintf("luawasm: unsupported constant type %T", cv))
+			}
 		}
 	}
+
+	// register every proto: (idx, numparams, isvararg, nupvalues,
+	// framecells). framecells = nregs + 4 (2-cell TFORLOOP margin + 2
+	// scratch cells) — must match gFrameCells and scratchAddr.
+	for idx, pi := range b.protos {
+		p := pi.proto
+		f.I32Const(int32(idx)).
+			I32Const(int32(p.NumParameters)).
+			I32Const(int32(p.IsVarArg)).
+			I32Const(int32(p.NumUpvalues)).
+			I32Const(int32(p.NumUsedRegisters) + 4).
+			Call(b.imp("rt_wasm_proto")).Drop()
+	}
+
 	f.End()
 	f.End() // close the step gate
 	f.Export("luawasm_init")
+}
+
+// emitDispatch writes lua_dispatch(idx, frame, cl, nargs, want) -> nret:
+// a br_table of direct calls over the proto index, inside the M5c
+// tail-restage loop scaffold (nothing produces -2 yet, so the loop back
+// edge is dead; the restage reload replaces the re-dispatch in M5c).
+func (b *backend) emitDispatch() {
+	m := b.m
+	f := m.NewFunction([]wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32}, []wasm.ValueType{wasm.I32})
+	b.dispatchFn = f.Idx()
+	const lNret uint32 = 5
+	f.Local(wasm.I32)
+	n := len(b.protos)
+
+	f.Loop(wasm.Void) // $again — the M5c restage target
+	for i := 0; i <= n; i++ {
+		f.Block(wasm.Void)
+	}
+	// default: unknown idx → host-refused marker
+	f.I32Const(-3).LocalSet(lNret)
+	depths := make([]uint32, n)
+	for i := range depths {
+		depths[i] = uint32(i)
+	}
+	f.LocalGet(0).BrTable(depths, uint32(n))
+	for k := 0; k < n; k++ {
+		f.End() // close arm k's block (k=0: the innermost)
+		f.LocalGet(1).LocalGet(2).LocalGet(3).LocalGet(4).
+			Call(b.protoFuncs[k].Idx()).LocalSet(lNret)
+		// → past the remaining arm blocks and OUT of the default block,
+		// landing at the -2 check (NOT the loop label — that would
+		// re-dispatch the same proto forever)
+		f.Br(uint32(n - k - 1))
+	}
+	f.End() // close the default block — the convergence point
+	// M5c scaffold: restage and continue the loop on a tailcall sentinel
+	f.LocalGet(lNret).I32Const(-2).I32Eq().BrIf(0)
+	f.End() // close loop
+	f.LocalGet(lNret)
+	f.End()
+	f.Export("lua_dispatch")
+}
+
+// emitMain writes the thin engine entry: lua_main(frame) runs proto 0
+// through the dispatcher and maps nret to the engine's status contract
+// (0 ok, 1 error).
+func (b *backend) emitMain() {
+	f := b.m.NewFunction([]wasm.ValueType{wasm.I32}, []wasm.ValueType{wasm.I32})
+	f.I32Const(0).LocalGet(0).I32Const(0).I32Const(0).I32Const(0).
+		Call(b.dispatchFn).LocalTee(0)
+	f.I32Const(0).I32GeS().If(wasm.Void)
+	f.I32Const(0).Return()
+	f.End()
+	f.I32Const(1).Return()
+	f.End()
+	f.Export("lua_main")
 }
 
 // writeStrBytes appends s to the sbuf (base local lS, cursor local lC),

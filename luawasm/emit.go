@@ -2,9 +2,14 @@ package luawasm
 
 // The function emitter: lowers one FunctionProto's bytecode to a wasm
 // function with flattened control flow (design doc §4.3/§4.4). Registers
-// are TValue cells at frame+16*k; the frame is caller-allocated (the
-// host allocates for lua_main via rt_frame_alloc, sized from the
-// exported gFrameCells global).
+// are TValue cells at frame+16*k; the frame is allocated and arg-filled
+// by the C adapter (precall_wasm) — params at R(0..np-1), varargs above
+// the register window at frame+16*framecells (M5b reads them there).
+//
+// Signature (ABI v3): (frame, cl, nargs, want) -> nret — the common
+// convention every protoFn and lua_dispatch share. nret >= 0: that many
+// results staged at frame+0..; -1: error, exact TValue staged in the
+// runtime; -2: tailcall sentinel (M5c).
 
 import (
 	"fmt"
@@ -16,37 +21,49 @@ import (
 const opMaxArgSbx = (1<<18 - 1) >> 1
 
 type funcEmitter struct {
-	b       *backend
-	f       *wasm.Function
-	proto   *lua.FunctionProto
-	nregs   int
-	code    []uint32
+	b     *backend
+	f     *wasm.Function
+	proto *lua.FunctionProto
+	pi    protoInfo
+	nregs int
+	np    int
+	code  []uint32
 
-	// local indices (param 0 = frame)
+	// local indices (params 0..3 = frame, cl, nargs, want)
 	lTop, lBlk, lSt, lT0, lT1 uint32 // i32
-	lVlo, lVhi                 uint32 // i64
-	lF0                        uint32 // f64
+	lVlo, lVhi                uint32 // i64
+	lF0                       uint32 // f64
 
 	blocks  map[int]int // pc -> block id
 	blockPC []int       // block id -> start pc
 }
 
-func (b *backend) newFuncEmitter() *funcEmitter {
-	p := b.main
-	f := b.m.NewFunction([]wasm.ValueType{wasm.I32}, []wasm.ValueType{wasm.I32})
-	f.Local(wasm.I32).Local(wasm.I32).Local(wasm.I32).Local(wasm.I32).Local(wasm.I32) // 1..5
-	f.Local(wasm.I64).Local(wasm.I64)                                               // 6,7
-	f.Local(wasm.F64)                                                               // 8
+func (b *backend) newFuncEmitter(p *lua.FunctionProto) *funcEmitter {
+	f := b.m.NewFunction([]wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32}, []wasm.ValueType{wasm.I32})
+	f.Local(wasm.I32).Local(wasm.I32).Local(wasm.I32).Local(wasm.I32).Local(wasm.I32) // 4..8
+	f.Local(wasm.I64).Local(wasm.I64)                                               // 9,10
+	f.Local(wasm.F64)                                                               // 11
 	return &funcEmitter{
 		b: b, f: f, proto: p,
+		pi:    b.protoInfoOf(p),
 		nregs: int(p.NumUsedRegisters),
+		np:    int(p.NumParameters),
 		code:  p.Code,
-		lTop: 1, lBlk: 2, lSt: 3, lT0: 4, lT1: 5,
-		lVlo: 6, lVhi: 7, lF0: 8,
+		lTop: 4, lBlk: 5, lSt: 6, lT0: 7, lT1: 8,
+		lVlo: 9, lVhi: 10, lF0: 11,
 	}
 }
 
 /* ---------- small emission helpers ---------- */
+
+func (b *backend) protoInfoOf(p *lua.FunctionProto) protoInfo {
+	for _, pi := range b.protos {
+		if pi.proto == p {
+			return pi
+		}
+	}
+	panic("luawasm: proto not in layout")
+}
 
 func (fe *funcEmitter) cellAddr(k int) *wasm.Function {
 	return fe.f.LocalGet(0).I32Const(int32(cellSize * k)).I32Add()
@@ -58,14 +75,15 @@ func (fe *funcEmitter) scratchAddr(k int) *wasm.Function {
 	return fe.f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + 2 + k))).I32Add()
 }
 
-// constant cell: i in Constants
+// constant cell: i in Constants (global pool offset per proto)
 func (fe *funcEmitter) kcell(i int) *wasm.Function {
-	return fe.f.GlobalGet(fe.b.gKCells).I32Const(int32(cellSize * i)).I32Add()
+	return fe.f.GlobalGet(fe.b.gKCells).I32Const(int32(cellSize * (fe.pi.koff + i))).I32Add()
 }
 
-// string-constant cell: i in stringConstants (offset by len(Constants))
+// string-constant cell: i in StringConstants (after the proto's
+// Constants in the global pool)
 func (fe *funcEmitter) kscell(i int) *wasm.Function {
-	return fe.f.GlobalGet(fe.b.gKCells).I32Const(int32(cellSize * (len(fe.proto.Constants) + i))).I32Add()
+	return fe.f.GlobalGet(fe.b.gKCells).I32Const(int32(cellSize * (fe.pi.koff + fe.pi.nc + i))).I32Add()
 }
 
 // RK operand address: register or constant cell
@@ -143,13 +161,14 @@ func (fe *funcEmitter) setBoolCellA(a int, cond func()) {
 	f.I32Const(1).I32Store8(8)
 }
 
-// checkStatus: st := <status on stack>; if st == RT_ERR return 1
+// checkStatus: st := <status on stack>; if st == RT_ERR return -1 (the
+// ABI v3 error convention — -1 is unambiguous with "1 result")
 func (fe *funcEmitter) checkStatus() {
 	f := fe.f
 	f.LocalSet(fe.lSt)
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().
 		If(wasm.Void).
-		I32Const(1).Return().
+		I32Const(-1).Return().
 		End()
 }
 
@@ -166,18 +185,34 @@ func (fe *funcEmitter) line(pc int) int32 {
 func (fe *funcEmitter) emitBody() {
 	f := fe.f
 
-	// exported frame size: registers + 2 margin + 2 scratch cells. The
-	// interpreter can write 2 cells past NumUsedRegisters (TFORLOOP stages
-	// its triple at R(A+3..A+5), and the compiler doesn't always reserve
-	// those); the margin absorbs that, and scratch lives above it so the
-	// two windows can never alias.
-	fe.b.m.ExportGlobal("gFrameCells", fe.b.m.GlobalI32(int32(fe.nregs+4), false))
-
-	// nil-fill all registers (v1 entry: no arguments)
-	for k := 0; k < fe.nregs; k++ {
-		fe.cellAddr(k)
-		f.I32Const(0).I32Store8(8)
+	// gFrameCells (main proto only): registers + 2 margin + 2 scratch
+	// cells — the engine sizes lua_main's frame from it. The interpreter
+	// can write 2 cells past NumUsedRegisters (TFORLOOP stages its triple
+	// at R(A+3..A+5), and the compiler doesn't always reserve those); the
+	// margin absorbs that, and scratch lives above it so the two windows
+	// can never alias.
+	if fe.proto == fe.b.main {
+		fe.b.m.ExportGlobal("gFrameCells", fe.b.m.GlobalI32(int32(fe.nregs+4), false))
 	}
+
+	// prologue: nil-fill R(min(nargs,np) .. nregs). The adapter copied
+	// actual params into R(0..np-1) (and dropped extras for non-vararg
+	// protos, like stock luaD_precall), so the fill starts at min(nargs,
+	// np) — covering missing params and unused registers alike.
+	f.LocalGet(2).I32Const(int32(fe.np)).I32LtS().If(wasm.Void)
+	f.LocalGet(2).LocalSet(fe.lT0)
+	f.Else()
+	f.I32Const(int32(fe.np)).LocalSet(fe.lT0)
+	f.End()
+	f.Block(wasm.Void)
+	f.Loop(wasm.Void)
+	f.LocalGet(fe.lT0).I32Const(int32(fe.nregs)).I32GeS().BrIf(1)
+	f.LocalGet(0).LocalGet(fe.lT0).I32Const(16).I32Mul().I32Add().
+		I32Const(0).I32Store8(8) // tag = nil
+	f.LocalGet(fe.lT0).I32Const(1).I32Add().LocalSet(fe.lT0)
+	f.Br(0)
+	f.End()
+	f.End()
 	f.I32Const(int32(fe.nregs)).LocalSet(fe.lTop)
 
 	fe.partitionBlocks()
@@ -234,6 +269,12 @@ func (fe *funcEmitter) partitionBlocks() {
 			}
 		case lua.OP_MOVEN:
 			pc += int(inst>>9) & 0x1ff // consume the C fused MOVEs
+		case lua.OP_CLOSURE:
+			// consume the upvalue-capture pseudo-instructions that follow
+			// (OP_MOVE B → capture register B; OP_GETUPVAL B → parent's
+			// upvalue B — read at _vm.go:793-803). FunctionProto carries no
+			// upvalue descriptors; the backend derives captures from these.
+			pc += int(fe.proto.FunctionPrototypes[int(inst&0x3ffff)].NumUpvalues)
 		}
 	}
 	ids := []int{}

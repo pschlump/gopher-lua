@@ -533,15 +533,16 @@ struct rt_wasm_md {
 static struct rt_wasm_md *rt_md;
 static int rt_md_n, rt_md_cap;
 
-int32_t rt_wasm_enter(void) {
+int32_t rt_wasm_enter(int32_t idx) {
+  (void)idx;
   if (rt_wasm_depth >= RTW_MAX_DEPTH) {
     /* the interpreter's message (state.go:1141); M5d pins wording and
        the depth divergence is ledgered (plan §7) */
-    TString *ts = luaS_newlstr(curL, "stack overflow", 13);
+    TString *ts = luaS_newlstr(curL, "stack overflow", 14);
     err_pending = 1;
     setsvalue(curL, &err_value, ts);
-    err_buf_len = 13;
-    memcpy(err_buf, "stack overflow", 14);
+    err_buf_len = 14;
+    memcpy(err_buf, "stack overflow", 15);
     return 1;
   }
   rt_wasm_depth++;
@@ -726,6 +727,9 @@ int32_t rt_newclosure(rt_addr dstcell, int32_t protoidx, rt_addr parentcl,
   m = &rt_md[protoidx];
   cl = luaF_newLclosure(curL, m->nupvalues,
                         parent ? parent->l.env : hvalue(&curL->l_gt));
+  /* luaF_newLclosure leaves l.p unset (stock callers set it — pushclosure
+     in lvm.c); the adapter's precall hook reads cl->p->wasm_idx */
+  cl->l.p = m->proto;
   for (i = 0; i < m->nupvalues; i++) {
     if (m->uv[i].instack) {
       UpVal *uv = rt_findupval(frameaddr + (rt_addr)sizeof(TValue) * m->uv[i].idx);

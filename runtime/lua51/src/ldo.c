@@ -6,6 +6,7 @@
 
 
 #include <setjmp.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -306,7 +307,7 @@ static int precall_wasm (lua_State *L, StkId func, int nresults,
   int nargs = cast_int(L->top - func) - 1;
   int status;
 
-  if (rt_wasm_enter() != 0) {  /* over RTW_MAX_DEPTH: staged error */
+  if (rt_wasm_enter(p->wasm_idx) != 0) {  /* over RTW_MAX_DEPTH: staged */
     TValue *ev = (TValue *)(size_t)rt_err_value_ptr();
     setobj2s(L, L->top, ev);
     incr_top(L);

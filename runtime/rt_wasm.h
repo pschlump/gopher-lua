@@ -63,8 +63,9 @@ int32_t rt_err_stage_value(rt_addr dst, int32_t cap);
 
 /* ---- internal helpers (rt_abi.c; called from ldo.c's adapter) ---- */
 
-int32_t rt_wasm_enter(void); /* 0 = ok; 1 = over RTW_MAX_DEPTH, "stack
-                               overflow" staged with a string value */
+int32_t rt_wasm_enter(int32_t idx); /* 0 = ok; 1 = over RTW_MAX_DEPTH,
+                                       "stack overflow" staged with a
+                                       string value */
 void rt_wasm_leave(void);
 
 /* frame stack: a chunked bump region in shared memory. push computes the

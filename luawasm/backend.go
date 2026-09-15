@@ -17,9 +17,6 @@
 // nret convention (ABI v3): >= 0 results at frame+0.., -1 error (the
 // exact TValue staged in the runtime), -2 tailcall sentinel (M5c),
 // -3 host-refused.
-//
-// Not yet lowered: OP_VARARG (M5b) and — until A4 — OP_CLOSURE and the
-// upvalue opcodes; encountering them fails the compile with a clear error.
 package luawasm
 
 import (
@@ -45,13 +42,6 @@ type protoInfo struct {
 // Compile emits a wasm module for the FunctionProto tree rooted at main.
 func Compile(main *lua.FunctionProto, chunkName string) ([]byte, error) {
 	protos := collectProtos(main)
-	for _, p := range protos {
-		for _, inst := range p.Code {
-			if int(inst>>26) == lua.OP_VARARG {
-				return nil, fmt.Errorf("luawasm: OP_VARARG not supported in backend v1 (M5b)")
-			}
-		}
-	}
 
 	b := &backend{m: wasm.NewModule(), main: main, chunkName: chunkName}
 	b.layoutProtos(protos)
@@ -139,6 +129,7 @@ func (b *backend) declareImports() {
 		"rt_getupval":      m.ImportFunc("rt", "rt_getupval", iii, nil),
 		"rt_setupval":      m.ImportFunc("rt", "rt_setupval", iii, nil),
 		"rt_close_upvals":  m.ImportFunc("rt", "rt_close_upvals", i32v, nil),
+		"rt_compat_arg":    m.ImportFunc("rt", "rt_compat_arg", iii, i32v),
 	}
 	b.gKCells = m.GlobalI32(0, true)
 	m.ExportGlobal("gKCells", b.gKCells)

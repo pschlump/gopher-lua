@@ -69,10 +69,24 @@ func (fe *funcEmitter) cellAddr(k int) *wasm.Function {
 	return fe.f.LocalGet(0).I32Const(int32(cellSize * k)).I32Add()
 }
 
-// scratch cell k — above the registers AND the 2-cell register margin
-// (see the gFrameCells note in emitBody)
+// scratch cell 0 — the adapter's +1 spare cell ABOVE the vararg staging
+// area. Dynamic for vararg protos: multret VARARG destinations reach
+// R(A+nv-1) with A up to nregs-1, so any static nregs+k position can
+// collide (M5b bug: `g(2, ...)` saved its callee over the third vararg).
+// frame + 16*(nregs+4) + 16*max(0, nargs-np) is provably above both the
+// register window and every vararg copy.
 func (fe *funcEmitter) scratchAddr(k int) *wasm.Function {
-	return fe.f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + 2 + k))).I32Add()
+	f := fe.f
+	base := f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + 4 + k))).I32Add()
+	if fe.proto.IsVarArg&lua.VarArgIsVarArg == 0 {
+		return base
+	}
+	// + 16 * max(0, nargs - np) — Select keeps live locals untouched
+	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().I32Const(16).I32Mul()
+	f.I32Const(0)
+	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().I32Const(0).I32GtS()
+	f.Select()
+	return f.I32Add()
 }
 
 // constant cell: i in Constants (global pool offset per proto)
@@ -119,6 +133,18 @@ func (fe *funcEmitter) copyCell(dst func(), src func()) {
 // dynamic cell copy: base register + 16*t (t in lT1)
 func (fe *funcEmitter) dynCellAddr(baseReg int) *wasm.Function {
 	return fe.f.LocalGet(0).I32Const(int32(cellSize * baseReg)).I32Add().
+		LocalGet(fe.lT1).I32Const(16).I32Mul().I32Add()
+}
+
+// vararg cells live above the register window (the adapter's split —
+// plan §3.2): varargBase = frame + 16*framecells, framecells = nregs+4
+func (fe *funcEmitter) varargCell(j int) *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize*(fe.nregs+4+j))).I32Add()
+}
+
+// vararg cell indexed by lT1 (dynamic copy loops)
+func (fe *funcEmitter) varargCellDyn() *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + 4))).I32Add().
 		LocalGet(fe.lT1).I32Const(16).I32Mul().I32Add()
 }
 
@@ -185,14 +211,15 @@ func (fe *funcEmitter) line(pc int) int32 {
 func (fe *funcEmitter) emitBody() {
 	f := fe.f
 
-	// gFrameCells (main proto only): registers + 2 margin + 2 scratch
-	// cells — the engine sizes lua_main's frame from it. The interpreter
-	// can write 2 cells past NumUsedRegisters (TFORLOOP stages its triple
-	// at R(A+3..A+5), and the compiler doesn't always reserve those); the
-	// margin absorbs that, and scratch lives above it so the two windows
-	// can never alias.
+	// gFrameCells (main proto only): registers + 2-cell TFORLOOP margin +
+	// the scratch spare — the TOTAL cell count the engine must allocate
+	// for lua_main's frame (main is vararg with nargs=0, so its scratch
+	// sits at nregs+4). The interpreter can write 2 cells past
+	// NumUsedRegisters (TFORLOOP stages its triple at R(A+3..A+5), and
+	// the compiler doesn't always reserve those); the margin absorbs
+	// that, and scratch lives above everything.
 	if fe.proto == fe.b.main {
-		fe.b.m.ExportGlobal("gFrameCells", fe.b.m.GlobalI32(int32(fe.nregs+4), false))
+		fe.b.m.ExportGlobal("gFrameCells", fe.b.m.GlobalI32(int32(fe.nregs+5), false))
 	}
 
 	// prologue: nil-fill R(min(nargs,np) .. nregs). The adapter copied
@@ -213,6 +240,23 @@ func (fe *funcEmitter) emitBody() {
 	f.Br(0)
 	f.End()
 	f.End()
+
+	// vararg prologue: the 5.0-compat `arg` table at R(np) when the
+	// compiler reserved the hidden local (IsVarArg & VarArgNeedsArg,
+	// cleared on `...` use — compile.go:1188; never a local for main —
+	// compile.go:1326, and unobservable there with nargs=0). The table
+	// overwrites the nil the fill just left at R(np).
+	if fe.proto != fe.b.main && fe.proto.IsVarArg&lua.VarArgNeedsArg != 0 {
+		f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().LocalSet(fe.lT0)
+		f.LocalGet(fe.lT0).I32Const(0).I32LtS().If(wasm.Void)
+		f.I32Const(0).LocalSet(fe.lT0)
+		f.End()
+		fe.cellAddr(fe.np)
+		f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + 4))).I32Add() // varargBase
+		f.LocalGet(fe.lT0)
+		f.Call(fe.b.imp("rt_compat_arg"))
+		fe.checkStatus()
+	}
 	f.I32Const(int32(fe.nregs)).LocalSet(fe.lTop)
 
 	fe.partitionBlocks()
@@ -497,6 +541,8 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			terminal = true
 		case lua.OP_SETLIST:
 			fe.emitSetlist(A, B, C, pc)
+		case lua.OP_VARARG:
+			fe.emitVararg(A, B)
 		case lua.OP_CLOSURE:
 			// R(A) := closure over child proto Bx. The capture
 			// pseudo-instructions that follow (OP_MOVE/OP_GETUPVAL) were

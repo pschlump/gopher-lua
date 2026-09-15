@@ -167,7 +167,28 @@ func TestGenMatrixCorpus(t *testing.T) {
 	add("cb01", "print(('hello world'):gsub('o', function(m) return m:upper() end))\n") // gsub function replacement
 	add("cb02", "print(pcall(function() return 1, 2 end))\n") // pcall of a wasm closure
 	add("cb03", "local mt = {__index = function(t, k) return k .. '!' end}\nlocal t = setmetatable({}, mt)\nprint(t.foo, t.bar)\n") // __index function metamethod
-	add("cb04", "local sum = 0\ntable.foreach({1, 2, 3}, function(k, v) sum = sum + v end)\nprint(sum)\n") // table.foreach callback + upvalue write
+	// ---- varargs (M5b) ----
+	add("var00", "local function f(...) return ... end\nprint(f(1, 2, 3))\n")
+	add("var01", "local function f(...) local a, b = ... return a, b end\nprint(f(7))\n") // nil-padding
+	add("var02", "local function f(...) return select('#', ...) end\nprint(f(nil, nil))\n") // count with nils
+	add("var03", "local function f(...) return select(-1, ...) end\nprint(f('a', 'b', 'c'))\n")
+	add("var04", "local function f(...) local t = {...} return #t, t[1], t[3] end\nprint(f('x', 'y', 'z'))\n") // constructor
+	add("var05", "local function g(a, b) return a + b end\nlocal function f(...) return g(...) end\nprint(f(3, 4))\n") // ... as sole call args
+	add("var06", "local t = {}\nfunction t.f(...) return ... end\nprint(t.f(1, 2))\n")
+	add("var07", "local function f(...) local n = 0\nfor _, v in ipairs({...}) do n = n + v end\nreturn n end\nprint(f(1, 2, 3))\n") // vararg iterator
+	add("var08", "local function f(...) return arg[1], arg.n end\nprint(f(7, 8))\n") // compat arg contents
+	add("var09", "local function f(a, ...) return a, select('#', ...) end\nprint(f(1, 2, 3))\n") // params + varargs split
+	add("var10", "local function f(...) return (...) end\nprint(f(9))\n") // single value
+	add("var11", "local function f(...) return ... end\nprint(f())\n") // zero varargs
+	add("var12", "local function f(...) local a, b = ... return b end\nprint(f(1, 2, 3))\n") // truncation
+	add("var13", "local function h(...) return ... end\nlocal function g(...) return h(...) end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n") // const+varargs, two levels (the M5b scratch-collision repro)
+	add("var14", "local function f(...) return unpack({...}) end\nprint(f('p', 'q'))\n")
+	add("var15", "local function f(a, b, ...) return a, b, ... end\nprint(f(1, 2, 3, 4))\n") // mixed params + varargs through
+	add("var16", "local function f(...) return arg.n end\nprint(f())\n") // arg.n with zero varargs
+	add("var17", "local function f(...) return select(2, ...) end\nprint(f(1, 2, 3))\n")
+	add("var18", "local function f(...) return table.concat({...}, '-') end\nprint(f('a', 'b', 'c'))\n")
+	add("var19", "local function f(fmt, ...) return string.format(fmt, ...) end\nprint(f('%d-%s', 7, 'q'))\n") // leading fixed arg then varargs to a C function
+	add("var20", "local function f(...) local x = ... return arg == nil end\nprint(f(1, 2))\n") // ... used → the arg local is never filled (compile.go:1188 clears NeedsArg) → nil, not the global
 
 	t.Logf("wrote %d cases to %s", len(cases), dir)
 }

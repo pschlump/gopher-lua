@@ -357,6 +357,60 @@ func (fe *funcEmitter) emitTForloop(A, C, pc int) {
 	f.End()
 }
 
+// emitVararg: R(A).. := the actual varargs (varargBase, above the
+// register window). nvarargs = max(0, nargs - np) — dynamic, from the
+// nargs param. Mirrors the interpreter's OP_VARARG (_vm.go): B==0 →
+// multret (copy all, top = A+nvarargs); B==1 → zero values (a bare
+// `...` statement); B>=2 → exactly B-1 values, copying
+// min(B-1, nvarargs) and nil-padding the rest.
+func (fe *funcEmitter) emitVararg(A, B int) {
+	f := fe.f
+	// lT0 = nvarargs
+	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().LocalSet(fe.lT0)
+	f.LocalGet(fe.lT0).I32Const(0).I32LtS().If(wasm.Void)
+	f.I32Const(0).LocalSet(fe.lT0)
+	f.End()
+
+	if B == 1 {
+		return // nwant = 0
+	}
+	if B == 0 {
+		// multret: top = A + nvarargs, dynamic copy
+		f.I32Const(int32(A)).LocalGet(fe.lT0).I32Add().LocalSet(fe.lTop)
+		f.I32Const(0).LocalSet(fe.lT1)
+		f.Block(wasm.Void)
+		f.Loop(wasm.Void)
+		f.LocalGet(fe.lT1).LocalGet(fe.lT0).I32GeS().BrIf(1)
+		fe.varargCellDyn().I64Load(0).LocalSet(fe.lVlo)
+		fe.varargCellDyn().I64Load(8).LocalSet(fe.lVhi)
+		fe.dynCellAddr(A)
+		f.LocalGet(fe.lVlo).I64Store(0)
+		fe.dynCellAddr(A)
+		f.LocalGet(fe.lVhi).I64Store(8)
+		f.LocalGet(fe.lT1).I32Const(1).I32Add().LocalSet(fe.lT1)
+		f.Br(0)
+		f.End()
+		f.End()
+		return
+	}
+	// B >= 2: exactly m = B-1 values, nil-padded past nvarargs
+	m := B - 1
+	for i := 0; i < m; i++ {
+		f.LocalGet(fe.lT0).I32Const(int32(i)).I32GtS().If(wasm.Void)
+		fe.varargCell(i).I64Load(0).LocalSet(fe.lVlo)
+		fe.varargCell(i).I64Load(8).LocalSet(fe.lVhi)
+		fe.cellAddr(A + i)
+		f.LocalGet(fe.lVlo).I64Store(0)
+		fe.cellAddr(A + i)
+		f.LocalGet(fe.lVhi).I64Store(8)
+		f.Else()
+		fe.cellAddr(A + i)
+		f.I32Const(0).I32Store8(8) // tag = nil
+		f.End()
+	}
+	fe.bumpTop(A + m)
+}
+
 // emitSetlist: R(A)[base+i+1] = R(A+1+i) for i in 0..count-1
 func (fe *funcEmitter) emitSetlist(A, B, C, pc int) {
 	f := fe.f

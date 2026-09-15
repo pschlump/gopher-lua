@@ -44,6 +44,13 @@ func (e *Interp) Run(c Case) []string {
 	})
 	defer L.Close()
 	installShim(L, emit)
+	// The C driver exposes arg = { [0] = chunkname } (luawasm.c); align the
+	// oracle so scripts touching the GLOBAL arg see the same surface. (The
+	// compat `arg` LOCAL is unaffected — NeedsArg is cleared when `...` is
+	// used, so such functions see this global.)
+	argt := L.NewTable()
+	argt.RawSetInt(0, lua.LString(c.Name))
+	L.SetGlobal("arg", argt)
 	defer func() {
 		matches, _ := filepath.Glob(filepath.Join(c.Dir, "testdiff.tmp.*"))
 		for _, m := range matches {

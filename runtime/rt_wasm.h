@@ -61,12 +61,29 @@ int32_t rt_clidx(rt_addr funcell);
 rt_addr rt_err_value_ptr(void);
 int32_t rt_err_stage_value(rt_addr dst, int32_t cap);
 
+/* ---- M5c: tailcall staging ---- */
+
+/* Stage a wasm-closure tailcall: returns the callee's clidx (>=0) with
+   the descriptor staged and the tailcalling frame's cursor restored, or
+   -1 to decline (C function / __call'd object / unregistered proto) —
+   the emitted code then falls back to rt_call. */
+int32_t rt_tail_stage(rt_addr funcell, rt_addr argcells, int32_t nargs,
+                      rt_addr frame);
+/* staging readback + the restage (fresh frame push with the params/
+   vararg split applied to the staged args) */
+int32_t rt_tail_clidx(void);
+int32_t rt_tail_nargs(void);
+rt_addr rt_tail_funcell(void);
+rt_addr rt_tail_restage(void);
+
 /* ---- internal helpers (rt_abi.c; called from ldo.c's adapter) ---- */
 
 int32_t rt_wasm_enter(int32_t idx); /* 0 = ok; 1 = over RTW_MAX_DEPTH,
                                        "stack overflow" staged with a
                                        string value */
 void rt_wasm_leave(void);
+void rt_pcall_caught(void); /* luaD_pcall recovery hook: consume the
+                               rt-staged error (sticky-staging fix) */
 
 /* frame stack: a chunked bump region in shared memory. push computes the
    dynamic size 16*(framecells + 1 + nvarargs) and copies the args

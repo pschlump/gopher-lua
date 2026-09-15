@@ -189,6 +189,17 @@ func TestGenMatrixCorpus(t *testing.T) {
 	add("var18", "local function f(...) return table.concat({...}, '-') end\nprint(f('a', 'b', 'c'))\n")
 	add("var19", "local function f(fmt, ...) return string.format(fmt, ...) end\nprint(f('%d-%s', 7, 'q'))\n") // leading fixed arg then varargs to a C function
 	add("var20", "local function f(...) local x = ... return arg == nil end\nprint(f(1, 2))\n") // ... used → the arg local is never filled (compile.go:1188 clears NeedsArg) → nil, not the global
+	// ---- tailcalls (M5c: the trampoline; staged for wasm-closure callees,
+	// rt_call fallback otherwise) ----
+	add("tco00", "local function f(n) if n == 0 then return 'done' end return f(n-1) end\nprint(f(100000))\n") // flat 10⁵
+	add("tco01", "local odd\nlocal function even(n) if n == 0 then return true end return odd(n-1) end\nfunction odd(n) if n == 0 then return false end return even(n-1) end\nprint(even(100001), odd(100001))\n") // mutual (pre-declared locals)
+	add("tco02", "local function f(x) return print(x) end\nf('tp')\n") // C-function tailcall → rt_call fallback
+	add("tco03", "local acc = 0\nlocal function f(n) acc = acc + 1 if n == 0 then return acc end return f(n-1) end\nprint(f(50000))\n") // upvalue writes across the chain
+	add("tco04", "local function g(...) return ... end\nlocal function f(...) return g(...) end\nprint(f(1, 2, 3))\n") // vararg tailcall
+	add("tco05", "local function add(a, b) return a + b end\nlocal function go(x) return add(x, x) end\nprint(go(21))\n") // multi-arg staged tailcall
+	add("tco06", "local function f(n) if n == 0 then error('deep') end return f(n-1) end\nprint(pcall(f, 10000))\n") // error through a 10⁴ staged chain (message heads compared; wording is row 9 → skip-annotated if it diverges)
+	add("tco07", "local mt = {__call = function(self, n) if n == 0 then return 'cd' end return self(n-1) end}\nlocal f = setmetatable({}, mt)\nprint(f(5))\n") // __call chain, shallow (deep chains ledger-row 18)
+	add("tco08", "local function g(...) return ... end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n") // const+varargs tailcall
 
 	t.Logf("wrote %d cases to %s", len(cases), dir)
 }

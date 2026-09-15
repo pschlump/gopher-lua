@@ -176,6 +176,22 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 		}
 	}
 
+	// M5c: try a staged tailcall — a wasm-closure callee re-dispatches at
+	// the same adapter level via the -2 sentinel (O(1) wasm stack, O(1)
+	// frames). Anything else (C function, __call'd object — precall's
+	// tryfuncTM resolves those) declines and takes the rt_call fallback,
+	// which matches the interpreter: C tailcalls don't recurse.
+	if tail {
+		fe.scratchAddr(0)
+		fe.cellAddr(A)
+		f.LocalGet(fe.lT0)
+		f.LocalGet(0) // frame — staging restores the cursor to here
+		f.Call(fe.b.imp("rt_tail_stage")).LocalSet(fe.lSt)
+		f.LocalGet(fe.lSt).I32Const(0).I32GeS().If(wasm.Void)
+		f.I32Const(-2).Return()
+		f.End()
+	}
+
 	// rt_call(scratch0, &R(A), nargs, want, line)
 	fe.scratchAddr(0)
 	fe.cellAddr(A)

@@ -104,6 +104,19 @@ void rt_err_clear(void) {
   err_buf_len = 0;
 }
 
+/* Called from luaD_pcall's recovery (ldo.c): a Lua-level catch consumes
+   the rt-staged error. Without this, the staging stays sticky after
+   pcall catches and the next rt_* in the surviving wasm frame refuses
+   instantly (found by M5c's error-through-tailcall-chain test: pcall
+   caught, then the chunk's own print rt_call failed with the stale
+   error). The A2 spike missed it — its driver chunk was C-interpreted,
+   so nothing after the catch ever crossed the ABI. */
+void rt_pcall_caught(void) {
+  err_pending = 0;
+  err_buf_len = 0;
+  setnilvalue(&err_value);
+}
+
 int32_t rt_err_stage_copy(rt_addr dst, int32_t cap) {
   int32_t n = err_buf_len < cap ? err_buf_len : cap;
   if (n > 0) memcpy((void *)(size_t)dst, err_buf, (size_t)n);
@@ -580,13 +593,15 @@ struct rt_frchunk {
 };
 static struct rt_frchunk *rt_fr;
 
-rt_addr rt_wasm_push_frame(lua_State *L, StkId base, int mdidx, int nargs) {
+/* rt_push_frame_from: size, bump and arg-fill a frame from a TValue
+   array (the adapter passes the L stack; the M5c tail restage passes
+   the staging buffer). */
+static rt_addr rt_push_frame_from(int mdidx, int nargs, const TValue *src) {
   struct rt_wasm_md *m;
   uint32_t need;
   rt_addr frame;
   int np, nv, i;
 
-  (void)L;
   m = &rt_md[mdidx];
   nv = (m->isvararg && nargs > m->numparams) ? nargs - m->numparams : 0;
   need = (uint32_t)sizeof(TValue) * (uint32_t)(m->framecells + 1 + nv);
@@ -613,14 +628,19 @@ rt_addr rt_wasm_push_frame(lua_State *L, StkId base, int mdidx, int nargs) {
      like stock luaD_precall. */
   np = nargs < m->numparams ? nargs : m->numparams;
   for (i = 0; i < np; i++)
-    *(TValue *)(size_t)(frame + (rt_addr)sizeof(TValue) * i) = base[i];
+    *(TValue *)(size_t)(frame + (rt_addr)sizeof(TValue) * i) = src[i];
   if (m->isvararg) {
     rt_addr vb = frame + (rt_addr)sizeof(TValue) * m->framecells;
     for (i = 0; i < nv; i++)
       *(TValue *)(size_t)(vb + (rt_addr)sizeof(TValue) * i) =
-          base[m->numparams + i];
+          src[m->numparams + i];
   }
   return frame;
+}
+
+rt_addr rt_wasm_push_frame(lua_State *L, StkId base, int mdidx, int nargs) {
+  (void)L;
+  return rt_push_frame_from(mdidx, nargs, base);
 }
 
 rt_addr rt_frame_cursor(void) {
@@ -636,6 +656,55 @@ void rt_frame_restore(rt_addr saved) {
   }
   if (rt_fr != NULL)
     rt_fr->used = (uint32_t)(saved - rt_fr->base);
+}
+
+/* ---- M5c: tailcall staging ----
+**
+** A wasm-closure tailcall stages its call descriptor here and returns
+** the -2 sentinel; lua_dispatch's restage loop turns it into a fresh
+** dispatch at the SAME adapter level — O(1) wasm stack, O(1) frames
+** (each restage reuses the memory the stager just restored). Anything
+** that is not a registered wasm closure (C functions, __call'd objects)
+** declines staging (-1) and the emitted code falls back to rt_call —
+** precall's tryfuncTM resolves __call, and C tailcalls don't recurse
+** (_vm.go:587-650 parity).
+**
+** Reentrancy: stage→restage is a closed cycle inside one lua_dispatch —
+** the staged fields are consumed (copied into the new frame) before any
+** nested dispatch can run, so overwrites are safe. */
+static TValue *tail_args;
+static int tail_nargs, tail_idx;
+static rt_addr tail_cl;
+
+int32_t rt_tail_stage(rt_addr funcell, rt_addr argcells, int32_t nargs,
+                      rt_addr frame) {
+  const TValue *f = (const TValue *)(size_t)funcell;
+  Closure *cl;
+  TValue *na;
+  int i;
+  if (err_pending) return -1;
+  if (!ttisfunction(f) || clvalue(f)->c.isC) return -1;
+  cl = clvalue(f);
+  if (cl->l.p->wasm_idx < 0 || cl->l.p->wasm_idx >= rt_md_n) return -1;
+  na = (TValue *)realloc(tail_args,
+                         (size_t)(nargs > 0 ? nargs : 1) * sizeof(TValue));
+  if (na == NULL) return -1;
+  tail_args = na;
+  for (i = 0; i < nargs; i++)
+    tail_args[i] = *(TValue *)(size_t)(argcells + (rt_addr)sizeof(TValue) * i);
+  tail_nargs = (int)nargs;
+  tail_idx = cl->l.p->wasm_idx;
+  tail_cl = (rt_addr)(size_t)cl;
+  rt_frame_restore(frame); /* the tailcalling frame is dead */
+  return tail_idx;
+}
+
+int32_t rt_tail_clidx(void) { return tail_idx; }
+int32_t rt_tail_nargs(void) { return tail_nargs; }
+rt_addr rt_tail_funcell(void) { return tail_cl; }
+
+rt_addr rt_tail_restage(void) {
+  return rt_push_frame_from(tail_idx, tail_nargs, tail_args);
 }
 
 /* rt_wasm_proto: protected the same way (luaF_newproto/luaS_newlstr

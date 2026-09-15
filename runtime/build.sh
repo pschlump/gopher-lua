@@ -40,6 +40,8 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -Wl,--export=rt_newclosure -Wl,--export=rt_getupval -Wl,--export=rt_setupval \
   -Wl,--export=rt_close_upvals -Wl,--export=rt_compat_arg -Wl,--export=rt_clidx \
   -Wl,--export=rt_err_value_ptr -Wl,--export=rt_err_stage_value \
+  -Wl,--export=rt_tail_stage -Wl,--export=rt_tail_clidx -Wl,--export=rt_tail_nargs \
+  -Wl,--export=rt_tail_funcell -Wl,--export=rt_tail_restage \
   -Wl,--export=lglobals"
 
 # ---- lua51_sjlj.wasm: native EH setjmp, runs on wasmtime ----

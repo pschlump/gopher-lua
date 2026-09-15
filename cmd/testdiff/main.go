@@ -55,6 +55,7 @@ func main() {
 		"err00.lua": "error-message wording (gopher-lua vs C 5.1) — M5 byte-exact suite",
 		"err01.lua": "error-message wording (gopher-lua vs C 5.1) — M5 byte-exact suite",
 		"err02.lua": "error-message wording (gopher-lua vs C 5.1) — M5 byte-exact suite",
+		"tco06.lua": "error-message wording through the tailcall chain — row 9, M5d",
 		"tbl07.lua": "table.sort callback path — ledger row 10, M5d",
 		"cb00.lua":  "table.sort comparator callback — ledger row 10, M5d",
 	})

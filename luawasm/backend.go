@@ -130,6 +130,11 @@ func (b *backend) declareImports() {
 		"rt_setupval":      m.ImportFunc("rt", "rt_setupval", iii, nil),
 		"rt_close_upvals":  m.ImportFunc("rt", "rt_close_upvals", i32v, nil),
 		"rt_compat_arg":    m.ImportFunc("rt", "rt_compat_arg", iii, i32v),
+		"rt_tail_stage":    m.ImportFunc("rt", "rt_tail_stage", iiii, i32v),
+		"rt_tail_clidx":    m.ImportFunc("rt", "rt_tail_clidx", nil, i32v),
+		"rt_tail_nargs":    m.ImportFunc("rt", "rt_tail_nargs", nil, i32v),
+		"rt_tail_funcell":  m.ImportFunc("rt", "rt_tail_funcell", nil, i32v),
+		"rt_tail_restage":  m.ImportFunc("rt", "rt_tail_restage", nil, i32v),
 	}
 	b.gKCells = m.GlobalI32(0, true)
 	m.ExportGlobal("gKCells", b.gKCells)
@@ -286,8 +291,16 @@ func (b *backend) emitDispatch() {
 		f.Br(uint32(n - k - 1))
 	}
 	f.End() // close the default block — the convergence point
-	// M5c scaffold: restage and continue the loop on a tailcall sentinel
-	f.LocalGet(lNret).I32Const(-2).I32Eq().BrIf(0)
+	// M5c: the tailcall restage — a staged descriptor becomes a fresh
+	// dispatch at the SAME adapter level (same want), so `return f(x)`
+	// recursion is O(1) wasm stack and O(1) frames.
+	f.LocalGet(lNret).I32Const(-2).I32Eq().If(wasm.Void)
+	f.Call(b.imp("rt_tail_clidx")).LocalSet(0)
+	f.Call(b.imp("rt_tail_nargs")).LocalSet(3)
+	f.Call(b.imp("rt_tail_funcell")).LocalSet(2)
+	f.Call(b.imp("rt_tail_restage")).LocalSet(1)
+	f.Br(1) // → the dispatch loop again
+	f.End()
 	f.End() // close loop
 	f.LocalGet(lNret)
 	f.End()

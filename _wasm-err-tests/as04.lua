@@ -1,0 +1,1 @@
+assert(nil, 42)

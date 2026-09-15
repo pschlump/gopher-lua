@@ -21,6 +21,9 @@
 #define LUA_LIB
 
 #include "lua.h"
+/* M5d patch: wasm-frame where via the rt activation line-stack */
+int rt_gopher_dialect(void);
+int rt_wasm_where(lua_State *L, int level);
 
 #include "lauxlib.h"
 
@@ -72,6 +75,8 @@ static void tag_error (lua_State *L, int narg, int tag) {
 
 LUALIB_API void luaL_where (lua_State *L, int level) {
   lua_Debug ar;
+  if (rt_gopher_dialect() && rt_wasm_where(L, level))
+    return;
   if (lua_getstack(L, level, &ar)) {  /* check function at level */
     lua_getinfo(L, "Sl", &ar);  /* get info about it */
     if (ar.currentline > 0) {  /* is there info? */

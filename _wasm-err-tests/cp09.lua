@@ -1,0 +1,1 @@
+print(false < 1)

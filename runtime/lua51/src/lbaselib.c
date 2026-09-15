@@ -18,6 +18,9 @@
 
 #include "lauxlib.h"
 #include "lualib.h"
+/* M5d patch: level-0 position suppression */
+int rt_gopher_dialect(void);
+void rt_where_mark(void);
 
 
 
@@ -83,11 +86,17 @@ static int luaB_tonumber (lua_State *L) {
 
 static int luaB_error (lua_State *L) {
   int level = luaL_optint(L, 2, 1);
+  if (rt_gopher_dialect() && lua_gettop(L) == 0)  /* M5d: fork's CheckAny */
+    luaL_error(L, "bad argument #1 to error (value expected)");
   lua_settop(L, 1);
-  if (lua_isstring(L, 1) && level > 0) {  /* add extra information? */
+  if ((rt_gopher_dialect() ? lua_type(L, 1) == LUA_TSTRING
+                        : lua_isstring(L, 1)) && level > 0) {  /* add extra information? */
     luaL_where(L, level);
     lua_pushvalue(L, 1);
     lua_concat(L, 2);
+  } else if (rt_gopher_dialect() && level <= 0) {
+    /* M5d: level 0 means NO position — keep rt_run from adding one */
+    rt_where_mark();
   }
   return lua_error(L);
 }
@@ -336,8 +345,14 @@ static int luaB_dofile (lua_State *L) {
 
 static int luaB_assert (lua_State *L) {
   luaL_checkany(L, 1);
-  if (!lua_toboolean(L, 1))
+  if (!lua_toboolean(L, 1)) {
+    if (rt_gopher_dialect() && !lua_isnone(L, 2) &&
+        lua_type(L, 2) != LUA_TSTRING)  /* M5d: fork's OptString check */
+      return luaL_error(L,
+                        "bad argument #2 to assert (string expected, got %s)",
+                        luaL_typename(L, 2));
     return luaL_error(L, "%s", luaL_optstring(L, 2, "assertion failed!"));
+  }
   return lua_gettop(L);
 }
 

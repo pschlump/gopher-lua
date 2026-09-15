@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"runtime/debug"
@@ -61,6 +62,36 @@ func toI32(v interface{}) int32 {
 		return int32(x)
 	}
 	return 0
+}
+
+// renderErrValue: a staged non-string error TValue (16 bytes) → the
+// interp's ValueRepr shape for the deterministic tags. Matches PrintArg /
+// ValueRepr: nil, boolean, number (NumRepr); collectables render as bare
+// markers (addresses are engine-local — the suite avoids them).
+func renderErrValue(raw []byte) string {
+	tag := raw[8]
+	switch tag {
+	case 0:
+		return "nil"
+	case 1: // boolean: value.b at offset 0
+		if raw[0] != 0 {
+			return "true"
+		}
+		return "false"
+	case 3: // number: f64 at offset 0
+		bits := uint64(0)
+		for i := 7; i >= 0; i-- {
+			bits = bits<<8 | uint64(raw[i])
+		}
+		return NumRepr(math.Float64frombits(bits))
+	case 4:
+		return "" // strings go through the bytes path
+	case 5:
+		return "<table>"
+	case 6:
+		return "<function>"
+	}
+	return "<value>"
 }
 
 // CompileSource runs the frontend and the backend: source → script.wasm.
@@ -281,6 +312,11 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	if err := e.gcStop(store, rtInst, call, L, c.Name); err != nil {
 		return []string{"ENGINE-ERROR\tgc stop: " + err.Error()}
 	}
+	// M5d: the gopher message dialect — the wasm engine pins interp ≡
+	// wasm byte-for-byte; the clua oracle keeps the stock C 5.1 texts.
+	if _, err := call(rtInst, "rt_set_dialect", 1); err != nil {
+		return []string{"ENGINE-ERROR\tdialect: " + err.Error()}
+	}
 	av, err := call(rtInst, "rt_abi_version")
 	if err != nil {
 		return []string{"ENGINE-ERROR\tABI version: " + err.Error()}
@@ -308,14 +344,26 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	}
 	stv, _ := status.(int32)
 	if stv != 0 {
-		// staged error: copy bytes out of a guest buffer
+		// staged error: message bytes, or — for non-string error values —
+		// the exact TValue rendered here (M5d: error(nil)/error(42) match
+		// the interp's deterministic renders; table/function values carry
+		// addresses and stay outside the byte-exact suite)
+		emitted := false
 		if buf, err := call(rtInst, "rt_frame_alloc", 4096); err == nil {
 			if n, err := call(rtInst, "rt_err_stage_copy", buf, 4096); err == nil {
 				nv, _ := n.(int32)
 				if nv > 0 {
 					if raw := memRead(buf.(int32), nv); raw != nil {
 						emit("ERROR", strconv.Quote(string(raw)))
+						emitted = true
 					}
+				}
+			}
+		}
+		if !emitted {
+			if vp, err := call(rtInst, "rt_err_value_ptr"); err == nil {
+				if raw := memRead(vp.(int32), 16); raw != nil {
+					emit("ERROR", strconv.Quote(renderErrValue(raw)))
 				}
 			}
 		}

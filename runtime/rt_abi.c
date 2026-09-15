@@ -54,6 +54,107 @@ _Static_assert(sizeof(lua_Number) == 8, "numbers are f64");
 static lua_State *curL;
 static int rt_wasm_depth; /* adapter nesting (RTW_MAX_DEPTH guard, v3) */
 
+/* ---- M5d: the gopher-lua message dialect ----
+**
+** The wasm engine enables it (rt_set_dialect(1)); the clua oracle keeps
+** the stock C 5.1 texts (M2 gate untouched). Texts mirror the fork's
+** RaiseError strings exactly (_vm.go/state.go/baselib.go):
+**   arith:    "cannot perform <op> operation between <t1> and <t2>"
+**   concat:   "cannot perform concat operation between <t1> and <t2>"
+**   index:    "attempt to index a non-table object(<t>) with key '<k>'"
+**   compare:  "attempt to compare <t1> with <t2>"
+**   call:     "attempt to call a non-function object"
+** Type names follow lValueNames (value.go). Position prefixes come from
+** the rt line immediates: rt_run's prefix for core raises, and the
+** activation line-stack (below) for error() levels / luaL_where. */
+static int rt_dialect;
+
+/* activation line-stack: one entry per LIVE rt_run — the current line of
+   each nested wasm activation (the CallInfos carry none). luaL_where
+   reads it top-down for error() levels. */
+#define RT_LINE_MAX 256
+static int rt_lines[RT_LINE_MAX];
+static int rt_line_sp;
+
+/* set when a position was already decided (error() built its prefix via
+   the line-stack, or chose none at level 0) — rt_run then must not add
+   its own prefix. */
+static int rt_where_set;
+
+void rt_set_dialect(int32_t d) { rt_dialect = (int)d; }
+int rt_gopher_dialect(void) { return rt_dialect; }
+
+void rt_where_mark(void) { rt_where_set = 1; }
+
+int rt_line_depth(void) { return rt_line_sp; }
+int rt_line_at(int32_t from_top) {
+  int i = rt_line_sp - 1 - (int)from_top;
+  if (i < 0 || i >= rt_line_sp) return 0;
+  return rt_lines[i];
+}
+
+/* gopher type names (value.go lValueNames) */
+const char *rt_gtypename_safe(const TValue *v) {
+  static const char *names[] = {"nil",     "boolean", "?",       "number",
+                                "string",  "table",   "function",
+                                "userdata", "thread"};
+  int t = ttype(v);
+  if (t < 0 || t > 8) return "?";
+  return names[t];
+}
+
+/* gopher key/value repr for index messages: key.String() — integers
+   plain, others %.14g */
+static void rt_grepr(char *buf, size_t cap, const TValue *v) {
+  switch (ttype(v)) {
+  case LUA_TNUMBER: {
+    lua_Number n = nvalue(v);
+    if (n == (lua_Number)(long long)n)
+      snprintf(buf, cap, "%lld", (long long)n);
+    else
+      snprintf(buf, cap, "%.14g", (double)n);
+    break;
+  }
+  case LUA_TSTRING:
+    snprintf(buf, cap, "%s", svalue(v));
+    break;
+  case LUA_TBOOLEAN:
+    snprintf(buf, cap, "%s", bvalue(v) ? "true" : "false");
+    break;
+  default:
+    snprintf(buf, cap, "%s", rt_gtypename_safe(v));
+  }
+}
+
+/* arith op names: gopher's event strings minus the underscores */
+static const char *rt_gopname(int op) {
+  switch (op) {
+  case RT_OP_ADD: return "add";
+  case RT_OP_SUB: return "sub";
+  case RT_OP_MUL: return "mul";
+  case RT_OP_DIV: return "div";
+  case RT_OP_MOD: return "mod";
+  case RT_OP_POW: return "pow";
+  case RT_OP_UNM: return "unm";
+  default: return "?";
+  }
+}
+
+/* the gopher index message, from t and k (both in hand at the raise) */
+void rt_gindex_error(lua_State *L, const TValue *t, const TValue *k) {
+  char kb[128];
+  rt_grepr(kb, sizeof kb, k);
+  luaG_runerror(L, "attempt to index a non-table object(%s) with key '%s'",
+                rt_gtypename_safe(t), kb);
+}
+int rt_wasm_ci(lua_State *L) {
+  Closure *cl;
+  if (L->ci == NULL || L->ci == L->base_ci - 1 || !ttisfunction(L->ci->func))
+    return 0;
+  cl = clvalue(L->ci->func);
+  return !cl->c.isC && cl->l.p->wasm_idx >= 0;
+}
+
 /* staged-error position prefix: the real chunk name (parity with the
    interpreter's "name:line:" format) */
 static char chunk_name[256] = "script";
@@ -62,10 +163,11 @@ static int chunk_name_len = 6;
 /* staged error: sticky until rt_err_clear. err_value carries the EXACT
    error TValue (the M5a fix — the adapter re-raises from it, so non-string
    objects survive); err_buf holds message bytes, filled only when the
-   value is a string (the typed protocol for other tags is M5d). */
+   value is a string. err_prefixed: the raiser already decided the
+   position (error() levels) or the value is non-string — no rt prefix. */
 static TValue err_value;
 static char err_buf[1024];
-static int err_buf_len, err_pending;
+static int err_buf_len, err_pending, err_prefixed;
 
 static void stage_error(void) {
   const TValue *ev = curL->top - 1;
@@ -73,6 +175,11 @@ static void stage_error(void) {
   curL->top -= 1;
   err_buf_len = 0;
   err_buf[0] = '\0';
+  /* sticky per in-flight error: the origin decided the position (or the
+     value is non-string) — outer re-stagings (the adapter's re-raise
+     caught by enclosing rt_runs) must not prefix again */
+  err_prefixed = err_prefixed || rt_where_set;
+  rt_where_set = 0;
   if (ttisstring(ev)) {
     const char *s = svalue(ev);
     size_t n = strlen(s);
@@ -80,6 +187,8 @@ static void stage_error(void) {
     memcpy(err_buf, s, n);
     err_buf[n] = '\0';
     err_buf_len = (int)n;
+  } else {
+    err_prefixed = 1; /* non-string: the engine renders the value */
   }
   err_pending = 1;
 }
@@ -92,6 +201,7 @@ void rt_set_state(rt_addr p) {
   curL = (lua_State *)(size_t)p;
   err_pending = 0;
   err_buf_len = 0;
+  err_prefixed = 0;
   setnilvalue(&err_value);
   rt_wasm_depth = 0;
 }
@@ -114,6 +224,7 @@ void rt_err_clear(void) {
 void rt_pcall_caught(void) {
   err_pending = 0;
   err_buf_len = 0;
+  err_prefixed = 0;
   setnilvalue(&err_value);
 }
 
@@ -168,16 +279,24 @@ static int rt_run(body_fn fn, int32_t line) { return rt_run_raw(fn, line); }
 /* returns RT_OK, or RT_ERR with the error staged (message gets the
    script-position prefix, matching the oracle's error format) */
 static int rt_run_raw(body_fn fn, int32_t line) {
+  int prefixed;
   if (err_pending) return RT_ERR;
   cur_body = fn;
+  if (rt_line_sp < RT_LINE_MAX) rt_lines[rt_line_sp] = (int)line;
+  rt_line_sp++;
   lua_lock(curL);
   int status = luaD_rawrunprotected(curL, protect_trampoline, NULL);
   lua_unlock(curL);
+  rt_line_sp--;
   if (status != 0) {
-    stage_error(); /* message bytes into err_buf */
-    if (line != 0) {
+    stage_error(); /* value + message bytes; captures rt_where_set */
+    prefixed = err_prefixed;
+    if (line != 0 && !prefixed && err_buf_len > 0) {
       /* position prefix, like luaG_runerror's — done in the buffer, not
-         on the Lua stack: post-error stack discipline is fragile */
+         on the Lua stack: post-error stack discipline is fragile.
+         Skipped when the raiser already decided the position
+         (error() levels via the line-stack) and for non-string values
+         (the engine renders those from the value itself). */
       char tmp[sizeof err_buf];
       int w = snprintf(tmp, sizeof tmp, "%.*s:%d: %s", chunk_name_len,
                        chunk_name, (int)line, err_buf);
@@ -263,12 +382,23 @@ static void arith_body(void) {
     setnvalue(dst, res);
     return;
   }
-  /* non-numbers: metamethod, else the standard arith error (raises) */
+  /* non-numbers: metamethod, else the arith error (raises) — the
+     gopher dialect carries the op and both type names (_vm.go) */
   TMS tm = (TMS)(op - RT_OP_ADD + TM_ADD);
   const TValue *tmf = luaT_gettmbyobj(curL, &ar_l, tm);
   if (ttisnil(tmf)) tmf = luaT_gettmbyobj(curL, &ar_r, tm);
-  if (ttisnil(tmf)) luaG_aritherror(curL, &ar_l, &ar_r);
-  else {
+  if (ttisnil(tmf)) {
+    if (rt_dialect) {
+      if (op == RT_OP_UNM)  /* the fork's own text (_vm.go OP_UNM) */
+        luaG_runerror(curL, "__unm undefined");
+      else
+        luaG_runerror(curL, "cannot perform %s operation between %s and %s",
+                      rt_gopname(op), rt_gtypename_safe(&ar_l),
+                      rt_gtypename_safe(&ar_r));
+    }
+    else
+      luaG_aritherror(curL, &ar_l, &ar_r);
+  } else {
     luaD_checkstack(curL, 4);
     setobj2s(curL, curL->top, tmf); curL->top++;
     setobj2s(curL, curL->top, &ar_l); curL->top++;
@@ -916,4 +1046,49 @@ int32_t rt_err_stage_value(rt_addr dst, int32_t cap) {
   if (cap < (int32_t)sizeof(TValue)) return 0;
   memcpy((void *)(size_t)dst, &err_value, sizeof err_value);
   return (int32_t)sizeof(TValue);
+}
+
+/* luaL_where hook (lauxlib.c): the level-th frame is a wasm closure →
+   push "chunk:line: " from the activation line-stack and mark the
+   position decided (rt_run must not re-prefix). Walking outward from
+   L->ci, every wasm frame passed consumes one line-stack entry (its
+   current rt_run's line); non-wasm frames just cost a level. Returns 0
+   to let the stock path run. */
+int rt_wasm_where(lua_State *L, int level) {
+  CallInfo *ci = L->ci;
+  int consumed = 0, idx;
+  /* gopher's arithmetic (state.go where + skipg): the level-th frame,
+     with C/G frames transparent — skip upward to the nearest wasm/Lua
+     frame. Inner wasm frames each hold one line-stack entry (top-down);
+     error('m',1) and ('m',2) both land on the direct caller because the
+     raising C function itself occupies index 0. */
+  for (idx = 0; ci >= L->base_ci; idx++, ci--) {
+    Closure *cl = ttisfunction(ci->func) ? clvalue(ci->func) : NULL;
+    int isw = cl != NULL && !cl->c.isC && cl->l.p->wasm_idx >= 0;
+    if (isw) {
+      if (idx >= level - 1) {
+        int line = rt_line_at(consumed);
+        if (line > 0) {
+          lua_pushfstring(L, "%s:%d: ", chunk_name, line);
+          rt_where_set = 1;
+          return 1;
+        }
+        return 0;  /* no line info → stock */
+      }
+      consumed++;  /* inner wasm frame passed */
+    }
+    /* C frames: transparent — keep walking */
+  }
+  /* walked past the CI array: the main chunk runs without a CallInfo
+     (the engine calls lua_main directly) but holds the bottom line-stack
+     entry */
+  if (consumed < rt_line_depth()) {
+    int line = rt_line_at(consumed);
+    if (line > 0) {
+      lua_pushfstring(L, "%s:%d: ", chunk_name, line);
+      rt_where_set = 1;
+      return 1;
+    }
+  }
+  return 0;
 }

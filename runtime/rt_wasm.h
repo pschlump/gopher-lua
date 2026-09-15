@@ -76,6 +76,18 @@ int32_t rt_tail_nargs(void);
 rt_addr rt_tail_funcell(void);
 rt_addr rt_tail_restage(void);
 
+/* ---- M5d: gopher-lua message dialect (internal helpers) ---- */
+
+void rt_set_dialect(int32_t d); /* exported to the host: 1 = gopher texts */
+int rt_gopher_dialect(void);
+void rt_where_mark(void);    /* a raise already decided the position */
+const char *rt_gtypename_safe(const TValue *v); /* gopher type name */
+const char *rt_chunkname_ptr(void); /* current chunk name (where prefix) */
+int rt_line_depth(void);     /* activation line-stack (per live rt_run) */
+int rt_line_at(int32_t from_top); /* 0 = top */
+void rt_gindex_error(lua_State *L, const TValue *t, const TValue *k);
+int rt_wasm_ci(lua_State *L); /* current CallInfo is a wasm frame */
+
 /* ---- internal helpers (rt_abi.c; called from ldo.c's adapter) ---- */
 
 int32_t rt_wasm_enter(int32_t idx); /* 0 = ok; 1 = over RTW_MAX_DEPTH,

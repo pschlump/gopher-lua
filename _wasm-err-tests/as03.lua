@@ -1,0 +1,1 @@
+print(pcall(assert, false))

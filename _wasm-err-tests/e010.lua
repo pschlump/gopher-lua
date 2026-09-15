@@ -1,0 +1,1 @@
+print(pcall(error, 'wrapped'))

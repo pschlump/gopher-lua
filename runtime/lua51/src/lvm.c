@@ -25,6 +25,7 @@
 #include "ltable.h"
 #include "ltm.h"
 #include "lvm.h"
+#include "rt_wasm.h"  /* M5d patch: gopher index dialect */
 
 
 
@@ -119,8 +120,12 @@ void luaV_gettable (lua_State *L, const TValue *t, TValue *key, StkId val) {
       }
       /* else will try the tag method */
     }
-    else if (ttisnil(tm = luaT_gettmbyobj(L, t, TM_INDEX)))
-      luaG_typeerror(L, t, "index");
+    else if (ttisnil(tm = luaT_gettmbyobj(L, t, TM_INDEX))) {
+      if (rt_gopher_dialect())  /* M5d: the key rides along (_vm.go) */
+        rt_gindex_error(L, t, key);
+      else
+        luaG_typeerror(L, t, "index");
+    }
     if (ttisfunction(tm)) {
       callTMres(L, val, tm, t, key);
       return;
@@ -148,8 +153,12 @@ void luaV_settable (lua_State *L, const TValue *t, TValue *key, StkId val) {
       }
       /* else will try the tag method */
     }
-    else if (ttisnil(tm = luaT_gettmbyobj(L, t, TM_NEWINDEX)))
-      luaG_typeerror(L, t, "index");
+    else if (ttisnil(tm = luaT_gettmbyobj(L, t, TM_NEWINDEX))) {
+      if (rt_gopher_dialect())  /* M5d: the key rides along (_vm.go) */
+        rt_gindex_error(L, t, key);
+      else
+        luaG_typeerror(L, t, "index");
+    }
     if (ttisfunction(tm)) {
       callTM(L, tm, t, key, val);
       return;

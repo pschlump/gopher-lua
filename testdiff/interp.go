@@ -122,19 +122,45 @@ func installShim(L *lua.LState, emit func(event, payload string)) {
 	}
 	L.SetField(L.GetGlobal("os"), "execute", L.NewFunction(execStub))
 
-	// os.time/clock/date: constants
+	// os.time/clock/date: the pinned-instant semantics the C engines
+	// implement (luawasm.c, ledger row 5): no-arg time = the pinned epoch,
+	// table form does real UTC calendar arithmetic (days_from_civil),
+	// date formats the fixed 2000-01-01 00:00:00 UTC instant (Saturday).
 	constStub := func(v float64) func(*lua.LState) int {
 		return func(L *lua.LState) int {
 			L.Push(lua.LNumber(v))
 			return 1
 		}
 	}
-	L.SetField(L.GetGlobal("os"), "time", L.NewFunction(constStub(1234567890)))
-	L.SetField(L.GetGlobal("os"), "clock", L.NewFunction(constStub(0)))
-	L.SetField(L.GetGlobal("os"), "date", L.NewFunction(func(L *lua.LState) int {
-		L.Push(lua.LString("2000-01-01 00:00:00"))
+	osTime := func(L *lua.LState) int {
+		if L.GetTop() > 0 && L.Get(1).Type() == lua.LTTable {
+			t := L.Get(1).(*lua.LTable)
+			geti := func(name string, def int) int {
+				if v := L.GetField(t, name); v.Type() == lua.LTNumber {
+					return int(v.(lua.LNumber))
+				}
+				return def
+			}
+			year := geti("year", 0)
+			month := geti("month", 1)
+			day := geti("day", 1)
+			hour := geti("hour", 12)
+			min := geti("min", 0)
+			sec := geti("sec", 0)
+			t.RawSetString("hour", lua.LNumber(hour))
+			t.RawSetString("min", lua.LNumber(min))
+			t.RawSetString("sec", lua.LNumber(sec))
+			t.RawSetString("isdst", lua.LBool(false))
+			days := daysFromCivil(year, month, day)
+			L.Push(lua.LNumber(days*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)))
+			return 1
+		}
+		L.Push(lua.LNumber(946684800)) // 2000-01-01 00:00:00 UTC
 		return 1
-	}))
+	}
+	L.SetField(L.GetGlobal("os"), "time", L.NewFunction(osTime))
+	L.SetField(L.GetGlobal("os"), "clock", L.NewFunction(constStub(0)))
+	L.SetField(L.GetGlobal("os"), "date", L.NewFunction(osDateShim))
 
 	// math.random/randomseed: deterministic, engine-owned RNG.
 	//
@@ -178,4 +204,79 @@ func installShim(L *lua.LState, emit func(event, payload string)) {
 		L.Push(lua.LString(fmt.Sprintf("testdiff.tmp.%d", tmpCounter)))
 		return 1
 	}))
+}
+
+
+// daysFromCivil: days since 1970-01-01 from a civil date (Howard
+// Hinnant's algorithm — the same one luawasm.c uses, ledger row 5).
+func daysFromCivil(y, m, d int) int64 {
+	yy := int64(y)
+	if m <= 2 {
+		yy--
+	}
+	era := yy / 400
+	if yy < 0 && yy%400 != 0 {
+		era-- // floor division for negatives
+	}
+	yoe := yy - era*400
+	var mp int
+	if m > 2 {
+		mp = m - 3
+	} else {
+		mp = m + 9
+	}
+	doy := (153*int64(mp)+2)/5 + int64(d) - 1
+	doe := yoe*365 + yoe/4 - yoe/100 + doy
+	return era*146097 + doe - 719468
+}
+
+// osDateShim: os.date over the pinned 2000-01-01 00:00:00 UTC instant —
+// "*t" gives the fixed table; string forms walk a strftime subset with
+// fixed outputs (the time argument is ignored, matching luawasm.c).
+func osDateShim(L *lua.LState) int {
+	f := "%c"
+	if L.GetTop() > 0 && L.Get(1).Type() == lua.LTString {
+		f = L.Get(1).String()
+	}
+	f = strings.TrimPrefix(f, "!") // UTC == local at the pinned instant
+	if f == "*t" {
+		t := L.NewTable()
+		t.RawSetString("year", lua.LNumber(2000))
+		t.RawSetString("month", lua.LNumber(1))
+		t.RawSetString("day", lua.LNumber(1))
+		t.RawSetString("hour", lua.LNumber(0))
+		t.RawSetString("min", lua.LNumber(0))
+		t.RawSetString("sec", lua.LNumber(0))
+		t.RawSetString("wday", lua.LNumber(7))
+		t.RawSetString("yday", lua.LNumber(1))
+		t.RawSetString("isdst", lua.LBool(false))
+		L.Push(t)
+		return 1
+	}
+	fixed := map[byte]string{
+		'Y': "2000", 'y': "00", 'm': "01", 'd': "01", 'H': "00", 'M': "00",
+		'S': "00", 'j': "001", 'w': "6", 'W': "00", 'U': "00", 'p': "AM",
+		'A': "Saturday", 'a': "Sat", 'B': "January", 'b': "Jan", 'h': "Jan",
+		'c': "Sat Jan  1 00:00:00 2000", 'x': "01/01/00", 'X': "00:00:00",
+	}
+	var b strings.Builder
+	for i := 0; i < len(f); i++ {
+		if f[i] != '%' || i+1 >= len(f) {
+			b.WriteByte(f[i])
+			continue
+		}
+		i++
+		if f[i] == '%' {
+			b.WriteByte('%')
+			continue
+		}
+		if v, ok := fixed[f[i]]; ok {
+			b.WriteString(v)
+		} else {
+			b.WriteByte('%')
+			b.WriteByte(f[i])
+		}
+	}
+	L.Push(lua.LString(b.String()))
+	return 1
 }

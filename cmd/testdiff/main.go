@@ -46,16 +46,12 @@ func main() {
 		os.Exit(2)
 	}
 	cases, skippedList := testdiff.FilterSkips(cases, map[string]string{
-		// Ledgered divergences (docs/Lua-Wasm-Divergence-Ledger.md):
-		// error-message wording differs between the gopher-lua oracle and
-		// stock C Lua 5.1 (the M2 oracle contract keeps the C texts);
-		// table.sort's comparator path still trips the wasm callback
-		// machinery (ledger row 10 — carried to M5d; gsub/pcall/__index
-		// callbacks pass since the A4 adapter).
-		"err00.lua": "error-message wording (gopher-lua vs C 5.1) — M5 byte-exact suite",
-		"err01.lua": "error-message wording (gopher-lua vs C 5.1) — M5 byte-exact suite",
-		"err02.lua": "error-message wording (gopher-lua vs C 5.1) — M5 byte-exact suite",
-		"tco06.lua": "error-message wording through the tailcall chain — row 9, M5d",
+		// Ledgered divergences (docs/Lua-Wasm-Divergence-Ledger.md): the
+		// gopher message dialect (M5d) made error wording byte-exact —
+		// err00-02 and tco06 now pass. Remaining: table.sort's comparator
+		// path still trips the wasm callback machinery (row 10, with the
+		// deep __call corner — row 18; gsub/pcall/__index callbacks pass
+		// since the A4 adapter).
 		"tbl07.lua": "table.sort callback path — ledger row 10, M5d",
 		"cb00.lua":  "table.sort comparator callback — ledger row 10, M5d",
 	})

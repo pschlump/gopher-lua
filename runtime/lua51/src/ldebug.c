@@ -27,6 +27,7 @@
 #include "ltable.h"
 #include "ltm.h"
 #include "lvm.h"
+#include "rt_wasm.h"  /* M5d patch: gopher message dialect */
 
 
 
@@ -567,6 +568,21 @@ static int isinstack (CallInfo *ci, const TValue *o) {
 void luaG_typeerror (lua_State *L, const TValue *o, const char *op) {
   const char *name = NULL;
   const char *t = luaT_typenames[ttype(o)];
+  if (rt_gopher_dialect()) {  /* M5d: the fork's texts, keyed by action */
+    if (strcmp(op, "call") == 0) {
+      luaG_runerror(L, "attempt to call a non-function object");
+      return;
+    }
+    if (strcmp(op, "concatenate") == 0) {
+      /* callers with both operands route through luaG_concaterror */
+      luaG_runerror(L, "cannot perform concat operation between a %s value and a value", t);
+      return;
+    }
+    if (strcmp(op, "get length of") == 0) {
+      luaG_runerror(L, "__len undefined");  /* the fork's own text */
+      return;
+    }
+  }
   const char *kind = (isinstack(L->ci, o)) ?
                          getobjname(L, L->ci, cast_int(o - L->base), &name) :
                          NULL;
@@ -579,6 +595,11 @@ void luaG_typeerror (lua_State *L, const TValue *o, const char *op) {
 
 
 void luaG_concaterror (lua_State *L, StkId p1, StkId p2) {
+  if (rt_gopher_dialect()) {  /* M5d: both operand types (_vm.go) */
+    luaG_runerror(L, "cannot perform concat operation between %s and %s",
+                  rt_gtypename_safe(p1), rt_gtypename_safe(p2));
+    return;
+  }
   if (ttisstring(p1) || ttisnumber(p1)) p1 = p2;
   lua_assert(!ttisstring(p1) && !ttisnumber(p1));
   luaG_typeerror(L, p1, "concatenate");
@@ -596,6 +617,11 @@ void luaG_aritherror (lua_State *L, const TValue *p1, const TValue *p2) {
 int luaG_ordererror (lua_State *L, const TValue *p1, const TValue *p2) {
   const char *t1 = luaT_typenames[ttype(p1)];
   const char *t2 = luaT_typenames[ttype(p2)];
+  if (rt_gopher_dialect()) {  /* M5d: always the with-form (_vm.go) */
+    luaG_runerror(L, "attempt to compare %s with %s",
+                  rt_gtypename_safe(p1), rt_gtypename_safe(p2));
+    return 0;
+  }
   if (t1[2] == t2[2])
     luaG_runerror(L, "attempt to compare two %s values", t1);
   else
@@ -630,9 +656,13 @@ void luaG_errormsg (lua_State *L) {
 
 void luaG_runerror (lua_State *L, const char *fmt, ...) {
   va_list argp;
+  const char *msg;
   va_start(argp, fmt);
-  addinfo(L, luaO_pushvfstring(L, fmt, argp));
+  msg = luaO_pushvfstring(L, fmt, argp);
   va_end(argp);
+  if (!rt_wasm_ci(L))  /* M5d: wasm CallInfos carry no line info — the
+                          rt line immediates own the position */
+    addinfo(L, msg);
   luaG_errormsg(L);
 }
 

@@ -284,9 +284,10 @@ func TestWasmReentrySpike(t *testing.T) {
 		t.Fatalf("rt_abi_version: %v %v", v, err)
 	}
 
-	memBase := guestMem.Data(store)
-	memSize := guestMem.DataSize(store)
-	mem := unsafe.Slice((*byte)(memBase), memSize)
+	// the wasm heap can grow (relocating) mid-run — read lazily
+	memNow := func() []byte {
+		return unsafe.Slice((*byte)(guestMem.Data(store)), guestMem.DataSize(store))
+	}
 	run := func(src string) int32 {
 		in, err := call("linbuf")
 		if err != nil {
@@ -296,16 +297,17 @@ func TestWasmReentrySpike(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		copy(mem[in:], src)
-		copy(mem[nm:], "spike")
+		copy(memNow()[in:], src)
+		copy(memNow()[nm:], "spike")
 		st, err := call("ldostring", L, in, len(src), nm, 0)
 		if err != nil {
 			t.Fatalf("ldostring(%q): %v", src, err)
 		}
 		if st != 0 {
-			if el, e := call("lerrlen"); e == nil && el > 0 {
-				if scr, e2 := call("rt_frame_alloc", 8192); e2 == nil {
-					if n, e3 := call("lerrcopy", scr, 8192); e3 == nil && n > 0 {
+			if el, e := call("lerrlen"); e == nil && el > 0 && el < 4096 {
+				if scr, e2 := call("rt_frame_alloc", 8192); e2 == nil && scr > 0 {
+					mem := memNow()
+					if n, e3 := call("lerrcopy", scr, 8192); e3 == nil && n > 0 && int(scr)+int(n) <= len(mem) {
 						t.Logf("ldostring(%q) err: %s", src, string(mem[scr:int(scr)+int(n)]))
 					}
 				}
@@ -344,7 +346,7 @@ func TestWasmReentrySpike(t *testing.T) {
 			t.Fatalf("rt_newclosure %s: %v", name, err)
 		}
 		kc := base + int32(16*(8+i))
-		copy(mem[kc:], name)
+		copy(memNow()[kc:], name)
 		if _, err := call("rt_intern", kc, kc, len(name)); err != nil {
 			t.Fatalf("rt_intern %s: %v", name, err)
 		}

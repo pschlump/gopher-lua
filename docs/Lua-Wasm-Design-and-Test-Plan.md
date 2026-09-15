@@ -5,12 +5,14 @@
 **Companion to:** `docs/Performance-Improvement-Plan.md` §7 (Option E)
 **Goal:** A production Lua 5.1 → WebAssembly compiler reusing this repo's frontend (`parse/`, `ast/`, `compile.go`), targeting wazero on linux/amd64 + linux/arm64, with a test regime strong enough to trust it inside a Redis-class network daemon running untrusted client scripts.
 
+**Integration target (updated 2026-09-14):** the daemon is a **pure-Go clone of Redis** — no C code is involved in the daemon: no cgo, no C toolchain, no C sources in the clone's repo. The clone consumes exactly two things from this project: a **Go host package** (the public API, §6) and **prebuilt, checksummed wasm blobs** embedded as data (`//go:embed`). The production engine is wazero precisely because it is pure Go; the wasmtime engines in `testdiff/` exist only as dev/CI differential-oracle hosts and their cgo dependency never ships. The C sources under `runtime/` are *this repo's* build-time concern only (§5): compiled once here into the runtime blob, never shipped as C.
+
 ---
 
 ## 1. System overview
 
 ```
-                 ┌────────────────────────── Go host (your Redis) ─────────────────────────┐
+                 ┌───────────────────── Go host (pure-Go Redis clone) ─────────────────────┐
                  │  script cache (SHA→module) · wazero Runtime · host module ("redis")     │
                  │  reply⇄linear-memory conversion · deadline flag · memory caps           │
                  └───────▲──────────────────────────────────▲──────────────────────────────┘
@@ -19,7 +21,7 @@
                  │ runtime.wasm       │            │ script.wasm          │
                  │ (C Lua 5.1 runtime │◄───────────│ (per-script, emitted │
                  │  minus lvm; built  │  rt_* calls│  by the new backend) │
-                 │  once, shipped)    │            │                      │
+                 │  once, embedded)   │            │                      │
                  └────────────────────┘            └──────────────────────┘
                           ▲                                ▲
                           └───── same pipeline, both oracles ─────┐
@@ -31,8 +33,8 @@ Three code-producing pieces and one host piece:
 
 1. **`wasm/`** — a standalone wasm binary emitter (sections, LEB128, encoders for the ~50 instruction forms we generate). No dependencies; usable for any wasm project.
 2. **`luawasm/`** — the backend: `[]FunctionProto` (tree) → module. This is the new compiler.
-3. **`runtime/`** — C Lua 5.1 runtime adapted to freestanding wasm32, compiled **once** with wasi-sdk/clang, shipped as a versioned blob (`runtime.wasm`).
-4. **Host shim** — Go package wiring wazero: instantiation, host imports, conversion, lifecycle.
+3. **`runtime/`** — C Lua 5.1 runtime adapted to freestanding wasm32, compiled **once, in this repo only**, with wasi-sdk/clang, shipped as a versioned, checksummed blob (`runtime.wasm`) embedded via `//go:embed`. To the daemon the blob is data, not C — nothing C crosses the boundary (A8).
+4. **Host package (`host/`, §6)** — the public Go API the Redis clone imports: wazero wiring, instantiation, host imports (`redis.*`), reply⇄TValue conversion, lifecycle, and the per-VM memory-image lock. This is the entire integration surface.
 
 ### 1.1 Key architectural decisions (beyond the plan doc's §7)
 
@@ -45,6 +47,8 @@ Three code-producing pieces and one host piece:
 | A5 | **Deadline via direct memory write.** Host writes a flag at a fixed linear-memory address; emitted loop back-edges load it and branch to `rt_deadline`. | No host call on the hot path; replaces the interpreter's per-instruction `select` on `ctx.Done()`. |
 | A6 | **Arena reset instead of GC for the common case.** Stateless script runs bump-allocate and reset; mark-sweep (frames-as-roots) engages only past a per-run memory threshold. | Most Redis scripts never collect. GC becomes a safety valve, not a component on the critical path. |
 | A7 | **Bring-up vehicle: stock C Lua 5.1 compiled whole (including `lvm.c`) to wasm first.** | Validates the toolchain and gives an in-wasm oracle *before the backend exists* (§8.4). The backend then progressively replaces `lvm.c` calls with inline code — same seam LuaJIT used. |
+| A8 | **The daemon is a pure-Go Redis clone: production engine is wazero, zero cgo, no C sources or C toolchain in the clone's repo.** The C under `runtime/` is this repo's build-time concern; the daemon consumes the Go host package (§6) plus embedded, checksummed wasm blobs. wasmtime stays dev/CI-only (oracle host). | Cross-compilation and deployment stay trivial; the security story for untrusted scripts lives entirely in wasm + Go. The M2–M4 engines run on wasmtime, and wazero implements no EH proposal, so an **EH-free blob flavor for wazero is a tracked M6 item** (§5, §11) gating M7 integration. |
+| A9 | **Concurrency: one lock per Lua memory image.** A *VM* owns the whole guest state of one running Lua — script-module instance + runtime-module instance + shared linear memory + control block — guarded by a single `sync.Mutex`; `VM.Run` holds it end-to-end. Concurrent Runs on one VM serialize; VMs are independent and run in parallel. | A multi-goroutine daemon gets thread-proofing as the API unit (§6.2), not an internal courtesy; host trampolines execute on the lock-holding goroutine so reentrancy cannot deadlock. Examples demonstrate it under `go test -race` (§6.3). |
 
 ---
 
@@ -197,6 +201,7 @@ sig: (param $L i32)         ;; thread/state pointer (current frame base etc.)
 
 - **Source**: Lua 5.1.4 `ltable.c lstring.c lgc.c lmem.c lobject.c ltm.c lvm.c(arith/compare helpers only) lapi.c(subset) lfunc.c ldo.c(structure only) lauxlib(subset)` — everything except the bytecode interpreter loop; MIT license.
 - **Toolchain**: `clang --target=wasm32-unknown-unknown -nostdlib` (or wasi-sdk with a stub libc: `memcpy/memset/memmove/strlen` only). Built once per release, checksummed, embedded in the Go binary via `//go:embed`.
+- **Build flavors (A8)**: the SJLJ/EH flavor (`lua51_sjlj.wasm`, wasmtime-hosted) serves dev/CI as oracle and differential engine. Production on wazero needs an **EH-free flavor** — wazero implements no exception-handling proposal — where error flow is exclusively the staged-value protocol (§4, A4): backend paths already are; the remaining internal setjmp users (`pcall`, sort/gsub callbacks) route through the same seams. M6 deliverable, gated on the full corpus green on wazero.
 - **setjmp/longjmp → error protocol**: `rt_error` sets `err_flag/err_value` and returns; callers (emitted code) early-return; `pcall` = `rt_pcall` saves frame/stack state, invokes, restores on flag — mirrors `PCall` semantics in `state.go:2029`.
 - **Allocator**: bump arena (`rt_alloc`), watermark check, mark-sweep collector (roots: frame list, globals, registry, upvalue list) run inside `rt_alloc` only when past watermark.
 - **Strings**: interned hash table (cached 32-bit hashes — the fix §2b of the plan wanted, now free); `string.format` etc. ported from `lstrlib.c` (deterministic subset).
@@ -205,26 +210,90 @@ sig: (param $L i32)         ;; thread/state pointer (current frame base etc.)
 
 ---
 
-## 6. Host shim (Go)
+## 6. Host package (Go) — the public API the Redis clone calls
+
+Everything the daemon needs is one import: package `host` (pure Go, wazero underneath, blobs embedded — A8). No cgo, no C toolchain, no C sources.
+
+### 6.1 Interface
 
 ```go
-type ScriptEngine struct {
-    rt      wazero.Runtime          // shared
-    rtMod   api.Module              // runtime.wasm, instantiated once
-    cache   map[SHA256]*compiledScript  // module + metadata (fnIdx→proto, line tables)
+package host
+
+// Engine: process-wide. Owns the shared wazero Runtime, the runtime blob,
+// and the compiled-script cache. Safe for concurrent use.
+type Engine struct {
+    // rt    wazero.Runtime        (shared)
+    // blob  []byte                (runtime.wasm, embedded + checksummed)
+    // cache map[SHA1]*Script
 }
 
-type compiledScript struct {
-    wazMod  wazero.CompiledModule
-    meta    ScriptMeta              // proto info for stack traces on the Go side
+func NewEngine(opts ...Option) (*Engine, error)
+
+// Compile: the EVAL path. source → parse → lua.Compile → backend → wasm,
+// cached by SHA1 (Redis parity). SCRIPT LOAD = Compile; EVAL = Compile+Run;
+// EVALSHA = Run from cache; SCRIPT FLUSH = cache drop.
+func (e *Engine) Compile(source []byte, name string) (*Script, error)
+
+type Script struct {
+    SHA1 []byte
+    Wasm []byte        // the durable artifact cmd/luawasmc writes/reads
+    Meta ScriptMeta    // proto/line tables for Go-side stack traces
 }
 
-func (e *ScriptEngine) Run(sha []byte, keys, argv []string, deadline time.Time) (Result, error)
+type RunOptions struct {
+    Keys, Argv []string  // staged into the args area as TValues
+    Deadline   time.Time // watchdog writes ctrl+0x10; loops poll at back-edges
+    MaxPages   uint32    // instance memory cap → rt_oom error, not host OOM
+}
+
+// VM: one Lua memory image — script-module instance + runtime-module
+// instance + the shared linear memory + control block — plus the mutex
+// that makes it thread-proof (A9). All guest state lives in the image.
+type VM struct {
+    // mu   sync.Mutex
+    // inst api.Instance (script), rtInst api.Instance (runtime)
+    // mem  api.Memory   (shared linear memory)
+}
+
+func (e *Engine) NewVM() (*VM, error) // fresh image; µs-cheap (M0 measured ≈7.4 µs)
+
+// Run executes s against this VM's memory image. It holds vm.mu from entry
+// to result: one execution at a time per image, any number of images in
+// parallel. Safe to call from any goroutine, any number of them.
+func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (Result, error)
+func (vm *VM) Close() error
+
+// Engine.Run: convenience — fresh VM per call. The v1 lifecycle and the
+// default deployment: maximum parallelism, zero shared mutable state.
+func (e *Engine) Run(ctx context.Context, s *Script, opt RunOptions) (Result, error)
+
+type Result struct { /* reply values, Tier-3 converted (§6.4) */ }
 ```
 
-- Host module `"redis"`: `call(ptr,len,argc,argvArea) -> (ptr,len)` implemented over `api.Module.Memory()`; reply→TValue writer emits Tier-3 typed tables (`[]float64` array part / string hash) directly.
+### 6.2 Concurrency contract (thread-proofing, A9)
+
+- **The unit of exclusion is the VM — the Lua memory image.** `VM.Run` takes `vm.mu` for the entire execution. Fine-grained locking inside the image is impossible by construction (the guest state is one linear memory plus two module instances), so the whole image is the lock scope. Concurrent `Run`s on one VM serialize; distinct VMs run in parallel on distinct goroutines.
+- **Reentrancy is same-goroutine.** Host trampolines (`redis.call`, and the M5 `host.wasm_dispatch` callback) fire on the goroutine that holds the lock — no deadlock — and the API provides no path for a different goroutine to re-enter a running VM.
+- **Deployment modes** (policies over `NewVM`/`Run`, not engine changes):
+  1. *Fresh VM per execution* — default (v1 lifecycle): instantiation is µs-cheap, scripts share nothing, full parallelism.
+  2. *VM pool* — `sync.Pool`-style reuse, adopted with the v2 `rt_reset()` lifecycle (§4.5) if measurement favors it.
+  3. *Single shared VM* — Redis-classic semantics: one global Lua state, scripts see each other's globals; the image lock then behaves exactly like Redis's single-threaded script execution.
+- **Gate**: `go test -race` over the host package and examples is a CI requirement (§8.6 Concurrency).
+
+### 6.3 Examples (deliverable; they double as integration tests)
+
+`examples/`, all runnable and `-race`-clean:
+
+1. `examples/eval` — minimal: compile once, run with keys/argv, print the reply.
+2. `examples/evalserver` — a goroutine-per-"client" server over a pool of locked VMs: concurrent EVALs, a deadline kill, per-VM serialization — the thread-proofing demonstration.
+3. `examples/sharedvm` — single-shared-VM mode: serialized scripts, shared globals.
+4. `examples/bench` — the perf harness (§8.10): interpreter vs backend(wazero) vs backend(wasmtime) vs **C Lua 5.1 native**, same box.
+
+### 6.4 Host module & mechanics
+
+- Host module `"redis"`: `call/pcall(ptr,len,argc,argvArea) -> (ptr,len)` implemented over `api.Module.Memory()`; reply→TValue writer emits Tier-3 typed tables (`[]float64` array part / string hash) directly; `error_reply`/`status_reply`.
 - Deadline: `mem.WriteBool(ctrlDeadline, true)` from a watchdog — no guest involvement until the next back-edge.
-- Memory cap: instance max pages + watermark → `rt_oom` error object; Redis returns `-BUSY`/script error per policy.
+- Memory cap: instance max pages + watermark → `rt_oom` error object; the daemon returns `-BUSY`/script error per policy.
 - Errors escaping as wasm traps are **always a backend bug** (§8.7 classification) — logged with module SHA + meta, never surfaced as a script error.
 
 ---
@@ -247,12 +316,12 @@ Equality oracle = **normalized event log** (not just final results):
 Test pyramid:
 
 ```
-L7  production soak (fuzz 24/7, Redis integration, perf gates)
+L7  production soak (fuzz 24/7, Go Redis clone integration, perf gates incl. C-Lua comparison)
 L6  conformance suites   (_lua5.1-tests, _glua-tests, curated real-world Redis scripts)
 L5  differential fuzzing (random Lua programs, oracle comparison)
 L4  end-to-end scripts   (multi-feature programs, coroutines of features per file)
 L3  per-opcode semantic tests (41 opcodes × edge-case matrix)
-L2  component tests      (emitter, ABI, runtime C, host shim)
+L2  component tests      (emitter, ABI, runtime C, host package: API + VM locking under -race)
 L1  unit tests           (LEB128, sections, TValue codec, allocator)
 ```
 
@@ -313,11 +382,12 @@ Each snippet runs in **all three engines** (interpreter, C-Lua-wasm, backend-was
 ### 8.5 L6 — conformance
 
 - `_glua-tests` and `_lua5.1-tests` run through the differential harness (they already run against the interpreter; add the backend and C-Lua-wasm as columns). Explicit, maintained skip list (os/io-dependent, interpreter-known-bugs) — **every skip has a reason string**; CI fails on skips without one.
-- **Curated real-world corpus**: collect public Redis Lua scripts (rate limiters, locks, token buckets, cjson/cmsgpack users from Redis docs and common libraries) — run through the full oracle matrix. This is the corpus that actually predicts production behavior for your Redis.
+- **Curated real-world corpus**: collect public Redis Lua scripts (rate limiters, locks, token buckets, cjson/cmsgpack users from Redis docs and common libraries) — run through the full oracle matrix. This is the corpus that actually predicts production behavior for the Go Redis clone.
 
 ### 8.6 L7 — production hardening tests
 
 - **Isolation**: run each corpus script twice in the same instance (v2 lifecycle) / new instance (v1) — globals and arena must be indistinguishable from a cold run (memory-diff the globals serialization).
+- **Concurrency (A9)**: N goroutines × M locked VMs (fresh-image and pool modes) run the corpus under `go test -race` — zero reports; the single-shared-VM mode serializes Runs on the image lock and observes strictly sequential globals (Redis-classic semantics); host trampolines (`redis.call`) execute only on the lock-holding goroutine — asserted with a goroutine-id check inside the trampoline.
 - **Deadline**: infinite-loop scripts must be killed within `deadline + ε` (measure the back-edge check interval), returning the Redis-documented error.
 - **Memory caps**: allocation-heavy scripts hit the watermark → clean OOM error, not a trap or host OOM.
 - **Recursion**: non-tail deep recursion → "stack overflow" error (not a wasm trap) at a deterministic frame count; tail recursion 10⁷ deep → success, flat memory.
@@ -346,8 +416,13 @@ The differential harness logs an opcode histogram per script (interpreter side).
 ### 8.10 Performance testing
 
 - Benchmark corpus = Week-0 corpus from the plan doc (string ops, cjson decode, table building, redis.call-heavy, numeric loops) + standard Lua benchmarks (fannkuch, nbody, binary-trees) for external comparability.
-- Fixed CI hardware, `benchstat`, gates: backend-wasm ≥ 2× interpreter fork on numeric corpus at M8; no regression >5% week-over-week; memory: peak arena per corpus script trended.
-- Comparative columns: interpreter fork, C Lua 5.1 native (informational, same CI box).
+- **Mandatory comparison columns in every perf run** (fixed CI hardware, `benchstat`):
+  1. gopher-lua interpreter (this fork) — the incumbent being replaced;
+  2. this backend on **wazero** — the production configuration;
+  3. this backend on wasmtime — isolates backend cost from engine cost;
+  4. **stock C Lua 5.1, built natively on the same CI box** — the head-to-head reference. The question this project ultimately answers is how close compiled-to-wasm Lua gets to the C implementation of Lua, so every perf run reports the ratio `backend(wazero) / lua5.1-native` per benchmark, trended week-over-week like every other column.
+- Gates at M8: backend-wasm ≥ 2× interpreter fork on the numeric corpus; no >5% week-over-week regression on any column **including the C-Lua ratio**; memory: peak arena per corpus script trended. Parity with native C Lua is the stretch goal, not a gate — the M8 report must state where the compiled path stands against C Lua and what would close the remaining gap (v2 control flow, inline caches, arena).
+- The harness is runnable standalone: `examples/bench` against a stock `lua` 5.1 binary on PATH.
 
 ---
 
@@ -375,8 +450,8 @@ The differential harness logs an opcode histogram per script (interpreter side).
 | **M4** | Backend v1 core: all pure-inline opcodes + arith/compare fast paths + `CALL/RETURN` direct & indirect, flattened control flow; scripts with no tables run | Opcode matrix rows green for covered set; differential corpus subset (hand-chosen ~200 cases) 100% match | 3–4 wk |
 | **M5** | Backend v1 complete: all 41 opcodes, closures/upvalues/varargs/metamethods/pcall/tailcall trampoline, line immediates | Full `_glua-tests` + curated Redis corpus: 0 unledgered DIVERGE; error-message suite byte-exact | 3–4 wk |
 | **M6** | Hardening: arena/GC watermark, stack limits, deadline, determinism, isolation | All 8.6 tests green; 7-night fuzz soak zero new classes; TRAP count = 0 over corpus ×10⁷ executions | 2 wk |
-| **M7** | Redis integration: host module, script cache, EVAL/EVALSHA/SCRIPT FLUSH flows, caps, typed-table reply conversion | Integration suite (incl. deadline kill, OOM, flush-isolation) green in the Redis repo | 2–3 wk |
-| **M8** | Performance: v2 structured control flow (differential-tested against v1 per-function), inline caches at hot sites, instantiate-vs-reset measurement | Perf gate: ≥2× fork on numeric corpus; v1↔v2 differential zero diffs; no >5% regressions | 3–4 wk |
+| **M7** | **Go Redis clone** integration: `host/` API freeze (§6), `redis.*` host module, script cache, EVAL/EVALSHA/SCRIPT FLUSH flows, caps, typed-table reply conversion, locked-VM examples | Integration suite (incl. deadline kill, OOM, flush-isolation) green **in the Go Redis clone repo**; `host/` + `examples/` green under `go test -race` | 2–3 wk |
+| **M8** | Performance: v2 structured control flow (differential-tested against v1 per-function), inline caches at hot sites, instantiate-vs-reset measurement, benchmark harness vs C Lua (`examples/bench`) | Perf gate: ≥2× fork on numeric corpus; v1↔v2 differential zero diffs; no >5% regressions on any column incl. the C-Lua ratio; head-to-head **vs C Lua 5.1 native** measured, reported, and trended (§8.10) | 3–4 wk |
 
 **Total: ~3.5–5.5 months** solo (consistent with the plan doc's estimate). M1 before M4 is deliberate: the differential harness existing *before* the backend is what makes every later milestone measurable. M2 before M3 is deliberate too: a whole-C-Lua-in-wasm oracle de-risks the runtime port with zero new compiler code.
 
@@ -389,7 +464,8 @@ wasm/            emitter (pure Go, no deps)         + wasm/*_test.go
 luawasm/         backend: proto→module              + luawasm/opcode_test.go, corpus/
 runtime/         C sources + wasi-sdk build + native test harness
 runtime/wasm/    build artifacts (embedded via go:embed, checksummed)
-host/            wazero shim, host module, conversion (Go)
+host/            public Go API: Engine/Script/VM, memory-image lock, redis.* host module — the only package the clone imports
+examples/        runnable examples: eval, evalserver (locked VM pool, -race), sharedvm, bench vs C Lua
 testdiff/        differential harness, event-log oracle, generators, CI glue
 docs/Lua-Wasm-Divergence-Ledger.md
 ```
@@ -400,12 +476,14 @@ docs/Lua-Wasm-Divergence-Ledger.md
 
 | Risk | Mitigation |
 |---|---|
-| wazero maintenance pin | version-pinned; module is portable → wasmtime-cgo escape hatch; `wasm2wat` keeps us toolchain-honest |
+| wazero maintenance pin | version-pinned; emitted modules are portable to any pure-Go engine (wasmtime-cgo would reintroduce cgo — disallowed by A8); `wasm2wat` keeps us toolchain-honest |
 | Flattened control flow too slow in v1 | M8 v2 exists; measure at M4 gate with the numeric corpus before committing to v2 timing |
 | Runtime ABI churn during M3–M5 | freeze at M3 gate; additive-only afterwards with minor version bump |
 | Error-message parity fights (Go `fmt` vs C `sprintf` formatting of floats) | format via a single shared formatter (C side) for messages produced in both engines; ledger documents the rest | 
 | Coroutine scope | Out of scope for Redis subset (decision); general-purpose build needs the Asyncify/CPS study (plan §7.7) |
 | Deep-recursion wasm stack traps | enforced Lua-level limit below the engine's (measure wazero's at M0; set `stack_limit` conservatively) |
 | Divergence between the two runtime sources of truth | ledger discipline (8.9); C Lua is final authority |
+| EH-free blob flavor for wazero (production host, A8) — current blob is SJLJ/new-EH, wasmtime-only | M6 build flavor (§5): error flow exclusively via the staged-value protocol; gate = full corpus green on wazero; the M2 Asyncify core-wasm path stays on record as fallback |
+| Embedder concurrency misuse (two goroutines into one Lua image) | the lock is the API unit (A9, §6.2): `VM.Run` holds the image mutex end-to-end; examples + host tests run under `-race` in CI (§8.6) |
 
 **Open questions to resolve at M0–M2:** wazero instantiation cost on target hardware (drives v1-vs-v2 lifecycle); exact wazero max wasm-stack depth (drives `stack_limit`); wasi-sdk wasm-ASan maturity (drives whether wasm-mode sanitizers are CI or advisory); whether this fork's `goto` surfaces any other codegen oddities (grep `compile.go` during M4).

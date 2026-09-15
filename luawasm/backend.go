@@ -47,13 +47,8 @@ func Compile(main *lua.FunctionProto, chunkName string) ([]byte, error) {
 	protos := collectProtos(main)
 	for _, p := range protos {
 		for _, inst := range p.Code {
-			switch int(inst >> 26) {
-			case lua.OP_CLOSURE:
-				return nil, fmt.Errorf("luawasm: OP_CLOSURE not supported in backend v1 (closures arrive with the A4 lowering)")
-			case lua.OP_VARARG:
+			if int(inst>>26) == lua.OP_VARARG {
 				return nil, fmt.Errorf("luawasm: OP_VARARG not supported in backend v1 (M5b)")
-			case lua.OP_GETUPVAL, lua.OP_SETUPVAL:
-				return nil, fmt.Errorf("luawasm: upvalue opcodes require closures (backend v1, A4)")
 			}
 		}
 	}
@@ -87,8 +82,9 @@ type backend struct {
 	imports    map[string]uint32
 	gKCells    uint32 // mutable global: constants cells base
 	protos     []protoInfo
-	protoFuncs []*wasm.Function // dispatch idx → wasm function
-	dispatchFn uint32            // lua_dispatch's function index
+	protoIdx   map[*lua.FunctionProto]int // proto → dispatch index
+	protoFuncs []*wasm.Function           // dispatch idx → wasm function
+	dispatchFn uint32                      // lua_dispatch's function index
 }
 
 func (b *backend) imp(name string) uint32 { return b.imports[name] }
@@ -97,9 +93,11 @@ func (b *backend) imp(name string) uint32 { return b.imports[name] }
 // constant pool: each proto's Constants followed by its StringConstants.
 func (b *backend) layoutProtos(protos []*lua.FunctionProto) {
 	off := 0
-	for _, p := range protos {
+	b.protoIdx = make(map[*lua.FunctionProto]int, len(protos))
+	for i, p := range protos {
 		pi := protoInfo{proto: p, koff: off, nc: len(p.Constants), nsc: len(p.StringConstants())}
 		b.protos = append(b.protos, pi)
+		b.protoIdx[p] = i
 		off += pi.nc + pi.nsc
 	}
 }
@@ -136,6 +134,11 @@ func (b *backend) declareImports() {
 		"rt_err_pending":   m.ImportFunc("rt", "rt_err_pending", nil, i32v),
 		"rt_call_count":    m.ImportFunc("rt", "rt_call_count", i32v, i32v),
 		"rt_wasm_proto":    m.ImportFunc("rt", "rt_wasm_proto", iiiii, i32v),
+		"rt_wasm_upval":    m.ImportFunc("rt", "rt_wasm_upval", iiii, nil),
+		"rt_newclosure":    m.ImportFunc("rt", "rt_newclosure", iiiii, i32v),
+		"rt_getupval":      m.ImportFunc("rt", "rt_getupval", iii, nil),
+		"rt_setupval":      m.ImportFunc("rt", "rt_setupval", iii, nil),
+		"rt_close_upvals":  m.ImportFunc("rt", "rt_close_upvals", i32v, nil),
 	}
 	b.gKCells = m.GlobalI32(0, true)
 	m.ExportGlobal("gKCells", b.gKCells)
@@ -210,17 +213,48 @@ func (b *backend) emitInit() {
 		}
 	}
 
-	// register every proto: (idx, numparams, isvararg, nupvalues,
+	// register every proto FIRST: (idx, numparams, isvararg, nupvalues,
 	// framecells). framecells = nregs + 4 (2-cell TFORLOOP margin + 2
-	// scratch cells) — must match gFrameCells and scratchAddr.
-	for idx, pi := range b.protos {
+	// scratch cells) — must match gFrameCells and scratchAddr. THEN the
+	// upvalue capture descriptors, derived from OP_CLOSURE's following
+	// pseudo-instructions (FunctionProto carries no descriptors — the
+	// fork encodes captures only there, _vm.go:793-803): OP_MOVE B →
+	// capture register B of the creating frame (instack=1); OP_GETUPVAL
+	// B → parent's upvalue B (instack=0). Order matters:
+	// rt_wasm_upval drops rows for unregistered protos, and a parent's
+	// registration must precede its children's descriptor rows.
+	for _, pi := range b.protos {
 		p := pi.proto
-		f.I32Const(int32(idx)).
+		f.I32Const(int32(b.protoIdx[p])).
 			I32Const(int32(p.NumParameters)).
 			I32Const(int32(p.IsVarArg)).
 			I32Const(int32(p.NumUpvalues)).
 			I32Const(int32(p.NumUsedRegisters) + 4).
 			Call(b.imp("rt_wasm_proto")).Drop()
+	}
+	for _, pi := range b.protos {
+		p := pi.proto
+		for pc := 0; pc < len(p.Code); pc++ {
+			inst := p.Code[pc]
+			if int(inst>>26) != lua.OP_CLOSURE {
+				continue
+			}
+			child := p.FunctionPrototypes[int(inst&0x3ffff)]
+			cidx := b.protoIdx[child]
+			for u := 0; u < int(child.NumUpvalues); u++ {
+				pc++
+				uins := p.Code[pc]
+				instack := int32(0)
+				if int(uins>>26) == lua.OP_MOVE {
+					instack = 1
+				}
+				f.I32Const(int32(cidx)).
+					I32Const(int32(u)).
+					I32Const(instack).
+					I32Const(int32(uins) & 0x1ff).
+					Call(b.imp("rt_wasm_upval"))
+			}
+		}
 	}
 
 	f.End()

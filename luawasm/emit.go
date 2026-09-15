@@ -314,6 +314,7 @@ func (fe *funcEmitter) blockOf(pc int) int {
 
 func (fe *funcEmitter) emitBlockBody(start, end int) {
 	code := fe.code
+	f := fe.f
 	terminal := false
 	pc := start
 	for pc < end {
@@ -496,8 +497,40 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			terminal = true
 		case lua.OP_SETLIST:
 			fe.emitSetlist(A, B, C, pc)
-		case lua.OP_CLOSE, lua.OP_NOP:
-			// no closures in v1: CLOSE is a no-op
+		case lua.OP_CLOSURE:
+			// R(A) := closure over child proto Bx. The capture
+			// pseudo-instructions that follow (OP_MOVE/OP_GETUPVAL) were
+			// registered at init (rt_wasm_upval scan) — consume them.
+			child := fe.proto.FunctionPrototypes[Bx]
+			ln := fe.line(pc)
+			pc += int(child.NumUpvalues)
+			fe.cellAddr(A)
+			f.I32Const(int32(fe.b.protoIdx[child]))
+			f.LocalGet(1) // cl — this closure is the parent
+			f.LocalGet(0) // frame — capture addresses are frame+16*k
+			f.I32Const(ln)
+			f.Call(fe.b.imp("rt_newclosure"))
+			fe.checkStatus()
+			fe.bumpTop(A + 1)
+		case lua.OP_GETUPVAL:
+			// R(A) := upvalue B of the running closure
+			f.LocalGet(1)
+			f.I32Const(int32(B))
+			fe.cellAddr(A)
+			f.Call(fe.b.imp("rt_getupval"))
+			fe.bumpTop(A + 1)
+		case lua.OP_SETUPVAL:
+			// upvalue B := R(A) (write-through: open → the frame cell)
+			f.LocalGet(1)
+			f.I32Const(int32(B))
+			fe.cellAddr(A)
+			f.Call(fe.b.imp("rt_setupval"))
+		case lua.OP_CLOSE:
+			// close open upvalues at or above frame+16*A (the interpreter
+			// closes at exactly TAILCALL/RETURN/CLOSE — _vm.go:610,659,780)
+			f.LocalGet(0).I32Const(int32(cellSize * A)).I32Add()
+			f.Call(fe.b.imp("rt_close_upvals"))
+		case lua.OP_NOP:
 		default:
 			panic(fmt.Sprintf("luawasm: unhandled opcode %d", op))
 		}

@@ -132,6 +132,12 @@ func (fe *funcEmitter) emitCompare(op, A, B, C, pc int) {
 // (static and multret alike).
 func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	f := fe.f
+	if tail {
+		// the interpreter closes this frame's upvalues before a tailcall
+		// (_vm.go:610) — the frame is not coming back
+		f.LocalGet(0)
+		f.Call(fe.b.imp("rt_close_upvals"))
+	}
 	// nargs
 	if B == 0 {
 		f.LocalGet(fe.lTop).I32Const(int32(A + 1)).I32Sub()
@@ -228,9 +234,12 @@ func (fe *funcEmitter) copyDyn(baseReg int) {
 	f.LocalGet(fe.lVhi).I64Store(8)
 }
 
-// emitReturn: results at R(A); B==0 → up to top.
+// emitReturn: results at R(A); B==0 → up to top. The frame's open
+// upvalues close first (the interpreter's OP_RETURN, _vm.go:659).
 func (fe *funcEmitter) emitReturn(A, B int) {
 	f := fe.f
+	f.LocalGet(0)
+	f.Call(fe.b.imp("rt_close_upvals"))
 	if B >= 2 {
 		n := B - 1
 		for i := 0; i < n; i++ {
@@ -262,8 +271,14 @@ func (fe *funcEmitter) emitReturn(A, B int) {
 	f.LocalGet(fe.lT0).Return()
 }
 
+// frameCellAddrConst: frame+16*i — the result-staging address. (A bare
+// i32.const here was a latent M4 bug: fixed-count RETURNs staged their
+// results at ABSOLUTE addresses 0.. — corrupting the runtime's static
+// data; main-chunk returns rarely had B>=2 so the corpus never saw it.
+// Called functions made it visible immediately: add(3,4) returned its
+// untouched arg0 cell.)
 func (fe *funcEmitter) frameCellAddrConst(i int) {
-	fe.f.I32Const(int32(cellSize * i))
+	fe.f.LocalGet(0).I32Const(int32(cellSize * i)).I32Add()
 }
 
 // emitForloop: init += step (cells); if (step>0 && init<=limit) ||

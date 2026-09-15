@@ -184,11 +184,14 @@ static int rt_run_raw(body_fn fn, int32_t line) {
 static TValue gt_t, gt_k, *gt_dst;
 
 static void gettable_body(void) {
+  TValue *dst = gt_dst; /* reentrancy: an __index metamethod on a wasm
+                           closure re-enters the ABI and overwrites the
+                           statics before we read them back */
   luaD_checkstack(curL, 3);
   setobj2s(curL, curL->top, &gt_t); curL->top++;
   setobj2s(curL, curL->top, &gt_k); curL->top++;
   luaV_gettable(curL, curL->top - 2, curL->top - 1, curL->top - 2);
-  *gt_dst = *(TValue *)(curL->top - 2);
+  *dst = *(TValue *)(curL->top - 2);
   curL->top -= 2;
 }
 
@@ -226,13 +229,15 @@ static int ar_op;
 
 static void arith_body(void) {
   TValue ln, rn;
+  TValue *dst = ar_dst; /* reentrancy: a metamethod may re-enter the ABI */
+  int op = ar_op;
   /* luaV_tonumber returns the converted value (the original cell when
      already a number, the temp only for strings) or NULL */
   const TValue *x = luaV_tonumber(&ar_l, &ln);
   const TValue *y = luaV_tonumber(&ar_r, &rn);
   if (x != NULL && y != NULL) {
     lua_Number a = nvalue(x), b = nvalue(y), res;
-    switch (ar_op) {
+    switch (op) {
     case RT_OP_ADD: res = a + b; break;
     case RT_OP_SUB: res = a - b; break;
     case RT_OP_MUL: res = a * b; break;
@@ -240,13 +245,13 @@ static void arith_body(void) {
     case RT_OP_MOD: res = luai_nummod(a, b); break;
     case RT_OP_POW: res = luai_numpow(a, b); break;
     case RT_OP_UNM: res = -a; break;
-    default: luaG_runerror(curL, "rt_abi: bad arith op %d", ar_op); return;
+    default: luaG_runerror(curL, "rt_abi: bad arith op %d", op); return;
     }
-    setnvalue(ar_dst, res);
+    setnvalue(dst, res);
     return;
   }
   /* non-numbers: metamethod, else the standard arith error (raises) */
-  TMS tm = (TMS)(ar_op - RT_OP_ADD + TM_ADD);
+  TMS tm = (TMS)(op - RT_OP_ADD + TM_ADD);
   const TValue *tmf = luaT_gettmbyobj(curL, &ar_l, tm);
   if (ttisnil(tmf)) tmf = luaT_gettmbyobj(curL, &ar_r, tm);
   if (ttisnil(tmf)) luaG_aritherror(curL, &ar_l, &ar_r);
@@ -256,7 +261,7 @@ static void arith_body(void) {
     setobj2s(curL, curL->top, &ar_l); curL->top++;
     setobj2s(curL, curL->top, &ar_r); curL->top++;
     luaD_call(curL, curL->top - 3, 1);
-    *ar_dst = *(TValue *)(curL->top - 1);
+    *dst = *(TValue *)(curL->top - 1);
     curL->top -= 1;
   }
 }
@@ -274,12 +279,13 @@ int32_t rt_arith(int32_t op, rt_addr lhscell, rt_addr rhscell, rt_addr dstcell, 
 static TValue len_v, *len_dst;
 
 static void len_body(void) {
+  TValue *dst = len_dst; /* reentrancy (metamethod) */
   switch (ttype(&len_v)) {
   case LUA_TTABLE:
-    setnvalue(len_dst, cast_num(luaH_getn(hvalue(&len_v))));
+    setnvalue(dst, cast_num(luaH_getn(hvalue(&len_v))));
     return;
   case LUA_TSTRING:
-    setnvalue(len_dst, cast_num(tsvalue(&len_v)->len));
+    setnvalue(dst, cast_num(tsvalue(&len_v)->len));
     return;
   default: {
     const TValue *tm = luaT_gettmbyobj(curL, &len_v, TM_LEN);
@@ -288,7 +294,7 @@ static void len_body(void) {
     setobj2s(curL, curL->top, tm); curL->top++;
     setobj2s(curL, curL->top, &len_v); curL->top++;
     luaD_call(curL, curL->top - 2, 1);
-    *len_dst = *(TValue *)(curL->top - 1);
+    *dst = *(TValue *)(curL->top - 1);
     curL->top -= 1;
   }
   }
@@ -320,6 +326,7 @@ static int call_tm2(const TValue *tm, const TValue *a, const TValue *b) {
 
 static void cmp_body(void) {
   int res;
+  TValue *dst = cmp_dst; /* reentrancy (metamethod) */
   switch (cmp_op) {
   case 0:
     res = (ttype(&cmp_a) == ttype(&cmp_b)) ? luaV_equalval(curL, &cmp_a, &cmp_b) : 0;
@@ -344,7 +351,7 @@ static void cmp_body(void) {
       }
     }
   }
-  setbvalue(cmp_dst, res);
+  setbvalue(dst, res);
 }
 
 static int cmp_entry(int op, rt_addr acell, rt_addr bcell, rt_addr dstcell, int32_t line) {
@@ -367,6 +374,7 @@ static TValue *cc_dst;
 
 static void concat_body(void) {
   int i;
+  TValue *dst = cc_dst; /* reentrancy (__concat may re-enter the ABI) */
   luaD_checkstack(curL, cc_n + 1);
   for (i = 0; i < cc_n; i++) {
     setobj2s(curL, curL->top, &cc_cells[i]);
@@ -375,7 +383,7 @@ static void concat_body(void) {
   luaV_concat(curL, cc_n, cast_int(curL->top - curL->base) - 1); /* top n -> one */
   /* the result occupies the FIRST slot of the window; luaV_concat does
      not adjust L->top (its callers in lvm do): n values -> 1 result */
-  *cc_dst = *(TValue *)(curL->top - cc_n);
+  *dst = *(TValue *)(curL->top - cc_n);
   curL->top -= cc_n - 1;
 }
 
@@ -399,32 +407,41 @@ static TValue ca_f;
 static TValue *ca_args;
 static int ca_n, ca_w, ca_nres;
 
+/* Reentrancy law (the M5a callback machinery): the callee may be a wasm
+   closure whose code re-enters the ABI — including another rt_call —
+   before this body resumes, so NO static may be read after luaD_call.
+   Everything lives on the C stack; only the single-word output
+   (ca_nres) is written back at the very end. */
 static void call_body(void) {
-  int i;
+  int i, n = ca_n, w = ca_w, nres;
+  TValue *args = ca_args;
   StkId base;
-  luaD_checkstack(curL, ca_n + 1);
+  luaD_checkstack(curL, n + 1);
   setobj2s(curL, curL->top, &ca_f); curL->top++;
-  for (i = 0; i < ca_n; i++) {
-      setobj2s(curL, curL->top, &ca_args[i]);
+  for (i = 0; i < n; i++) {
+      setobj2s(curL, curL->top, &args[i]);
     curL->top++;
   }
-  base = curL->top - ca_n - 1;
-  luaD_call(curL, base, ca_w < 0 ? LUA_MULTRET : ca_w);
-  ca_nres = cast_int(curL->top - base);
-  if (ca_w >= 0) ca_nres = ca_w;
-  for (i = 0; i < ca_nres; i++) ca_args[i] = base[i];
+  base = curL->top - n - 1;
+  luaD_call(curL, base, w < 0 ? LUA_MULTRET : w);
+  nres = cast_int(curL->top - base);
+  if (w >= 0) nres = w;
+  for (i = 0; i < nres; i++) args[i] = base[i];
   curL->top = base;
+  ca_nres = nres;
 }
 
 int32_t rt_call(rt_addr funcell, rt_addr argcells, int32_t nargs, int32_t want, int32_t line) {
+  int w = (int)want, nres;
   ca_f = *(TValue *)(size_t)funcell;
   ca_args = (TValue *)(size_t)argcells;
   ca_n = (int)nargs;
-  ca_w = (int)want;
+  ca_w = w;
   ca_nres = 0;
   int st = rt_run(call_body, line);
   if (st != RT_OK) return RT_ERR;
-  return ca_w < 0 ? -(ca_nres + 1) : RT_OK; /* encode count; -1 means zero */
+  nres = ca_nres; /* read before encoding — a nested call may follow */
+  return w < 0 ? -(nres + 1) : RT_OK; /* encode count; -1 means zero */
 }
 
 /* the count encoded by a multret rt_call */
@@ -621,10 +638,28 @@ void rt_frame_restore(rt_addr saved) {
     rt_fr->used = (uint32_t)(saved - rt_fr->base);
 }
 
+/* rt_wasm_proto: protected the same way (luaF_newproto/luaS_newlstr
+   allocate; OOM must not longjmp into wasm mid-init). */
+static int32_t wp_idx, wp_numparams, wp_isvararg, wp_nupvalues, wp_framecells;
+static Proto *wp_out;
+
+static void wasm_proto_body(void) {
+  Proto *p = luaF_newproto(curL); /* GC-linked */
+  p->wasm_idx = (int)wp_idx;
+  p->source = luaS_newlstr(curL, chunk_name, (size_t)chunk_name_len);
+  p->numparams = (lu_byte)wp_numparams;
+  p->is_vararg = (lu_byte)wp_isvararg;
+  p->nups = (lu_byte)wp_nupvalues;
+  /* maxstacksize is a lu_byte; framecells can exceed 255 (nregs+4). The
+     ADAPTER sizes frames from the registry (full int); the Proto field
+     is C-invariant bookkeeping only (checkstack/ci->top). */
+  p->maxstacksize = (lu_byte)(wp_framecells > 255 ? 255 : wp_framecells);
+  wp_out = p;
+}
+
 int32_t rt_wasm_proto(int32_t idx, int32_t numparams, int32_t isvararg,
                       int32_t nupvalues, int32_t framecells) {
   struct rt_wasm_md *m;
-  Proto *p;
   if (err_pending) return RT_ERR;
   if (idx < 0) return RT_ERR;
   if (idx >= rt_md_cap) {
@@ -636,16 +671,16 @@ int32_t rt_wasm_proto(int32_t idx, int32_t numparams, int32_t isvararg,
     rt_md = nm;
     rt_md_cap = ncap;
   }
-  p = luaF_newproto(curL); /* GC-linked; can only raise on OOM */
-  p->wasm_idx = (int)idx;
-  p->source = luaS_newlstr(curL, chunk_name, (size_t)chunk_name_len);
-  p->numparams = (lu_byte)numparams;
-  p->is_vararg = (lu_byte)isvararg;
-  p->nups = (lu_byte)nupvalues;
-  /* maxstacksize is a lu_byte; framecells can exceed 255 (nregs+4). The
-     ADAPTER sizes frames from the registry (full int); the Proto field
-     is C-invariant bookkeeping only (checkstack/ci->top). */
-  p->maxstacksize = (lu_byte)(framecells > 255 ? 255 : framecells);
+  wp_idx = idx;
+  wp_numparams = numparams;
+  wp_isvararg = isvararg;
+  wp_nupvalues = nupvalues;
+  wp_framecells = framecells;
+  wp_out = NULL;
+  {
+    int st = rt_run(wasm_proto_body, 0);
+    if (st != RT_OK) return st;
+  }
   m = &rt_md[idx];
   m->numparams = numparams;
   m->isvararg = isvararg;
@@ -656,7 +691,7 @@ int32_t rt_wasm_proto(int32_t idx, int32_t numparams, int32_t isvararg,
     m->uv = (void *)calloc((size_t)nupvalues, sizeof *m->uv);
     if (m->uv == NULL) return RT_ERR;
   }
-  m->proto = p;
+  m->proto = wp_out;
   if (idx >= rt_md_n) rt_md_n = idx + 1;
   return RT_OK;
 }
@@ -716,15 +751,16 @@ void rt_close_upvals(rt_addr level) {
   }
 }
 
-int32_t rt_newclosure(rt_addr dstcell, int32_t protoidx, rt_addr parentcl,
-                      rt_addr frameaddr, int32_t line) {
-  struct rt_wasm_md *m;
-  Closure *parent = parentcl ? (Closure *)(size_t)parentcl : NULL;
+/* rt_newclosure: protected (allocation + UpVal creation can raise; no
+   longjmp may cross into wasm). */
+static rt_addr nc_dst, nc_parent, nc_frame;
+static int32_t nc_protoidx;
+
+static void newclosure_body(void) {
+  struct rt_wasm_md *m = &rt_md[nc_protoidx];
+  Closure *parent = nc_parent ? (Closure *)(size_t)nc_parent : NULL;
   Closure *cl;
   int i;
-  (void)line;
-  if (err_pending || protoidx < 0 || protoidx >= rt_md_n) return RT_ERR;
-  m = &rt_md[protoidx];
   cl = luaF_newLclosure(curL, m->nupvalues,
                         parent ? parent->l.env : hvalue(&curL->l_gt));
   /* luaF_newLclosure leaves l.p unset (stock callers set it — pushclosure
@@ -732,17 +768,32 @@ int32_t rt_newclosure(rt_addr dstcell, int32_t protoidx, rt_addr parentcl,
   cl->l.p = m->proto;
   for (i = 0; i < m->nupvalues; i++) {
     if (m->uv[i].instack) {
-      UpVal *uv = rt_findupval(frameaddr + (rt_addr)sizeof(TValue) * m->uv[i].idx);
-      if (uv == NULL) return RT_ERR;
+      UpVal *uv =
+          rt_findupval(nc_frame + (rt_addr)sizeof(TValue) * m->uv[i].idx);
+      if (uv == NULL) {
+        luaG_runerror(curL, "not enough memory");
+        return;
+      }
       cl->l.upvals[i] = uv;
     } else if (parent != NULL) {
       cl->l.upvals[i] = parent->l.upvals[m->uv[i].idx];
     } else {
-      return RT_ERR; /* upvalue-of-main capture without a parent closure */
+      luaG_runerror(curL,
+                    "rt_newclosure: upvalue capture without a parent");
+      return;
     }
   }
-  setclvalue(curL, (TValue *)(size_t)dstcell, cl);
-  return RT_OK;
+  setclvalue(curL, (TValue *)(size_t)nc_dst, cl);
+}
+
+int32_t rt_newclosure(rt_addr dstcell, int32_t protoidx, rt_addr parentcl,
+                      rt_addr frameaddr, int32_t line) {
+  if (err_pending || protoidx < 0 || protoidx >= rt_md_n) return RT_ERR;
+  nc_dst = dstcell;
+  nc_protoidx = protoidx;
+  nc_parent = parentcl;
+  nc_frame = frameaddr;
+  return rt_run(newclosure_body, line);
 }
 
 void rt_getupval(rt_addr cl, int32_t idx, rt_addr cell) {

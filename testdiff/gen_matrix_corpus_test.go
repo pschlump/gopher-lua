@@ -114,9 +114,9 @@ func TestGenMatrixCorpus(t *testing.T) {
 	add("tbl04", "local t = {}\nfor i = 1, 60 do t[i] = i * 2 end\nprint(#t, t[50], t[60])\n")
 	add("tbl05", "local t = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60}\nprint(#t, t[1], t[60])\n")
 	add("tbl06", "local t = {'a','b','c'}\ntable.insert(t, 'd')\nprint(#t, t[4])\n")
-	// tbl07 (table.sort) REMOVED: sort's comparator path trips the wasmtime
-	// callback machinery (ENGINE-PANIC at lglobals; CLI goes silent after the
-	// sort call). Ledger row — fixed with the M5 error/EH investigation.
+	// tbl07 (table.sort) restored (A4): the M5a precall adapter is the
+	// callback machinery — sort's comparator now dispatches through it.
+	add("tbl07", "local t = {3, 1, 2}\ntable.sort(t)\nprint(t[1], t[2], t[3])\n")
 	add("tbl08", "local t = {x = {y = {z = 7}}}\nprint(t.x.y.z)\n")
 	add("tbl09", "local t = {}\nt[1] = 'a' t[2] = 'b'\nprint(table.concat(t, '-'))\n")
 	// ---- strings ----
@@ -146,6 +146,28 @@ func TestGenMatrixCorpus(t *testing.T) {
 	add("nest01", "local s = 0\nfor i = 1, 4 do if i % 2 == 0 then s = s + i end end\nprint(s)\n")
 	add("nest02", "local i = 0\nwhile i < 5 do i = i + 1 if i == 3 then break end end\nprint(i)\n")
 	add("nest03", "for i = 1, 3 do if i == 2 then break end print(i) end\n")
+
+	// ---- closures (M5a A4) ----
+	add("clo00", "local f = function() return 7 end\nprint(f())\n")
+	add("clo01", "local function add(a, b) return a + b end\nprint(add(3, 4))\n")
+	add("clo02", "local fs = {}\nfor i = 1, 3 do fs[i] = function() return i end end\nprint(fs[1](), fs[2](), fs[3]())\n") // distinct per-iteration closures
+	add("clo03", "local function counter()\n  local n = 0\n  return function() n = n + 1 return n end\nend\nlocal c = counter()\nc() c()\nprint(c())\n") // shared upvalue write-through
+	add("clo04", "local function outer()\n  local x = 1\n  local function inner() x = x + 10 return x end\n  inner() inner()\n  return x\nend\nprint(outer())\n") // write-through visible to creator
+	add("clo05", "local fs = {}\nfor i = 1, 3 do\n  local j = i * 10\n  fs[i] = function() return j end\nend\nprint(fs[1](), fs[2](), fs[3]())\n") // closure over body local
+	add("clo06", "local f\nfor i = 1, 3 do\n  f = function() return i end\n  if i == 1 then break end\nend\nprint(f())\n") // break closes the upvalue
+	add("clo07", "local function a()\n  local x = 1\n  return function()\n    local y = 2\n    return function() return x + y end\n  end\nend\nprint(a()()())\n") // nested 3 deep, captures at both levels
+	add("clo08", "local function make(n)\n  return function() return n * 2 end\nend\nprint(make(5)(), make(21)())\n") // capture a param
+	add("clo09", "local t = {}\nlocal function get() return t end\nget().k = 5\nprint(t.k)\n") // closure-returned table stays identity-equal
+	add("clo10", "local function fib(n)\n  if n < 2 then return n end\n  return fib(n - 1) + fib(n - 2)\nend\nprint(fib(10))\n") // self-recursive local (upvalue capture of own name)
+	add("clo11", "local function g() return 1, 2, 3 end\nlocal a, b, c = g()\nprint(a, b, c)\n") // multret from a closure
+	add("clo12", "local fns = {}\nfor i = 1, 2 do\n  for j = 1, 2 do\n    fns[#fns + 1] = function() return i * 10 + j end\n  end\nend\nlocal out = {}\nfor k, f in ipairs(fns) do out[k] = tostring(f()) end\nprint(table.concat(out, ' '))\n") // two captured loop vars
+	add("clo13", "local function apply(f, v) return f(v) end\nprint(apply(function(x) return x * 3 end, 5))\n") // closure as argument
+	// ---- C→wasm callbacks through the adapter (M5a A4 matrix) ----
+	add("cb00", "local t = {3, 1, 2}\ntable.sort(t, function(a, b) return a > b end)\nprint(t[1], t[2], t[3])\n") // sort comparator (was ledger row 10)
+	add("cb01", "print(('hello world'):gsub('o', function(m) return m:upper() end))\n") // gsub function replacement
+	add("cb02", "print(pcall(function() return 1, 2 end))\n") // pcall of a wasm closure
+	add("cb03", "local mt = {__index = function(t, k) return k .. '!' end}\nlocal t = setmetatable({}, mt)\nprint(t.foo, t.bar)\n") // __index function metamethod
+	add("cb04", "local sum = 0\ntable.foreach({1, 2, 3}, function(k, v) sum = sum + v end)\nprint(sum)\n") // table.foreach callback + upvalue write
 
 	t.Logf("wrote %d cases to %s", len(cases), dir)
 }

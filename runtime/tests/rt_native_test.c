@@ -164,6 +164,54 @@ int main(void) {
     CHECK(nvalue(&args[0]) == 42); /* result overwrites the first arg cell */
   }
 
+  /* ABI v3: the rt-owned open-upvalue registry — open → write-through →
+     close → snapshot, and close-level ordering */
+  {
+    TValue cells[4];  /* a fake wasm frame: four contiguous register cells */
+    TValue c0, c1, out;
+    rt_addr cf = cell_of(&cells[0]);
+    CHECK(rt_wasm_proto(0, 0, 0, 1, 8) == RT_OK);
+    rt_wasm_upval(0, 0, 1, 1); /* the closure captures register 1 */
+    rt_mknumber(cell_of(&cells[1]), 42);
+    CHECK(rt_newclosure(cell_of(&c0), 0, 0, cf, 1) == RT_OK);
+    CHECK(ttisfunction(&c0));
+    CHECK(rt_clidx(cell_of(&c0)) == 0);
+    rt_mknumber(cell_of(&c1), 1);
+    CHECK(rt_clidx(cell_of(&c1)) == -1);
+    /* open: GETUPVAL reads the frame cell */
+    rt_mknil(cell_of(&out));
+    rt_getupval((rt_addr)(uintptr_t)clvalue(&c0), 0, cell_of(&out));
+    CHECK(ttisnumber(&out) && nvalue(&out) == 42);
+    /* write-through: SETUPVAL lands in the open frame cell */
+    rt_mknumber(cell_of(&out), 99);
+    rt_setupval((rt_addr)(uintptr_t)clvalue(&c0), 0, cell_of(&out));
+    CHECK(nvalue(&cells[1]) == 99);
+    /* close-level ordering: closing ABOVE the cell leaves it open */
+    rt_close_upvals(cf + 2 * (rt_addr)sizeof(TValue));
+    rt_mknumber(cell_of(&cells[1]), 77);
+    rt_mknil(cell_of(&out));
+    rt_getupval((rt_addr)(uintptr_t)clvalue(&c0), 0, cell_of(&out));
+    CHECK(nvalue(&out) == 77);
+    /* close AT the frame: the value is snapshotted; later frame writes
+       are invisible through the closure */
+    rt_close_upvals(cf);
+    rt_mknumber(cell_of(&cells[1]), 111);
+    rt_mknil(cell_of(&out));
+    rt_getupval((rt_addr)(uintptr_t)clvalue(&c0), 0, cell_of(&out));
+    CHECK(nvalue(&out) == 77);
+    /* two closures, two levels: closing the higher cell leaves the lower
+       one open */
+    CHECK(rt_wasm_proto(1, 0, 0, 1, 8) == RT_OK);
+    rt_wasm_upval(1, 0, 1, 0); /* captures register 0 */
+    rt_mknumber(cell_of(&cells[0]), 5);
+    CHECK(rt_newclosure(cell_of(&c1), 1, 0, cf, 1) == RT_OK);
+    rt_close_upvals(cf + (rt_addr)sizeof(TValue)); /* closes cells[1] only */
+    rt_mknumber(cell_of(&cells[1]), 0);
+    rt_mknil(cell_of(&out));
+    rt_getupval((rt_addr)(uintptr_t)clvalue(&c1), 0, cell_of(&out));
+    CHECK(nvalue(&out) == 5); /* cells[0] still open, reads through */
+  }
+
   if (failures == 0) printf("RT-NATIVE PASS\n");
   else printf("RT-NATIVE FAIL (%d)\n", failures);
   return failures;

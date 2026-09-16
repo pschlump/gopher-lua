@@ -198,8 +198,9 @@ func TestGenMatrixCorpus(t *testing.T) {
 	add("tco04", "local function g(...) return ... end\nlocal function f(...) return g(...) end\nprint(f(1, 2, 3))\n") // vararg tailcall
 	add("tco05", "local function add(a, b) return a + b end\nlocal function go(x) return add(x, x) end\nprint(go(21))\n") // multi-arg staged tailcall
 	add("tco06", "local function f(n) if n == 0 then error('deep') end return f(n-1) end\nprint(pcall(f, 10000))\n") // error through a 10⁴ staged chain (message heads compared; wording is row 9 → skip-annotated if it diverges)
-	add("tco07", "local mt = {__call = function(self, n) if n == 0 then return 'cd' end return self(n-1) end}\nlocal f = setmetatable({}, mt)\nprint(f(5))\n") // __call chain, shallow (deep chains ledger-row 18)
+	add("tco07", "local mt = {__call = function(self, n) if n == 0 then return 'cd' end return self(n-1) end}\nlocal f = setmetatable({}, mt)\nprint(f(5))\n") // __call chain, shallow
 	add("tco08", "local function g(...) return ... end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n") // const+varargs tailcall
+	add("tco09", "local mt = {__call = function(self, n) if n == 0 then return 'cd' end return self(n-1) end}\nlocal f = setmetatable({}, mt)\nprint(f(120))\n") // deep __call+tailcall chain (row 18 pin — fixed with row 31's call_body rebasing; 120 < RTW_MAX_DEPTH=150, whose depth divergence is row 20)
 
 	t.Logf("wrote %d cases to %s", len(cases), dir)
 }

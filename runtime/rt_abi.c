@@ -218,6 +218,9 @@ int32_t rt_err_pending(void) { return err_pending; }
 void rt_err_clear(void) {
   err_pending = 0;
   err_buf_len = 0;
+  err_prefixed = 0; /* the staging contract: sticky until CLEARED — a
+                       cleared error must not suppress the prefix of the
+                       next one (native ABI tests check staged bytes) */
 }
 
 /* Called from luaD_pcall's recovery (ldo.c): a Lua-level catch consumes
@@ -312,6 +315,14 @@ static int rt_run_raw(body_fn fn, int32_t line) {
         memcpy(err_buf, tmp, n);
         err_buf[n] = '\0';
         err_buf_len = (int)n;
+        err_prefixed = 1; /* sticky: outer re-stagings must not re-prefix */
+        /* row 28: pcall must catch the PREFIXED string too — the staged
+           value is what the adapter re-raises and luaD_pcall hands back
+           to the script, so rebuild it from the prefixed bytes (GC is
+           stopped per run; the fresh TString is interned and linked). */
+        if (ttisstring(&err_value))
+          setsvalue(curL, &err_value,
+                    luaS_newlstr(curL, err_buf, (size_t)err_buf_len));
       }
     }
     return RT_ERR;
@@ -526,16 +537,21 @@ static TValue *cc_dst;
 static void concat_body(void) {
   int i;
   TValue *dst = cc_dst; /* reentrancy (__concat may re-enter the ABI) */
-  luaD_checkstack(curL, cc_n + 1);
-  for (i = 0; i < cc_n; i++) {
+  int n = cc_n;         /* and overwrite the statics before we read them */
+  luaD_checkstack(curL, n + 1);
+  for (i = 0; i < n; i++) {
     setobj2s(curL, curL->top, &cc_cells[i]);
     curL->top++;
   }
-  luaV_concat(curL, cc_n, cast_int(curL->top - curL->base) - 1); /* top n -> one */
+  luaV_concat(curL, n, cast_int(curL->top - curL->base) - 1); /* top n -> one */
   /* the result occupies the FIRST slot of the window; luaV_concat does
-     not adjust L->top (its callers in lvm do): n values -> 1 result */
-  *dst = *(TValue *)(curL->top - cc_n);
-  curL->top -= cc_n - 1;
+     not adjust L->top (its callers in lvm do): n values -> 1 result.
+     Unlike lvm, the ABI's result lives in an off-stack cell, so the
+     window must be fully popped — leaving the residual result TValue
+     leaked one Lua-stack slot per call (ledger row 27: top crept past
+     the frame until the run corrupted). */
+  *dst = *(TValue *)(curL->top - n);
+  curL->top -= n;
 }
 
 int32_t rt_concat(rt_addr cells, int32_t count, rt_addr dstcell, int32_t line) {
@@ -574,7 +590,18 @@ static void call_body(void) {
     curL->top++;
   }
   base = curL->top - n - 1;
-  luaD_call(curL, base, w < 0 ? LUA_MULTRET : w);
+  /* Ledger row 31: the callee may nest deep enough to grow — and MOVE —
+     the Lua stack (luaD_checkstack inside the nested precall). A raw
+     StkId dangles across that; only the offset survives (the same
+     savestack/restorestack discipline precall_wasm uses). Reading the
+     results or resetting top through a stale base corrupted every
+     subsequent stack write — layout-dependent on whether realloc
+     happened to move the block. */
+  {
+    ptrdiff_t baser = savestack(curL, base);
+    luaD_call(curL, base, w < 0 ? LUA_MULTRET : w);
+    base = restorestack(curL, baser);
+  }
   nres = cast_int(curL->top - base);
   if (w >= 0) nres = w;
   for (i = 0; i < nres; i++) args[i] = base[i];

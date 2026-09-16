@@ -61,9 +61,7 @@ func TestWasmGluaFull(t *testing.T) {
 // TestWasmFullMatrix: the regenerated opcode matrix stays green.
 func TestWasmFullMatrix(t *testing.T) {
 	wasmGluaFull(t, "../_wasm-tests", map[string]string{
-		"tbl07.lua":     "table.sort callback path — ledger row 10, M5d",
-		"cb00.lua":      "table.sort comparator callback — ledger row 10, M5d",
-		"concat16.lua":  "loop concat >= 16 corrupts the run — ledger row 27, M6 (found by _cli-tests grep)",
-		"calcshape.lua": "calc-shaped program dies silently on wasm — ledger row 31, M6 (found by _cli-tests calc)",
+		"tbl07.lua": "table.sort callback path — ledger row 10, M5d",
+		"cb00.lua":  "table.sort comparator callback — ledger row 10, M5d",
 	})
 }

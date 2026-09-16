@@ -14,14 +14,8 @@ import (
 // ledgeredErrSkips: suite cases whose divergence has a ruling (each skip
 // cites its row in docs/Lua-Wasm-Divergence-Ledger.md).
 var ledgeredErrSkips = map[string]string{
-	// The depth guard fires inside the adapter with no rt line, and the
-	// throw's 150-level unwind doesn't reach pcall cleanly (so01 traps).
-	// Depth divergence is ruled in row 20; the clean unwind lands with M6.
-	"so00.lua": "stack-overflow depth/unwind — ledger row 20, M6",
-	"so01.lua": "stack-overflow depth/unwind — ledger row 20, M6",
-	// The staged core raise carries no position prefix on the value the
-	// script catches; interp and stock C both prefix it. Ruled in row 28.
-	"pc10.lua": "pcall-caught core raises lose the position prefix — ledger row 28",
+	// (empty — rows 20's unclean unwind and 28's missing prefix were
+	// fixed with the call_body rebasing in M6; so00/so01/pc10 pass)
 }
 
 func TestWasmErrorSuite(t *testing.T) {

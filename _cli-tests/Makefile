@@ -56,11 +56,11 @@ define check3
 endef
 
 # xfailw NAME PROG ARGS — interp and clua match the shared ref; the wasm
-# leg must still DIFFER (ledger rows 27/31: silent exit, garbage error,
-# trap, or hang). timeout + || true so every failure mode reaches the
-# flip check. Promote to check3 when the row is fixed.
+# leg must still DIFFER (ledger row 31: silent exit, garbage error, trap,
+# or hang). timeout + || true so every failure mode reaches the flip
+# check. Promote to check3 when the row is fixed.
 define xfailw
-	@echo "== $(1) (xfail wasm: ledger rows 27/31)"
+	@echo "== $(1) (xfail wasm: ledger row 31)"
 	$(GLUA) -w tmp/$(2).wasm ./$(2).lua > /dev/null
 	$(GLUA) ./$(2).lua $(3) > out/$(1).i.out
 	$(CLUA) ./$(2).lua $(3) > out/$(1).c.out
@@ -70,7 +70,7 @@ define xfailw
 	if diff -q out/$(1).w.out ref/$(1).out; then \
 		echo "$(1): wasm now matches — promote to check3"; exit 1; \
 	else \
-		echo "  wasm diverges as expected (ledger rows 27/31)"; \
+		echo "  wasm diverges as expected (ledger row 31)"; \
 	fi
 endef
 
@@ -111,7 +111,7 @@ test005:
 test006:
 	$(call check3,grep1,grep,dog data/poem.txt)
 test007:
-	$(call xfailw,grep2,grep,-n moon data/poem.txt data/ls.out)
+	$(call check3,grep2,grep,-n moon data/poem.txt data/ls.out)
 test008:
 	$(call check3,grep3,grep,-c the data/poem.txt data/names.txt)
 test009:
@@ -211,12 +211,12 @@ test027:
 	diff $(KVDB_OUT) ref/kvdb.out
 	rm -f tmp/kvdb.db $(KVDB_OUT)
 
-# ---- calc (both legs xfail: row 27 concat + row 31 calc-shape) ----
+# ---- calc (row 31 fixed: call_body rebasing across stack growth) ----
 
 test028:
-	$(call xfailw,calc1,calc,-f data/exprs.txt)
+	$(call check3,calc1,calc,-f data/exprs.txt)
 test029:
-	$(call xfailw,calc2,calc,'2*(3+4)' '10 % 3' '2^0.5' '-3^-2')
+	$(call check3,calc2,calc,'2*(3+4)' '10 % 3' '2^0.5' '-3^-2')
 
 # ---- queens / word frequency ----
 
@@ -253,10 +253,10 @@ test035:
 	diff out/syntaxerr.i.out ref/syntaxerr.i.out
 	diff out/syntaxerr.c.out ref/syntaxerr.c.out
 
-# ---- row 27 pinner: wasm must still fail ----
+# ---- concat stress (was the row 27 pinner; now a plain gate) ----
 
 test036:
-	$(call xfailw,concatstress,concatstress,)
+	$(call check3,concatstress,concatstress,)
 
 # ---- ref regeneration (from interp, the primary oracle; per-engine
 # refs regenerated from their own engine). Review the diff before

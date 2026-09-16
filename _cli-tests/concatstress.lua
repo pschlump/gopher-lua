@@ -1,8 +1,8 @@
 -- concatstress.lua — the ledger row 27 pinner: >= 16 runtime string
--- concats executed in ONE frame corrupt the wasm run (silent truncation,
--- garbage error bytes, or the nested-dispatch panic). Interp and clua
--- sail through; the Makefile xfail-targets the wasm leg until the row
--- is fixed.
+-- concats executed in ONE frame used to corrupt the wasm run (silent
+-- truncation, garbage error bytes, or the nested-dispatch panic): each
+-- rt_concat leaked one Lua-stack slot (top crept past the frame).
+-- Fixed in runtime/rt_abi.c concat_body; this now passes everywhere.
 
 local parts = {}
 for i = 1, 40 do

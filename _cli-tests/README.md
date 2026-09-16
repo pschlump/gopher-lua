@@ -18,8 +18,10 @@ ref is a behavior change.
 
 The three-engine shape is the point: interp and wasm share the
 frontend, so a frontend bug leaves their diff green — only the C Lua
-leg disagrees. Three real bugs were found this way on day one
-(ledger rows 27–30).
+leg disagrees. Six real bugs were found this way on day one (ledger
+rows 27–31 plus the io.write flush and the upstream multi-assignment
+compiler bug); rows 27, 28 and 31 are fixed — the `xfailw` Makefile
+macro remains for pinning future open rows.
 
 ## Programs
 
@@ -55,10 +57,9 @@ ledger):
 - **No `table.sort`** — the wasm path is a known gap (row 10u; fails
   with and without comparators). Sort in plain Lua (`sortl.lua`'s
   merge sort, `kvdb.lua`'s insertion sort).
-- **No `..` concat on runtime values ≥16 times in one frame** — row
-  27 (wasm corruption). `string.format` and `table.concat` are safe.
-  The Makefile runs affected tests as `xfailw` targets that FAIL when
-  wasm starts matching (promote them to `check3` then).
+- **`..` concat is fine** (row 27's ≥16-in-a-frame corruption was a
+  runtime Lua-stack leak, fixed); `string.format` and `table.concat`
+  were always safe.
 - **No coroutines** (row 22, out of scope), **no `os.exit`** in shared
   tests (wasm: traps and swallows buffered output), **no
   `io.stderr`** in shared tests (wasm engine drops it),
@@ -71,10 +72,12 @@ ledger):
 - **Iterate hash tables only in sorted key order** — `pairs` order is
   engine-specific.
 - **Error messages a program surfaces:** raise with `error(msg, 0)`
-  (no position prefix) and print via pcall — positions and stock
-  lib-error wording differ per engine (rows 25, 28). `err1.lua` is the
-  deliberate exception: it pins each engine's raw error surface against
-  its own ref.
+  (no position prefix) and print via pcall — clua's arg prelude shifts
+  positions by one line and stock lib-error wording differs (row 25).
+  `err1.lua` is the deliberate exception: it pins each engine's raw
+  error surface against its own ref (interp and wasm now match
+  byte-for-byte, including pcall-caught position prefixes — row 28
+  fixed).
 - **arg[0] differs** (`-W` passes the .wasm path) — print a fixed
   program name in usage messages instead.
 

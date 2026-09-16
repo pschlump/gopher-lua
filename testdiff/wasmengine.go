@@ -434,6 +434,30 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		emit("GLOBALS", "<lglobals failed: "+err.Error()+">")
 	}
 
+	// Ledger row 29: the driver returns without libc exit(), so
+	// wasi-libc's atexit stdout flush never runs and io.write's buffered
+	// tail is lost (the first line alone made it through). Best-effort
+	// io.flush() in the live state drains it before the host reads the
+	// capture file; failures (e.g. a script that closed io.stdout) are
+	// ignored — the flush is an engine obligation, not script behavior.
+	eFlush := func() {
+		inAddr, err := call(rtInst, "linbuf")
+		if err != nil {
+			return
+		}
+		nameAddr, err := call(rtInst, "lnamebuf")
+		if err != nil {
+			return
+		}
+		src := []byte("io.flush()")
+		mem := rtInst.GetExport(store, "memory").Memory().UnsafeData(store)
+		in, nameA := uint32(toI32(inAddr)), uint32(toI32(nameAddr))
+		copy(mem[in:], src)
+		copy(mem[nameA:], []byte("=flush"))
+		_, _ = call(rtInst, "ldostring", L, int(in), len(src), int(nameA), 0)
+	}
+	eFlush()
+
 	if out, err := os.ReadFile(stdoutFile.Name()); err == nil && len(out) > 0 {
 		for _, line := range bytes.Split(bytes.TrimRight(out, "\n"), []byte("\n")) {
 			emit("STDOUT", string(line))

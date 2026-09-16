@@ -375,8 +375,19 @@ func (e *CLua) Run(c Case) []string {
 			emit("ERROR", `""`)
 		}
 	}
+	// Ledger row 29: lclose returns without libc exit(), so wasi-libc's
+	// atexit stdout flush never runs and io.write's buffered tail is
+	// lost. Best-effort io.flush() in the live state (before lclose)
+	// drains it; failures (a script that closed io.stdout) are ignored.
+	if inAddr, err := call("linbuf"); err == nil {
+		if nameAddr, err := call("lnamebuf"); err == nil {
+			src := []byte("io.flush()")
+			if writeMem(inAddr, src) && writeMem(nameAddr, []byte("=flush")) {
+				_, _ = call("ldostring", L, inAddr, uint64(len(src)), nameAddr, 0)
+			}
+		}
+	}
 	call("lclose", L)
-
 	if out, err := os.ReadFile(stdoutFile.Name()); err == nil && len(out) > 0 {
 		// WASI stdout (io.write, C-level prints). Ledger row 3: the interp
 		// engine does not capture io.write, so cross-engine diffs exclude it.

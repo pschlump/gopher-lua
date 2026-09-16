@@ -752,17 +752,36 @@ func compileAssignStmtRight(context *funcContext, stmt *ast.AssignStmt, reg int,
 			expr = stmt.Rhs[namesassigned]
 		}
 		idx := reg
-		reginc := compileExpr(context, reg, expr, ec)
-		if ec.ctype == ecTable {
-			if _, ok := expr.(*ast.LogicalOpExpr); !ok {
-				context.Code.PropagateKMV(context.RegTop(), &ac.valuerk, &reg, reginc)
-			} else {
-				ac.valuerk = idx
-				reg += reginc
-			}
-		} else {
+		if ec.ctype == ecLocal && localAssignNeedsTemp(stmt, namesassigned) {
+			// Multiple assignment is simultaneous (Lua 5.1: all RHS
+			// expressions are evaluated before any assignment is
+			// performed). Compiling the RHS straight into the target
+			// local's register would clobber it before a later RHS
+			// expression reads the old value (a, b = b, a+b evaluated
+			// sequentially). Hazardous targets evaluate into a window
+			// slot instead; the reverse assignment loop below moves it,
+			// which also restores stock 5.1's leftmost-wins order for
+			// duplicate targets (a, a = 1, 2 → 1). (Upstream
+			// yuin/gopher-lua has the sequential bug; found by
+			// _cli-tests fib vs C Lua.) varargopt 0: a non-last RHS
+			// adjusts to exactly one value (`...` and call results
+			// alike); the multi-return case is the branch above.
+			reginc := compileExpr(context, reg, expr, ecnone(0))
 			ac.needmove = reginc != 0
 			reg += reginc
+		} else {
+			reginc := compileExpr(context, reg, expr, ec)
+			if ec.ctype == ecTable {
+				if _, ok := expr.(*ast.LogicalOpExpr); !ok {
+					context.Code.PropagateKMV(context.RegTop(), &ac.valuerk, &reg, reginc)
+				} else {
+					ac.valuerk = idx
+					reg += reginc
+				}
+			} else {
+				ac.needmove = reginc != 0
+				reg += reginc
+			}
 		}
 		namesassigned += 1
 	}
@@ -778,6 +797,75 @@ func compileAssignStmtRight(context *funcContext, stmt *ast.AssignStmt, reg int,
 		reg += compileExpr(context, reg, stmt.Rhs[i], ecnone(varargopt))
 	}
 	return rightreg, acs
+} // }}}
+
+// localAssignNeedsTemp reports whether the local target at index i of a
+// multiple assignment must not be direct-written: a later RHS expression
+// still reads the target's old value (a, b = b, a+b), or the same local
+// is assigned twice (a, a = 1, 2 — the reverse assignment loop must own
+// the ordering). Anything the walker cannot classify reads the target
+// conservatively (table/function literals may mention or capture it).
+func localAssignNeedsTemp(stmt *ast.AssignStmt, i int) bool {
+	name := stmt.Lhs[i].(*ast.IdentExpr).Value
+	dups := 0
+	for _, lhs := range stmt.Lhs {
+		if id, ok := lhs.(*ast.IdentExpr); ok && id.Value == name {
+			dups++
+		}
+	}
+	if dups > 1 {
+		return true
+	}
+	for j := i + 1; j < len(stmt.Rhs); j++ {
+		if exprMentionsIdent(stmt.Rhs[j], name) {
+			return true
+		}
+	}
+	return false
+}
+
+// exprMentionsIdent reports whether expr reads the local `name`.
+func exprMentionsIdent(expr ast.Expr, name string) bool { // {{{
+	switch ex := expr.(type) {
+	case *ast.IdentExpr:
+		return ex.Value == name
+	case *ast.AttrGetExpr:
+		return exprMentionsIdent(ex.Object, name) || exprMentionsIdent(ex.Key, name)
+	case *ast.FuncCallExpr:
+		if exprMentionsIdent(ex.Func, name) {
+			return true
+		}
+		if ex.Receiver != nil && exprMentionsIdent(ex.Receiver, name) {
+			return true
+		}
+		for _, arg := range ex.Args {
+			if exprMentionsIdent(arg, name) {
+				return true
+			}
+		}
+		return false
+	case *ast.LogicalOpExpr:
+		return exprMentionsIdent(ex.Lhs, name) || exprMentionsIdent(ex.Rhs, name)
+	case *ast.RelationalOpExpr:
+		return exprMentionsIdent(ex.Lhs, name) || exprMentionsIdent(ex.Rhs, name)
+	case *ast.ArithmeticOpExpr:
+		return exprMentionsIdent(ex.Lhs, name) || exprMentionsIdent(ex.Rhs, name)
+	case *ast.StringConcatOpExpr:
+		return exprMentionsIdent(ex.Lhs, name) || exprMentionsIdent(ex.Rhs, name)
+	case *ast.UnaryMinusOpExpr:
+		return exprMentionsIdent(ex.Expr, name)
+	case *ast.UnaryNotOpExpr:
+		return exprMentionsIdent(ex.Expr, name)
+	case *ast.UnaryLenOpExpr:
+		return exprMentionsIdent(ex.Expr, name)
+	case *ast.Comma3Expr, *ast.StringExpr, *ast.NumberExpr,
+		*ast.TrueExpr, *ast.FalseExpr, *ast.NilExpr:
+		return false
+	default:
+		// table constructors, function literals, const exprs: may read
+		// or capture the target — treat as a mention
+		return true
+	}
 } // }}}
 
 func compileAssignStmt(context *funcContext, stmt *ast.AssignStmt) { // {{{

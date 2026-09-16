@@ -1,0 +1,5 @@
+before the crash
+false	attempt to index a non-table object(nil) with key 'field'
+false	cannot perform concat operation between string and nil
+glua: "./err1.lua:22: deliberate uncaught error"
+exit=1

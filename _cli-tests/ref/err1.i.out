@@ -1,0 +1,9 @@
+before the crash
+false	./err1.lua:13: attempt to index a non-table object(nil) with key 'field'
+false	./err1.lua:18: cannot perform concat operation between string and nil
+./err1.lua:22: deliberate uncaught error
+stack traceback:
+	[G]: in function 'error'
+	./err1.lua:22: in main chunk
+	[G]: ?
+exit=1

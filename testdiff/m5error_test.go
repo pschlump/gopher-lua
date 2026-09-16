@@ -19,6 +19,9 @@ var ledgeredErrSkips = map[string]string{
 	// Depth divergence is ruled in row 20; the clean unwind lands with M6.
 	"so00.lua": "stack-overflow depth/unwind — ledger row 20, M6",
 	"so01.lua": "stack-overflow depth/unwind — ledger row 20, M6",
+	// The staged core raise carries no position prefix on the value the
+	// script catches; interp and stock C both prefix it. Ruled in row 28.
+	"pc10.lua": "pcall-caught core raises lose the position prefix — ledger row 28",
 }
 
 func TestWasmErrorSuite(t *testing.T) {

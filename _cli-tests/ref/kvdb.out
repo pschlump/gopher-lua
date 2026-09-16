@@ -1,0 +1,19 @@
+ok
+ok
+ok
+4
+14
+one
+14
+<nil>
+alpha
+beta
+gamma
+gamma
+(1)
+<nil>
+alpha
+gamma
+1
+kvdb: set takes exactly two arguments
+kvdb: unknown command: frobnicate

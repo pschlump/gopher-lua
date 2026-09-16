@@ -37,6 +37,10 @@ type Case struct {
 	Name   string // e.g. "base.lua"
 	Dir    string // working directory for the run (may hold files the script reads)
 	Source []byte
+	// Args are exposed to the script as arg[1..n] (arg[0] stays the
+	// chunkname, the C driver contract) — the standalone runners (glua
+	// -W, luawasm-run) pass their CLI args through. Corpus cases set none.
+	Args []string
 }
 
 // Result is the outcome of running one case across all engines.

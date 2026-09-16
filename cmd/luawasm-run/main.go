@@ -1,18 +1,17 @@
 // Command luawasm-run executes a module saved by cmd/luawasmc against
 // the C-Lua rt_* runtime (embedded lua51_sjlj.wasm) on wasmtime.
 //
-//	luawasm-run [-v] artifact.wasm
+//	luawasm-run [-v] artifact.wasm [args...]
 //
-// PRINT/STDOUT events go to stdout; errors to stderr (exit 1). -v prints
-// the full event log (STEP/GLOBALS/...) exactly as the differential
-// harness sees it.
+// args become the script's arg table (arg[1..n]). PRINT/STDOUT events go
+// to stdout; errors to stderr (exit 1). -v prints the full event log
+// (STEP/GLOBALS/...) exactly as the differential harness sees it.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/pschlump/gopher-lua/testdiff"
@@ -22,8 +21,8 @@ func main() {
 	verbose := flag.Bool("v", false, "print the full event log")
 	flag.Parse()
 
-	if flag.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: luawasm-run [-v] artifact.wasm")
+	if flag.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "usage: luawasm-run [-v] artifact.wasm [args...]")
 		os.Exit(2)
 	}
 	in := flag.Arg(0)
@@ -41,9 +40,10 @@ func main() {
 	e := testdiff.NewWasmEngine("run")
 	e.Precompiled = bin
 	log := e.Run(testdiff.Case{
-		Name:   "@" + filepath.Base(in),
+		Name:   in, // arg[0] / chunkname: the path as typed
 		Dir:    dir,
 		Source: bin,
+		Args:   flag.Args()[1:],
 	})
 
 	exit := 0

@@ -50,6 +50,63 @@ func (e *WasmEngine) gcStop(store *wt.Store, rtInst *wt.Instance, call func(*wt.
 	return err
 }
 
+// luaQuote renders s as a Lua 5.1 double-quoted string literal: \\ and \"
+// escaped, control bytes as 3-digit decimal \ddd (5.1 has no \x escapes;
+// 3-digit padding keeps a following digit from being absorbed).
+func luaQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"' || c == '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case c < 0x20:
+			fmt.Fprintf(&b, "\\%03d", c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// setArgGlobal exposes the CLI args in the runtime state as the global arg
+// table — arg[0] = chunkname (the C driver contract, luawasm.c's
+// dostring_body: raw name without the '@' prefix), arg[i] = c.Args[i-1] —
+// before lua_main dispatches the script, so standalone wasm runs (glua -W,
+// luawasm-run) see the same surface the interpreter CLI provides.
+func (e *WasmEngine) setArgGlobal(store *wt.Store, rtInst *wt.Instance, call func(*wt.Instance, string, ...interface{}) (interface{}, error), L interface{}, name string, args []string) error {
+	name = strings.TrimPrefix(name, "@") // arg[0] is the raw name (luawasm.c)
+	inAddr, err := call(rtInst, "linbuf")
+	if err != nil {
+		return err
+	}
+	nameAddr, err := call(rtInst, "lnamebuf")
+	if err != nil {
+		return err
+	}
+	var b strings.Builder
+	b.WriteString("arg={[0]=")
+	b.WriteString(luaQuote(name))
+	for _, a := range args {
+		b.WriteByte(',')
+		b.WriteString(luaQuote(a))
+	}
+	b.WriteString("}")
+	src := []byte(b.String())
+	if len(src) > 1<<20 { // inbuf is 1 MiB (luawasm.c)
+		return fmt.Errorf("arg table snippet too large: %d bytes", len(src))
+	}
+	mem := rtInst.GetExport(store, "memory").Memory().UnsafeData(store)
+	in, nameA := uint32(toI32(inAddr)), uint32(toI32(nameAddr))
+	copy(mem[in:], src)
+	copy(mem[nameA:], []byte("=arg")) // literal chunkname: host setup, not script
+	_, err = call(rtInst, "ldostring", L, int(in), len(src), int(nameA), 0)
+	return err
+}
+
 func toI32(v interface{}) int32 {
 	switch x := v.(type) {
 	case int32:
@@ -311,6 +368,11 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	// GC for script runs anyway.
 	if err := e.gcStop(store, rtInst, call, L, c.Name); err != nil {
 		return []string{"ENGINE-ERROR\tgc stop: " + err.Error()}
+	}
+	// expose the CLI args (gcStop's ldostring resets arg = {[0]=name}, so
+	// this runs after it and owns the full surface)
+	if err := e.setArgGlobal(store, rtInst, call, L, c.Name, c.Args); err != nil {
+		return []string{"ENGINE-ERROR\targ setup: " + err.Error()}
 	}
 	// M5d: the gopher message dialect — the wasm engine pins interp ≡
 	// wasm byte-for-byte; the clua oracle keeps the stock C 5.1 texts.

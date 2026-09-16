@@ -201,6 +201,14 @@ func (e *CLua) Run(c Case) []string {
 		}
 	}()
 
+	// Case.Args: the C driver's ldostring installs arg = {[0]=cn} directly
+	// before the pcall — no host-side window to add entries. Skip with a
+	// reason rather than diverge (§8.9 ledger discipline); no corpus case
+	// sets Args (it is the standalone runners' surface).
+	if len(c.Args) > 0 {
+		return []string{"SKIP-UNSUPPORTED\tclua engine does not support Case.Args"}
+	}
+
 	// The oracle runs on wasmtime because the C Lua runtime's error
 	// handling needs setjmp/longjmp, which requires the wasm EH proposal
 	// (lua51_sjlj.wasm, -mllvm -wasm-enable-sjlj). wazero implements only

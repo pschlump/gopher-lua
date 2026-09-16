@@ -8,7 +8,6 @@ import (
 	"github.com/pschlump/gopher-lua/parse"
 	"github.com/pschlump/gopher-lua/testdiff"
 	"os"
-	"path/filepath"
 	"runtime/pprof"
 	"strings"
 )
@@ -118,11 +117,14 @@ Available options are:
 				return 1
 			}
 			if opt_W || (len(bin) >= 4 && string(bin[:4]) == "\x00asm") {
-				return runWasm(bin, script)
+				return runWasm(bin, script, flag.Args()[1:])
 			}
 			// not a wasm module after all — run it as Lua source below
 		}
 		argtb := L.NewTable()
+		// the standalone surface: arg[0] = script name, arg[1..n] = CLI
+		// args — the same table the wasm engine seeds for a -W run
+		L.RawSet(argtb, lua.LNumber(0), lua.LString(script))
 		for i := 1; i < nargs; i++ {
 			L.RawSet(argtb, lua.LNumber(i), lua.LString(flag.Arg(i)))
 		}
@@ -170,8 +172,9 @@ Available options are:
 }
 
 // runWasm executes a precompiled wasm module on the wasm engine (the
-// luawasm-run path): PRINT/STDOUT events go to stdout, errors to stderr.
-func runWasm(bin []byte, path string) int {
+// luawasm-run path): args become the script's arg table (arg[1..n]),
+// PRINT/STDOUT events go to stdout, errors to stderr.
+func runWasm(bin []byte, path string, args []string) int {
 	dir, err := os.Getwd()
 	if err != nil {
 		fmt.Println(err.Error())
@@ -180,9 +183,10 @@ func runWasm(bin []byte, path string) int {
 	e := testdiff.NewWasmEngine("run")
 	e.Precompiled = bin
 	log := e.Run(testdiff.Case{
-		Name:   "@" + filepath.Base(path),
+		Name:   path, // arg[0] / chunkname: the path as typed, like the source path
 		Dir:    dir,
 		Source: bin,
+		Args:   args,
 	})
 	status := 0
 	for _, line := range log {

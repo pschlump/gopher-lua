@@ -50,6 +50,9 @@ func (e *Interp) Run(c Case) []string {
 	// used, so such functions see this global.)
 	argt := L.NewTable()
 	argt.RawSetInt(0, lua.LString(c.Name))
+	for i, a := range c.Args { // the CLI-arg surface glua -W feeds the wasm engine
+		argt.RawSetInt(i+1, lua.LString(a))
+	}
 	L.SetGlobal("arg", argt)
 	defer func() {
 		matches, _ := filepath.Glob(filepath.Join(c.Dir, "testdiff.tmp.*"))

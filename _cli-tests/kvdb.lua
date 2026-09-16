@@ -15,8 +15,8 @@ local function fail(msg)
     error(msg, 0)
 end
 
--- insertion sort over strings: table.sort is avoided on purpose — its
--- wasm path is a known gap (divergence ledger row 10u)
+-- insertion sort over strings: kept for plain-Lua coverage (table.sort
+-- works on wasm — ledger row 10u was fixed with the M6 stack fixes)
 local function sort_keys(keys)
     for i = 2, #keys do
         local k = keys[i]

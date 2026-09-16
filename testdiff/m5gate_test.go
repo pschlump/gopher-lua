@@ -61,7 +61,7 @@ func TestWasmGluaFull(t *testing.T) {
 // TestWasmFullMatrix: the regenerated opcode matrix stays green.
 func TestWasmFullMatrix(t *testing.T) {
 	wasmGluaFull(t, "../_wasm-tests", map[string]string{
-		"tbl07.lua": "table.sort callback path — ledger row 10, M5d",
-		"cb00.lua":  "table.sort comparator callback — ledger row 10, M5d",
+		// (empty — row 10u's table.sort skips were removed with the M6
+		// call_body stack-rebasing fix; tbl07/cb00/tsort01 pass)
 	})
 }

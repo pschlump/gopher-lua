@@ -1,7 +1,6 @@
 -- sortl.lua — sort lines from files, like sort(1), with a merge sort
--- written in plain Lua (the wasm table.sort path is a known ledger-10u
--- gap, so the sort is hand-rolled here — which also exercises recursion,
--- closures and table slicing as language features).
+-- written in plain Lua (kept for recursion/closure coverage even though
+-- table.sort works on wasm now — see tsort.lua for the table.sort gate).
 -- Flags: -n numeric compare, -r reverse, -u unique (collapse equal lines).
 
 local opt_n, opt_r, opt_u = false, false, false

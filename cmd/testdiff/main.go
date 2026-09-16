@@ -47,13 +47,10 @@ func main() {
 	}
 	cases, skippedList := testdiff.FilterSkips(cases, map[string]string{
 		// Ledgered divergences (docs/Lua-Wasm-Divergence-Ledger.md): the
-		// gopher message dialect (M5d) made error wording byte-exact —
-		// err00-02 and tco06 now pass. Remaining: table.sort's comparator
-		// path still trips the wasm callback machinery (row 10, with the
-		// deep __call corner — row 18; gsub/pcall/__index callbacks pass
-		// since the A4 adapter).
-		"tbl07.lua": "table.sort callback path — ledger row 10, M5d",
-		"cb00.lua":  "table.sort comparator callback — ledger row 10, M5d",
+		// gopher message dialect (M5d) made error wording byte-exact, and
+		// the M6 stack-discipline fixes cured table.sort (row 10u was
+		// call_body's dangling base — sort grows the Lua stack across its
+		// nested luaD_calls). No skips remain for this corpus.
 	})
 	results := testdiff.RunCorpus(cases, engines)
 

@@ -1,0 +1,7 @@
+asc 1000 ok=true first=0 last=996
+desc 1000 ok=true first=996 last=0
+strings	k1	k99
+false	cmp boom
+metalt	true	1	52
+cbcomp	0	60
+survived

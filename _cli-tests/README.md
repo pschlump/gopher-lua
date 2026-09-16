@@ -54,9 +54,9 @@ ledger):
   the wasm engines buffer WASI stdout and emit it after the event log,
   so interleaving order is not preserved. End `io.write` output with a
   newline.
-- **No `table.sort`** — the wasm path is a known gap (row 10u; fails
-  with and without comparators). Sort in plain Lua (`sortl.lua`'s
-  merge sort, `kvdb.lua`'s insertion sort).
+- **`table.sort` is fine** (row 10u was fixed with the M6 stack
+  rebasing — `tsort.lua` gates it). `sortl.lua`/`kvdb.lua` keep
+  hand-rolled sorts for recursion/closure coverage.
 - **`..` concat is fine** (row 27's ≥16-in-a-frame corruption was a
   runtime Lua-stack leak, fixed); `string.format` and `table.concat`
   were always safe.

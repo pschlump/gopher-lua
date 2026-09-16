@@ -22,7 +22,7 @@ CLUA = tmp/clua-run
 	test010 test011 test012 test013 test014 test015 test016 \
 	test017 test018 test019 test020 test021 test022 test023 \
 	test024 test025 test026 test027 test028 test029 test030 \
-	test031 test032 test033 test034 test035 test036
+	test031 test032 test033 test034 test035 test036 test037 test038
 
 test: setup tools \
 	test000 test001 test002 \
@@ -30,7 +30,7 @@ test: setup tools \
 	test010 test011 test012 test013 test014 test015 test016 \
 	test017 test018 test019 test020 test021 test022 test023 \
 	test024 test025 test026 test027 test028 test029 test030 \
-	test031 test032 test033 test034 test035 test036 \
+	test031 test032 test033 test034 test035 test036 test037 test038 \
 	fin
 
 setup:
@@ -258,6 +258,13 @@ test035:
 test036:
 	$(call check3,concatstress,concatstress,)
 
+# ---- table.sort (row 10u regression) ----
+
+test037:
+	$(call check3,tsort1,tsort,300)
+test038:
+	$(call check3,tsort2,tsort,1000)
+
 # ---- ref regeneration (from interp, the primary oracle; per-engine
 # refs regenerated from their own engine). Review the diff before
 # committing: a changed ref is a behavior change. ----
@@ -294,6 +301,8 @@ refs:
 	$(GLUA) ./wfreq.lua -8 data/poem.txt > ref/wfreq1.out
 	$(GLUA) ./wfreq.lua -5 data/poem.txt data/names.txt > ref/wfreq2.out
 	$(GLUA) ./concatstress.lua > ref/concatstress.out
+	$(GLUA) ./tsort.lua 300 > ref/tsort1.out
+	$(GLUA) ./tsort.lua 1000 > ref/tsort2.out
 	rm -f tmp/kvdb.db ref/kvdb.out
 	$(call kvdb_seq,$(GLUA) ./kvdb.lua,>> ref/kvdb.out)
 	rm -f tmp/kvdb.db

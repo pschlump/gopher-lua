@@ -162,30 +162,30 @@ sig: (param $L i32)         ;; thread/state pointer (current frame base etc.)
 
 ### 4.4 Opcode lowering table (complete inventory, 41 opcodes)
 
-| Opcode(s) | Lowering |
-|---|---|
-| `MOVE`, `MOVEN`, `LOADK`, `LOADBOOL`, `LOADNIL` | pure inline local moves / immediate tags / constant-handle loads |
-| `GETUPVAL`, `SETUPVAL` | inline: closure upvalue array load/store |
-| `GETGLOBAL`, `SETGLOBAL` | `rt_gettable/settable` on the globals-table handle with the interned name handle (globals are a table; env chain per closure) |
-| `GETTABLE`, `GETTABLEKS` | fast path inline: table-tag ∧ number-key ∧ `0 < key ≤ array_len` → bounds-checked `i32.load` of the array part; else `rt_gettable` |
-| `SETTABLE`, `SETTABLEKS` | symmetric; the runtime call also owns the write barrier when GC is active |
-| `NEWTABLE` | `rt_newtable(hintFromBC)` |
-| `SELF` | `rt_gettable` + register move |
-| `ADD..POW`, `UNM` | fast path: both tags `number` → f64 op inline; else `rt_arith(op,…)` (string coercion, `__add`… ) |
-| `NOT`, `TEST`, `TESTSET` | inline tag tests |
-| `LEN` | `rt_len` (string len inline fast path: tag=str → i32.load header) |
-| `CONCAT` | `rt_concat(frame, start, count, line)` (right-associative, `__concat`) |
-| `JMP` | branch (v1: set next-id; v2: wasm br) |
-| `EQ` | fast: number×number → f64 cmp; string×string (both interned) → `i32 eq` on handles; else `rt_equals` |
-| `LT`, `LE` | fast: number×number; else `rt_lessthan` (mixed-type errors, `__lt`/`__le`) |
-| `CALL`, `TAILCALL`, `RETURN` | §4.2 |
-| `FORPREP`, `FORLOOP` | `FORPREP`: guard/convert A..A+2 to numbers once (`rt_forprep` handles metamethod/coercion errors) → f64 locals; `FORLOOP`: pure inline f64 add + compare + visible copy at A+3 |
-| `TFORLOOP` | runtime-driven: call iterator via §4.2 mechanism, nil test inline |
-| `SETLIST` | `rt_setlist(tbl, frameSlot, n, baseIndex)` (flush at `FieldsPerFlush`) |
-| `CLOSE` | `rt_close_upvals` |
-| `CLOSURE` | `rt_newclosure(protoIdx, descPtr)` — capture descriptor in module data |
-| `VARARG` | copy from vararg area of frame (`frame + np*16 …`), nil-pad to B |
-| `NOP` | nothing |
+| Opcode(s)                                       | Lowering                                                                                                                                                                       |
+|-------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `MOVE`, `MOVEN`, `LOADK`, `LOADBOOL`, `LOADNIL` | pure inline local moves / immediate tags / constant-handle loads                                                                                                               |
+| `GETUPVAL`, `SETUPVAL`                          | inline: closure upvalue array load/store                                                                                                                                       |
+| `GETGLOBAL`, `SETGLOBAL`                        | `rt_gettable/settable` on the globals-table handle with the interned name handle (globals are a table; env chain per closure)                                                  |
+| `GETTABLE`, `GETTABLEKS`                        | fast path inline: table-tag ∧ number-key ∧ `0 < key ≤ array_len` → bounds-checked `i32.load` of the array part; else `rt_gettable`                                             |
+| `SETTABLE`, `SETTABLEKS`                        | symmetric; the runtime call also owns the write barrier when GC is active                                                                                                      |
+| `NEWTABLE`                                      | `rt_newtable(hintFromBC)`                                                                                                                                                      |
+| `SELF`                                          | `rt_gettable` + register move                                                                                                                                                  |
+| `ADD..POW`, `UNM`                               | fast path: both tags `number` → f64 op inline; else `rt_arith(op,…)` (string coercion, `__add`… )                                                                              |
+| `NOT`, `TEST`, `TESTSET`                        | inline tag tests                                                                                                                                                               |
+| `LEN`                                           | `rt_len` (string len inline fast path: tag=str → i32.load header)                                                                                                              |
+| `CONCAT`                                        | `rt_concat(frame, start, count, line)` (right-associative, `__concat`)                                                                                                         |
+| `JMP`                                           | branch (v1: set next-id; v2: wasm br)                                                                                                                                          |
+| `EQ`                                            | fast: number×number → f64 cmp; string×string (both interned) → `i32 eq` on handles; else `rt_equals`                                                                           |
+| `LT`, `LE`                                      | fast: number×number; else `rt_lessthan` (mixed-type errors, `__lt`/`__le`)                                                                                                     |
+| `CALL`, `TAILCALL`, `RETURN`                    | §4.2                                                                                                                                                                           |
+| `FORPREP`, `FORLOOP`                            | `FORPREP`: guard/convert A..A+2 to numbers once (`rt_forprep` handles metamethod/coercion errors) → f64 locals; `FORLOOP`: pure inline f64 add + compare + visible copy at A+3 |
+| `TFORLOOP`                                      | runtime-driven: call iterator via §4.2 mechanism, nil test inline                                                                                                              |
+| `SETLIST`                                       | `rt_setlist(tbl, frameSlot, n, baseIndex)` (flush at `FieldsPerFlush`)                                                                                                         |
+| `CLOSE`                                         | `rt_close_upvals`                                                                                                                                                              |
+| `CLOSURE`                                       | `rt_newclosure(protoIdx, descPtr)` — capture descriptor in module data                                                                                                         |
+| `VARARG`                                        | copy from vararg area of frame (`frame + np*16 …`), nil-pad to B                                                                                                               |
+| `NOP`                                           | nothing                                                                                                                                                                        |
 
 **Fidelity note:** every `rt_*` behavior contract is written down as "what `_vm.go` does today" — the interpreter source is the executable spec (e.g. `opArith` `_vm.go:831`, `stringConcat` `_vm.go:930`, `lessThan` `_vm.go:967`, `equals` `_vm.go:989`, vararg frame shuffle `state.go:1192-1240`).
 
@@ -302,10 +302,10 @@ type Result struct { /* reply values, Tier-3 converted (§6.4) */ }
 
 **Backbone principle: differential testing against two independent oracles.**
 
-| Oracle | Role | Notes |
-|---|---|---|
-| **gopher-lua interpreter (this repo)** | primary differential oracle | same frontend, same test corpus, run-for-run comparison; catches backend divergence with zero setup |
-| **C Lua 5.1 (native, via wasmoon-style build of stock Lua — see M3)** | semantic authority | where the interpreter itself deviates from Lua 5.1, C wins; every known divergence goes in the ledger (§8.9) |
+| Oracle                                                                | Role                        | Notes                                                                                                        |
+|-----------------------------------------------------------------------|-----------------------------|--------------------------------------------------------------------------------------------------------------|
+| **gopher-lua interpreter (this repo)**                                | primary differential oracle | same frontend, same test corpus, run-for-run comparison; catches backend divergence with zero setup          |
+| **C Lua 5.1 (native, via wasmoon-style build of stock Lua — see M3)** | semantic authority          | where the interpreter itself deviates from Lua 5.1, C wins; every known divergence goes in the ledger (§8.9) |
 
 Equality oracle = **normalized event log** (not just final results):
 
@@ -397,13 +397,13 @@ Each snippet runs in **all three engines** (interpreter, C-Lua-wasm, backend-was
 
 ### 8.7 Failure classification (drives CI severity)
 
-| Class | Meaning | CI action |
-|---|---|---|
-| TRAP | wasm trap (OOB, div-by-zero miscompiled, unreachable) | **always a backend bug**; blocks |
-| DIVERGE | event-log mismatch vs interpreter | blocks; ledger decides fix-vs-document |
-| C-DIVERGE | interpreter and C Lua disagree | ledger entry; blocks only if backend ≠ interpreter |
-| TIMEOUT-DEADLINE | deadline honored | expected behavior test |
-| OOM | watermark honored | expected behavior test |
+| Class            | Meaning                                               | CI action                                          |
+|------------------|-------------------------------------------------------|----------------------------------------------------|
+| TRAP             | wasm trap (OOB, div-by-zero miscompiled, unreachable) | **always a backend bug**; blocks                   |
+| DIVERGE          | event-log mismatch vs interpreter                     | blocks; ledger decides fix-vs-document             |
+| C-DIVERGE        | interpreter and C Lua disagree                        | ledger entry; blocks only if backend ≠ interpreter |
+| TIMEOUT-DEADLINE | deadline honored                                      | expected behavior test                             |
+| OOM              | watermark honored                                     | expected behavior test                             |
 
 ### 8.8 Semantic coverage instrumentation
 

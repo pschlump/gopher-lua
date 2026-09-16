@@ -1,3 +1,7 @@
 .idea
 .zai
 note/
+cmd/glua/glua
+cmd/luawasmc/luawasmc
+cmd/luawasm-run/luawasm-run
+,*

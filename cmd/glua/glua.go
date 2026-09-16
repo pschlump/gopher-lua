@@ -6,8 +6,11 @@ import (
 	"github.com/chzyer/readline"
 	"github.com/pschlump/gopher-lua"
 	"github.com/pschlump/gopher-lua/parse"
+	"github.com/pschlump/gopher-lua/testdiff"
 	"os"
+	"path/filepath"
 	"runtime/pprof"
+	"strings"
 )
 
 func main() {
@@ -15,17 +18,19 @@ func main() {
 }
 
 func mainAux() int {
-	var opt_e, opt_l, opt_p string
-	var opt_i, opt_v, opt_dt, opt_dc bool
+	var opt_e, opt_l, opt_p, opt_w string
+	var opt_i, opt_v, opt_dt, opt_dc, opt_W bool
 	var opt_m int
 	flag.StringVar(&opt_e, "e", "", "")
 	flag.StringVar(&opt_l, "l", "", "")
 	flag.StringVar(&opt_p, "p", "", "")
+	flag.StringVar(&opt_w, "w", "", "")
 	flag.IntVar(&opt_m, "mx", 0, "")
 	flag.BoolVar(&opt_i, "i", false, "")
 	flag.BoolVar(&opt_v, "v", false, "")
 	flag.BoolVar(&opt_dt, "dt", false, "")
 	flag.BoolVar(&opt_dc, "dc", false, "")
+	flag.BoolVar(&opt_W, "W", false, "")
 	flag.Usage = func() {
 		fmt.Println(`Usage: glua [options] [script [args]].
 Available options are:
@@ -36,6 +41,8 @@ Available options are:
   -dc      dump VM codes
   -i       enter interactive mode after executing 'script'
   -p file  write cpu profiles to the file
+  -w file  compile 'script' (or -e stat) to a wasm module, write to 'file' and exit
+  -W       run 'script' as a precompiled wasm module (cmd/luawasmc or -w output)
   -v       show version information`)
 	}
 	flag.Parse()
@@ -70,8 +77,51 @@ Available options are:
 		}
 	}
 
+	// -w: compile to a wasm module and exit instead of running (the
+	// luawasmc path) — source is the script, or the -e stat string.
+	if len(opt_w) > 0 {
+		if flag.NArg() == 0 && len(opt_e) == 0 {
+			fmt.Println("glua: -w needs a script or -e stat")
+			return 2
+		}
+		src, name := []byte(opt_e), "(command line)"
+		if flag.NArg() > 0 {
+			var err error
+			if src, err = os.ReadFile(flag.Arg(0)); err != nil {
+				fmt.Println(err.Error())
+				return 1
+			}
+			name = flag.Arg(0)
+		}
+		bin, err := testdiff.CompileSource(src, name)
+		if err != nil {
+			fmt.Println(err.Error())
+			return 1
+		}
+		if err := os.WriteFile(opt_w, bin, 0644); err != nil {
+			fmt.Println(err.Error())
+			return 1
+		}
+		fmt.Printf("%s: %d bytes wasm\n", opt_w, len(bin))
+		return 0
+	}
+
 	if nargs := flag.NArg(); nargs > 0 {
 		script := flag.Arg(0)
+		// A precompiled module (cmd/luawasmc or -w output) runs on the
+		// wasm engine: -W forces it, else detect a .wasm path carrying
+		// the module magic — the way Lua loads binary chunks.
+		if opt_W || strings.HasSuffix(script, ".wasm") {
+			bin, err := os.ReadFile(script)
+			if err != nil {
+				fmt.Println(err.Error())
+				return 1
+			}
+			if opt_W || (len(bin) >= 4 && string(bin[:4]) == "\x00asm") {
+				return runWasm(bin, script)
+			}
+			// not a wasm module after all — run it as Lua source below
+		}
 		argtb := L.NewTable()
 		for i := 1; i < nargs; i++ {
 			L.RawSet(argtb, lua.LNumber(i), lua.LString(flag.Arg(i)))
@@ -115,6 +165,39 @@ Available options are:
 
 	if opt_i {
 		doREPL(L)
+	}
+	return status
+}
+
+// runWasm executes a precompiled wasm module on the wasm engine (the
+// luawasm-run path): PRINT/STDOUT events go to stdout, errors to stderr.
+func runWasm(bin []byte, path string) int {
+	dir, err := os.Getwd()
+	if err != nil {
+		fmt.Println(err.Error())
+		return 1
+	}
+	e := testdiff.NewWasmEngine("run")
+	e.Precompiled = bin
+	log := e.Run(testdiff.Case{
+		Name:   "@" + filepath.Base(path),
+		Dir:    dir,
+		Source: bin,
+	})
+	status := 0
+	for _, line := range log {
+		tab := strings.IndexByte(line, '\t')
+		event, payload := line, ""
+		if tab >= 0 {
+			event, payload = line[:tab], line[tab+1:]
+		}
+		switch event {
+		case "PRINT", "STDOUT":
+			fmt.Println(payload)
+		case "ERROR", "ENGINE-ERROR", "SKIP-UNSUPPORTED":
+			fmt.Fprintf(os.Stderr, "glua: %s\n", payload)
+			status = 1
+		}
 	}
 	return status
 }

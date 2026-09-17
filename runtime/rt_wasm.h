@@ -14,6 +14,7 @@
 #ifndef RT_WASM_H
 #define RT_WASM_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "rt_abi.h"
 
@@ -88,6 +89,30 @@ int rt_line_at(int32_t from_top); /* 0 = top */
 void rt_gindex_error(lua_State *L, const TValue *t, const TValue *k);
 int rt_wasm_ci(lua_State *L); /* current CallInfo is a wasm frame */
 int rt_wasm_ciframe(CallInfo *ci);
+
+/* ---- M6d: memory cap (D3) + deadline (D4) — rt_abi.c ---- */
+
+/* the budget-tracking lua_Alloc (lnewstate builds states with
+   lua_newstate(rt_alloc, NULL) so every Lua-object byte funnels through
+   the cap). See the rt_set_memlimit block in rt_abi.c. */
+void *rt_alloc(void *ud, void *ptr, size_t osize, size_t nsize);
+
+/* init-time per-VM budget in bytes (0 = unlimited); call BEFORE
+   lnewstate so the whole VM lifetime counts. Resets the used counter. */
+void rt_set_memlimit(int32_t bytes);
+int32_t rt_mem_used_bytes(void); /* diagnostics/tests */
+
+/* deadline control block: the address hosts write 1 to when the run's
+   deadline expires (watchdog: a single 4-byte LE store — engines cannot
+   take store-API calls off-thread; main thread: rt_set_deadline). The
+   backend emits a poll against it at every basic-block transition; a set
+   flag makes emitted code call rt_deadline → ordinary pcall-catchable
+   error. Sticky for the run. */
+rt_addr rt_ctrl_addr(void); /* i32 on wasm32 (rt_addr: the ABI's
+                               pointer-carrying type) */
+void rt_set_deadline(int32_t on);
+int32_t rt_deadline_flag(void);
+int32_t rt_deadline(void); /* stages "context deadline exceeded", RT_ERR */
 
 /* ---- internal helpers (rt_abi.c; called from ldo.c's adapter) ---- */
 

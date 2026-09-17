@@ -43,7 +43,19 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -Wl,--export=rt_tail_stage -Wl,--export=rt_tail_clidx -Wl,--export=rt_tail_nargs \
   -Wl,--export=rt_tail_funcell -Wl,--export=rt_tail_restage \
   -Wl,--export=rt_set_dialect -Wl,--export=rt_sandbox \
+  -Wl,--export=rt_set_memlimit -Wl,--export=rt_mem_used_bytes \
+  -Wl,--export=rt_ctrl_addr -Wl,--export=rt_set_deadline \
+  -Wl,--export=rt_deadline_flag -Wl,--export=rt_deadline \
   -Wl,--export=lglobals"
+
+# M6d: declare a memory MAX on both flavors. (i) A static (max-bounded)
+# linear memory never moves its base in wasmtime — the deadline
+# watchdog's single 4-byte store at rt_ctrl_addr() stays valid for the
+# instance's lifetime. (ii) It is the coarse second OOM backstop: a
+# memory.grow failure makes dlmalloc return NULL → the same clean
+# "not enough memory" path as the rt_alloc budget (D3). 256 MiB covers
+# the 8 MiB stack + data + any v1 per-VM budget with headroom.
+MEMMAX="-Wl,--max-memory=268435456"
 
 # ---- lua51_sjlj.wasm: native EH setjmp, runs on wasmtime ----
 
@@ -52,7 +64,7 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -DLUAWASM_SJLJ \
   -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
   -lsetjmp \
-  $EXPORTS \
+  $EXPORTS $MEMMAX \
   -Wl,-z,stack-size=8388608 -Wl,--strip-all \
   -o lua51_sjlj.wasm luawasm.c rt_abi.c $SRC
 
@@ -80,7 +92,7 @@ PROD_SRC=$(ls lua51/src/*.c | grep -v -e /liolib.c -e /loslib.c -e /loadlib.c -e
   -ffunction-sections -fdata-sections \
   -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
   -lsetjmp \
-  $EXPORTS \
+  $EXPORTS $MEMMAX \
   -Wl,-z,stack-size=8388608 -Wl,--strip-all \
   -o lua51_prod.wasm luawasm.c rt_abi.c $PROD_SRC
 

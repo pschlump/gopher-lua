@@ -14,6 +14,7 @@
 
 /* pull the ABI in directly (single translation unit with Lua core) */
 #include "../rt_abi.c"
+#include "lua51/src/lualib.h" /* luaL_openlibs (the sandbox leg) */
 
 /* wasm_dispatch_host is a host import on wasm; native tests have no
    script module, so stub it host-refused (nothing registers a wasm proto
@@ -30,6 +31,19 @@ static int failures = 0;
 } while (0)
 
 static rt_addr cell_of(TValue *v) { return (rt_addr)(uintptr_t)v; }
+
+/* M6d: allocation-hungry bodies run under lua_cpcall (an unprotected
+   ERRMEM would abort the test — the point is that it is CATCHABLE) */
+static int oom_body(lua_State *L) {
+  const char *big = (const char *)lua_touserdata(L, 1);
+  lua_pushlstring(L, big, 200 * 1024); /* over the 64 KiB cap → ERRMEM */
+  return 1;
+}
+
+static int small_body(lua_State *L) {
+  lua_pushliteral(L, "fits");
+  return 1;
+}
 
 int main(void) {
   TValue c[16];
@@ -234,6 +248,62 @@ int main(void) {
     rt_mknil(cell_of(&out));
     rt_getupval((rt_addr)(uintptr_t)clvalue(&c1), 0, cell_of(&out));
     CHECK(nvalue(&out) == 5); /* cells[0] still open, reads through */
+  }
+
+  /* ---- M6d (D3): the allocation cap ---- */
+  {
+    /* A capped state: creation succeeds, allocation over the budget
+       refuses, the refusal raises a catchable LUA_ERRMEM carrying stock
+       5.1's bare "not enough memory" (no position — seterrorobj's
+       literal), and the catch re-arms the refusal (emergency slack is
+       one-time, not per-catch). */
+    static char big[200 * 1024];
+    lua_State *M;
+    memset(big, 'x', sizeof big);
+    rt_set_memlimit(64 * 1024);
+    M = lua_newstate(rt_alloc, NULL);
+    CHECK(M != NULL); /* state + core structs fit the budget */
+    CHECK(lua_cpcall(M, oom_body, (void *)big) == LUA_ERRMEM);
+    CHECK(lua_isstring(M, -1));
+    CHECK(strcmp(lua_tostring(M, -1), "not enough memory") == 0);
+    lua_pop(M, 1);
+    /* catch re-arms: still over budget (used ≥ limit) → still refused */
+    CHECK(lua_cpcall(M, oom_body, (void *)big) == LUA_ERRMEM);
+    lua_pop(M, 1);
+    /* small allocations keep working at/under the cap */
+    CHECK(lua_cpcall(M, small_body, NULL) == 0);
+    /* unbounded again */
+    rt_set_memlimit(0);
+    CHECK(lua_cpcall(M, oom_body, (void *)big) == 0);
+    lua_close(M);
+    /* the original state's allocator is unaffected by the second state's
+       budget (rt_set_memlimit is process-global; engines create one VM
+       per instance — documented posture, reset here for the rest of the
+       suite) */
+    rt_set_memlimit(0);
+  }
+
+  /* ---- M6d (D4): the deadline control block ---- */
+  {
+    char buf[64];
+    rt_set_deadline(0);
+    CHECK(rt_deadline_flag() == 0);
+    CHECK(rt_ctrl_addr() == (rt_addr)(uintptr_t)&g_deadline_flag);
+    /* the watchdog contract: a bare 4-byte store at rt_ctrl_addr() */
+    *(int32_t *)(uintptr_t)rt_ctrl_addr() = 1;
+    CHECK(rt_deadline_flag() == 1);
+    CHECK(rt_deadline() == RT_ERR);
+    CHECK(rt_err_pending() == 1);
+    {
+      int32_t n = rt_err_stage_copy((rt_addr)(uintptr_t)buf, sizeof buf);
+      CHECK(n == (int32_t)strlen("context deadline exceeded"));
+      CHECK(strcmp(buf, "context deadline exceeded") == 0);
+    }
+    /* sticky: rt_deadline never re-stages over a pending error */
+    CHECK(rt_deadline() == RT_ERR);
+    rt_err_clear();
+    rt_set_deadline(0);
+    CHECK(rt_deadline_flag() == 0);
   }
 
   if (failures == 0) printf("RT-NATIVE PASS\n");

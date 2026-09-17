@@ -18,6 +18,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 
 	wt "github.com/bytecodealliance/wasmtime-go/v48"
@@ -184,6 +185,16 @@ type WasmEngine struct {
 	Sandbox bool
 	// Seed: host RNG seed (0 → 42); applied after lnewstate (D5).
 	Seed int64
+	// MaxMem: per-VM allocation budget in bytes (0 = unlimited). Applied
+	// via rt_set_memlimit BEFORE lnewstate so the whole VM lifetime
+	// counts; over-budget allocation dies with a clean pcall-catchable
+	// "not enough memory" (M6d D3, ledger row 36).
+	MaxMem int64
+	// Deadline: host timeout for the run. When it expires, a watchdog
+	// writes the rt control-block flag; the guest's back-edge polls raise
+	// "context deadline exceeded" as an ordinary Lua error (M6d D4,
+	// ledger row 37).
+	Deadline time.Duration
 }
 
 // NewWasmEngine returns a wasm-backend engine with the given name.
@@ -368,6 +379,14 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		return f.Call(store, args...)
 	}
 
+	// M6d (D3): the per-VM allocation cap — before lnewstate, so the
+	// state, stdlib, shims, constant pool and script all count.
+	if e.MaxMem > 0 {
+		if _, err := call(rtInst, "rt_set_memlimit", int(e.MaxMem)); err != nil {
+			return []string{"ENGINE-ERROR\trt_set_memlimit: " + err.Error()}
+		}
+	}
+
 	scriptMod, err := wt.NewModule(engine, bin)
 	if err != nil {
 		return []string{"ENGINE-ERROR\tscript module: " + err.Error()}
@@ -438,6 +457,25 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	frame, err := call(rtInst, "rt_frame_alloc", int(frameCells)*16)
 	if err != nil {
 		return []string{"ENGINE-ERROR\tframe: " + err.Error()}
+	}
+
+	// M6d (D4): the deadline watchdog. wasmtime Stores are !Sync — the
+	// only safe off-thread crossing is a bare aligned word store into the
+	// linear memory: the blob declares a memory max, so wasmtime maps it
+	// statically (the base never moves) and the slice captured here on the
+	// main goroutine stays valid. The guest's back-edge polls read the
+	// flag and raise rt_deadline's ordinary (pcall-catchable) error.
+	if e.Deadline > 0 {
+		if a, err := call(rtInst, "rt_ctrl_addr"); err == nil {
+			flagAddr := uint32(toI32(a))
+			memBase := guestMem.UnsafeData(store)
+			timer := time.AfterFunc(e.Deadline, func() {
+				// 4-byte little-endian 1 — one aligned store
+				b := memBase[flagAddr : flagAddr+4 : flagAddr+4]
+				b[0], b[1], b[2], b[3] = 1, 0, 0, 0
+			})
+			defer timer.Stop()
+		}
 	}
 
 	status, err := call(scriptInst, "lua_main", frame)

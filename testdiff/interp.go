@@ -5,11 +5,13 @@ package testdiff
 // directory equal to the corpus directory.
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pschlump/gopher-lua"
 )
@@ -21,6 +23,11 @@ type Interp struct {
 	// Seed: host RNG seed for the run (0 → 42, the harness contract —
 	// M6c D5 determinism plumbing, mirrors the wasm engines' Seed).
 	Seed int64
+	// Deadline: host timeout for the run (M6d D4 parity leg) — SetContext;
+	// mainLoopWithContext raises ctx.Err() ("context deadline exceeded")
+	// at the next instruction boundary. This is the oracle whose wording
+	// the wasm engines' rt_deadline mirrors (ledger row 37).
+	Deadline time.Duration
 }
 
 // NewInterp returns an interpreter engine with the given display name.
@@ -46,6 +53,11 @@ func (e *Interp) Run(c Case) []string {
 		IncludeGoStackTrace: true,
 	})
 	defer L.Close()
+	if e.Deadline > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), e.Deadline)
+		defer cancel()
+		L.SetContext(ctx)
+	}
 	installShim(L, emit, e.Seed)
 	// The C driver exposes arg = { [0] = chunkname } (luawasm.c); align the
 	// oracle so scripts touching the GLOBAL arg see the same surface. (The

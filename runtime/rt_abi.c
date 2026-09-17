@@ -54,6 +54,12 @@ _Static_assert(sizeof(lua_Number) == 8, "numbers are f64");
 static lua_State *curL;
 static int rt_wasm_depth; /* adapter nesting (RTW_MAX_DEPTH guard, v3) */
 
+/* M6d (D3) alloc-cap state — see the rt_set_memlimit block below */
+static int64_t rt_mem_limit; /* bytes; 0 = unlimited (default) */
+static int64_t rt_mem_used;
+static int rt_oom_inflight;
+#define RT_MEM_EMERGENCY (64 * 1024)
+
 /* ---- M5d: the gopher-lua message dialect ----
 **
 ** The wasm engine enables it (rt_set_dialect(1)); the clua oracle keeps
@@ -210,6 +216,7 @@ void rt_set_state(rt_addr p) {
   err_prefixed = 0;
   setnilvalue(&err_value);
   rt_wasm_depth = 0;
+  rt_oom_inflight = 0; /* M6d: fresh activation re-arms the cap refusal */
 }
 
 /* ---- M6c: sandbox globals lockdown (host flag, m6 plan §4.3) ----
@@ -251,6 +258,130 @@ int32_t rt_sandbox(int32_t on) {
 
 int32_t rt_err_pending(void) { return err_pending; }
 
+/* ---- M6d (D3): the per-VM allocation cap ----
+**
+** rt_alloc replaces the stock l_alloc (luawasm.c's lnewstate builds the
+** state with lua_newstate(rt_alloc, NULL)): every Lua-object byte passes
+** through here, so a budget check at the chokepoint converts runaway
+** allocation into a clean LUA_ERRMEM ("not enough memory") — an ordinary
+** pcall-catchable Lua error, never a trap (design §6.4/§8.6, m6 plan D3).
+**
+** rt_set_memlimit is an init-time hook (per-VM lifetime, not per-run):
+** the host calls it BEFORE lnewstate, so the whole VM — stdlib open,
+** shims, constant pool, script — counts against the budget. It zeroes
+** the used counter (calling it mid-lifetime undercounts live blocks;
+** frees clamp at 0, so accounting stays monotone-safe either way).
+**
+** Emergency slack: a refusal sets rt_oom_inflight, and while it is set,
+** allocations up to limit+RT_MEM_EMERGENCY still pass. Without it the
+** OOM raise would dead-end — stock 5.1's ERRMEM recovery interns the
+** message string through the same allocator ("not enough memory", and
+** our stage_c_error below does too); refusing THAT would recurse the
+** error machinery into error handling. The slack is one-time: the used
+** counter keeps counting, so a catch-and-retry loop gains at most
+** RT_MEM_EMERGENCY bytes total over the limit. rt_err_clear /
+** rt_pcall_caught / rt_set_state clear the flag so the next over-limit
+** allocation re-refuses.
+**
+** The interp oracle has NO counterpart surface: Go's allocator cannot
+** refuse (SetMx watches runtime stats and os.Exit(3)s — not catchable),
+** so the OOM text is pinned absolutely, not diffed (ledger row 36).
+** Non-Lua allocations (rt_frame_alloc's malloc, frame chunks) bypass the
+** cap by design — bounded by the depth guard and restored per frame; the
+** linear-memory max (build.sh --max-memory) is the second, coarser
+** backstop: memory.grow failure makes malloc fail → the same clean path.
+*/
+void rt_set_memlimit(int32_t bytes) {
+  rt_mem_limit = bytes > 0 ? (int64_t)bytes : 0;
+  rt_mem_used = 0;
+  rt_oom_inflight = 0;
+}
+
+int32_t rt_mem_used_bytes(void) {
+  return rt_mem_used > 0x7fffffffLL ? 0x7fffffff : (int32_t)rt_mem_used;
+}
+
+void *rt_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+  void *np;
+  (void)ud;
+  if (nsize == 0) {
+    free(ptr);
+    rt_mem_used -= (int64_t)osize;
+    if (rt_mem_used < 0) rt_mem_used = 0; /* frees of pre-limit blocks */
+    return NULL;
+  }
+  if (rt_mem_limit > 0 && nsize > osize) {
+    int64_t cap =
+        rt_oom_inflight ? rt_mem_limit + RT_MEM_EMERGENCY : rt_mem_limit;
+    if (rt_mem_used + (int64_t)(nsize - osize) > cap) {
+      rt_oom_inflight = 1; /* → luaM_realloc_ raises LUA_ERRMEM */
+      return NULL;
+    }
+  }
+  np = realloc(ptr, nsize);
+  if (np == NULL) {
+    if (rt_mem_limit > 0) rt_oom_inflight = 1; /* real exhaustion: same path */
+    return NULL;
+  }
+  rt_mem_used += (int64_t)nsize - (int64_t)osize; /* signed: shrinks subtract */
+  return np;
+}
+
+/* ---- M6d (D4): the deadline control block ----
+**
+** g_deadline_flag is host-written and guest-polled. The host arms it
+** when the run's deadline expires — either by calling rt_set_deadline
+** (main thread) or, from a watchdog goroutine, a single 4-byte
+** little-endian store of 1 at rt_ctrl_addr() (wasm engines cannot take
+** store-API calls off-thread; an aligned word store into linear memory
+** is the one safe crossing — the blobs declare a memory max, so the
+** base never moves under wasmtime's static memories). The backend emits
+** a load-and-branch against it at every basic-block transition and at
+** the tailcall restage loop (m6 plan D4); a set flag → rt_deadline
+** stages an ordinary Lua error (pcall-catchable, like the OOM raise).
+**
+** The flag is sticky for the run: a script can pcall-catch the deadline
+** error, but its next back edge re-raises — no livelock, no progress.
+** Fresh-VM-per-run resets it by construction (hosts may rt_set_deadline
+** (0) to disarm). Polling is cooperative: a single non-returning C call
+** (a giant string.rep) never sees a poll — the alloc cap bounds those.
+*/
+int32_t g_deadline_flag;
+
+/* rt_addr (i32 on wasm32 — the frozen pointer-carrying ABI type; the
+   native64 build keeps full width so tests can round-trip it) */
+rt_addr rt_ctrl_addr(void) { return (rt_addr)(size_t)&g_deadline_flag; }
+
+void rt_set_deadline(int32_t on) { g_deadline_flag = on ? 1 : 0; }
+
+int32_t rt_deadline_flag(void) { return g_deadline_flag; }
+
+/* rt_deadline: stage the deadline error and refuse — the emitted poll
+   does checkStatus on the return, so the -1 convention unwinds the wasm
+   frame chain exactly like any rt_* error; the adapter re-raises and
+   pcall can catch. Body text matches the interp oracle's cancellation
+   message byte-for-byte (mainLoopWithContext raises ctx.Err() —
+   "context deadline exceeded" for a deadline context); the position
+   prefix diverges (the poll site has no line info; interp's raise rides
+   an instruction boundary) — ruled in ledger row 37. */
+int32_t rt_deadline(void) {
+  if (!err_pending) {
+    static const char msg[] = "context deadline exceeded";
+    size_t n = sizeof msg - 1;
+    if (curL != NULL) { /* the normal path: a real string error value */
+      TString *ts = luaS_newlstr(curL, msg, n);
+      setsvalue(curL, &err_value, ts);
+    } else { /* exported entry point, no state set: buffer-only staging */
+      setnilvalue(&err_value);
+    }
+    memcpy(err_buf, msg, n + 1);
+    err_buf_len = (int)n;
+    err_prefixed = 1; /* position decided: none */
+    err_pending = 1;
+    rt_where_set = 0;
+  }
+  return RT_ERR;
+}
 
 void rt_err_clear(void) {
   err_pending = 0;
@@ -258,6 +389,7 @@ void rt_err_clear(void) {
   err_prefixed = 0; /* the staging contract: sticky until CLEARED — a
                        cleared error must not suppress the prefix of the
                        next one (native ABI tests check staged bytes) */
+  rt_oom_inflight = 0; /* M6d: a consumed OOM re-arms the refusal */
 }
 
 /* Called from luaD_pcall's recovery (ldo.c): a Lua-level catch consumes
@@ -272,6 +404,7 @@ void rt_pcall_caught(void) {
   err_buf_len = 0;
   err_prefixed = 0;
   setnilvalue(&err_value);
+  rt_oom_inflight = 0; /* M6d: a caught OOM re-arms the refusal */
 }
 
 int32_t rt_err_stage_copy(rt_addr dst, int32_t cap) {
@@ -322,6 +455,26 @@ static int rt_run_raw(body_fn fn, int32_t line);
 
 static int rt_run(body_fn fn, int32_t line) { return rt_run_raw(fn, line); }
 
+/* stage_c_error: LUA_ERRMEM/LUA_ERRERR land here with NO value on the
+   Lua stack — stock seterrorobj only runs at pcall-family recoveries,
+   so plain rawrunprotected catches would stage whatever stale value sat
+   at top (the M6d OOM path found this: the throw leaves the stack
+   untouched). Stage the bare literal exactly as seterrorobj would (the
+   interning rides the OOM emergency slack); stock ERRMEM/ERRERR carry
+   no position, hence err_prefixed. */
+static void stage_c_error(int status) {
+  const char *msg =
+      (status == LUA_ERRMEM) ? "not enough memory" : "error in error handling";
+  size_t n = strlen(msg);
+  TString *ts = luaS_newlstr(curL, msg, n);
+  setsvalue(curL, &err_value, ts);
+  memcpy(err_buf, msg, n + 1);
+  err_buf_len = (int)n;
+  err_prefixed = 1;
+  err_pending = 1;
+  rt_where_set = 0;
+}
+
 /* returns RT_OK, or RT_ERR with the error staged (message gets the
    script-position prefix, matching the oracle's error format) */
 static int rt_run_raw(body_fn fn, int32_t line) {
@@ -335,7 +488,10 @@ static int rt_run_raw(body_fn fn, int32_t line) {
   lua_unlock(curL);
   rt_line_sp--;
   if (status != 0) {
-    stage_error(); /* value + message bytes; captures rt_where_set */
+    if (status == LUA_ERRMEM || status == LUA_ERRERR)
+      stage_c_error(status); /* no stack value: stage the literal */
+    else
+      stage_error(); /* value + message bytes; captures rt_where_set */
     prefixed = err_prefixed;
     if (line != 0 && !prefixed && err_buf_len > 0) {
       /* position prefix, like luaG_runerror's — done in the buffer, not

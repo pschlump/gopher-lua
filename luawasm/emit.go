@@ -267,6 +267,10 @@ func (fe *funcEmitter) emitBody() {
 	// the dispatch LOOP itself (that would re-dispatch with a stale lBlk
 	// and loop forever — the {1,2,3} constructor OOM).
 	f.Loop(wasm.Void)
+	// M6d (D4): the deadline poll — every basic-block transition passes
+	// here, so every loop iteration of every loop observes the flag (the
+	// interpreter's ctx check is the same per-instruction granularity).
+	fe.b.emitDeadlinePoll(f)
 	for i := 0; i <= len(fe.blockPC); i++ {
 		f.Block(wasm.Void)
 	}

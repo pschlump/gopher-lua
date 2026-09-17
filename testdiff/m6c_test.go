@@ -23,7 +23,7 @@ import (
 // lua51ProdSHA256 pins the embedded prod blob. Rebuild runtime/build.sh →
 // update this constant (the artifact test is the self-check that forces
 // the bump). Brittle by design (A8: checksummed artifact).
-const lua51ProdSHA256 = "e4e54d759500d916957c92f289c74fd57b4df5e3fc3de3d1261e167d1202face"
+const lua51ProdSHA256 = "4c60f9655f8c1278b9334139316c4fa330beaedf0b1a1a4a705f03c7da97c56c"
 
 func TestM6cProdBlobArtifact(t *testing.T) {
 	imps, err := wasm.Imports(lua51ProdWasm)
@@ -57,7 +57,10 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 		exp[e.Name] = true
 	}
 	for _, name := range []string{"rt_sandbox", "lnewstate", "ldostring", "lglobals",
-		"rt_set_state", "rt_set_dialect", "rt_abi_version", "rt_frame_alloc", "linbuf", "lnamebuf"} {
+		"rt_set_state", "rt_set_dialect", "rt_abi_version", "rt_frame_alloc", "linbuf", "lnamebuf",
+		// M6d: the cap + deadline surface (ledger rows 36-37)
+		"rt_set_memlimit", "rt_mem_used_bytes", "rt_ctrl_addr", "rt_set_deadline",
+		"rt_deadline_flag", "rt_deadline"} {
 		if !exp[name] {
 			t.Errorf("prod blob export %s missing", name)
 		}

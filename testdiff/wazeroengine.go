@@ -28,6 +28,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pschlump/gopher-lua/wasm"
 	"github.com/tetratelabs/wazero"
@@ -35,6 +36,10 @@ import (
 	"github.com/tetratelabs/wazero/experimental"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
+
+// deadlineFlagLE is the watchdog's single store: 1 as 4 little-endian
+// bytes (M6d D4 — see rt_abi.c's control-block contract).
+var deadlineFlagLE = []byte{1, 0, 0, 0}
 
 func u32[T int32 | int | uint32](v T) uint64 { return uint64(uint32(v)) }
 
@@ -75,6 +80,12 @@ type WazeroEngine struct {
 	// Applied after lnewstate (which reseeds to 42 from the C side), so
 	// engines with the same Seed observe identical math.random streams.
 	Seed int64
+	// MaxMem: per-VM allocation budget in bytes (0 = unlimited), via
+	// rt_set_memlimit before lnewstate (M6d D3, ledger row 36).
+	MaxMem int64
+	// Deadline: host timeout — the watchdog writes the rt control-block
+	// flag and the guest's back-edge polls raise the error (M6d D4).
+	Deadline time.Duration
 }
 
 // NewWazeroEngine returns a wazero-hosted wasm-backend engine.
@@ -220,6 +231,14 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		return f.Call(ctx, args...)
 	}
 
+	// M6d (D3): the per-VM allocation cap — before lnewstate, so the
+	// whole VM lifetime counts (state, stdlib, pool, script).
+	if e.MaxMem > 0 {
+		if _, err := call(rtInst, "rt_set_memlimit", u32(int32(e.MaxMem))); err != nil {
+			return []string{"ENGINE-ERROR\trt_set_memlimit: " + err.Error()}
+		}
+	}
+
 	L, err := call(rtInst, "lnewstate")
 	if err != nil {
 		return []string{"ENGINE-ERROR\tlnewstate: " + err.Error()}
@@ -293,6 +312,20 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	frame, err := call(rtInst, "rt_frame_alloc", u32(frameCells*16))
 	if err != nil {
 		return []string{"ENGINE-ERROR\tframe: " + err.Error()}
+	}
+
+	// M6d (D4): the deadline watchdog — a bare 4-byte store into the
+	// linear memory at the control-block flag (wazero's Memory.Write is a
+	// plain buffer copy; no engine state touched, safe off-thread). The
+	// guest's back-edge polls raise rt_deadline's ordinary error.
+	if e.Deadline > 0 {
+		if a, err := call(rtInst, "rt_ctrl_addr"); err == nil {
+			flagAddr := uint32(a[0])
+			timer := time.AfterFunc(e.Deadline, func() {
+				_ = mem.Write(flagAddr, deadlineFlagLE)
+			})
+			defer timer.Stop()
+		}
 	}
 
 	status, err := call(scriptInst, "lua_main", frame[0])

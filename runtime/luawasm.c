@@ -34,6 +34,8 @@
 #include "lua51/src/lauxlib.h"
 #include "lua51/src/lualib.h"
 #include "lua51/src/ldo.h"
+#include "lua51/src/lstate.h"
+#include "rt_wasm.h" /* M6d: rt_alloc — the capped lua_Alloc */
 
 #ifdef LUAWASM_SJLJ
 /* Native build: wasi-sdk's EH-based setjmp (-mllvm -wasm-enable-sjlj);
@@ -527,7 +529,11 @@ static void install_shims(lua_State *L) {
 static lua_State *g_state; /* for lglobals after the entry returns */
 
 int32_t lnewstate(void) {
-  lua_State *L = luaL_newstate();
+  /* M6d (D3): the budget-tracking allocator — rt_set_memlimit() before
+     this call caps the whole VM lifetime; every Lua-object byte (state,
+     stdlib, strings, tables) funnels through it, and a refusal raises a
+     clean pcall-catchable "not enough memory" (ledger row 36). */
+  lua_State *L = lua_newstate(rt_alloc, NULL);
   if (L == NULL) return 0;
   luaL_openlibs(L);
   install_shims(L);

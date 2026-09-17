@@ -12,9 +12,22 @@
 # Known-broken wasm legs (divergence ledger rows) run as XFAIL targets:
 # they assert the wasm output still DIFFERS, and fail the suite when the
 # engine starts matching — a nudge to promote them back to check3.
+#
+# WAZERO=1 (M6b engine-parity leg, ledger row 32: one blob, two hosts)
+# swaps every wasm leg from the wasmtime oracle to the wazero production
+# engine — same golden files, same diffs:
+#
+#   make test WAZERO=1
 
 GLUA = ../cmd/glua/glua
 CLUA = tmp/clua-run
+
+ifdef WAZERO
+export GLUA_WASM_ENGINE = wazero
+WASMENG = wazero
+else
+WASMENG = wasmtime
+endif
 
 .PHONY: test setup tools fin refs \
 	test000 test001 test002 \
@@ -45,7 +58,7 @@ fin:
 
 # check3 NAME PROG ARGS — all three engines must match ref/NAME.out.
 define check3
-	@echo "== $(1) (interp / wasm / clua)"
+	@echo "== $(1) (interp / wasm-$(WASMENG) / clua)"
 	$(GLUA) -w tmp/$(2).wasm ./$(2).lua > /dev/null
 	$(GLUA) ./$(2).lua $(3) > out/$(1).i.out
 	$(GLUA) -W tmp/$(2).wasm $(3) > out/$(1).w.out
@@ -198,7 +211,7 @@ define kvdb_seq
 endef
 
 test027:
-	@echo "== kvdb (interp / wasm / clua, one shared db)"
+	@echo "== kvdb (interp / wasm-$(WASMENG) / clua, one shared db)"
 	$(GLUA) -w tmp/kvdb.wasm ./kvdb.lua > /dev/null
 	rm -f tmp/kvdb.db $(KVDB_OUT)
 	$(call kvdb_seq,$(GLUA) ./kvdb.lua,>> $(KVDB_OUT))

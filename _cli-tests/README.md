@@ -16,6 +16,12 @@ refs (`err1.*`, `syntaxerr.*`), which each engine generates itself.
 Review `git diff ref/` before committing a regenerated ref: a changed
 ref is a behavior change.
 
+`make test WAZERO=1` (M6b, ledger row 32 — one blob, two hosts) swaps
+every wasm leg from the wasmtime oracle to the pure-Go wazero
+production engine (`GLUA_WASM_ENGINE=wazero`, understood by `glua -W`
+and `luawasm-run`): same golden files, same diffs — the production
+engine is byte-for-byte with the oracle over the whole CLI surface.
+
 The three-engine shape is the point: interp and wasm share the
 frontend, so a frontend bug leaves their diff green — only the C Lua
 leg disagrees. Six real bugs were found this way on day one (ledger

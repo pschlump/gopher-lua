@@ -1,5 +1,7 @@
 // Command luawasm-run executes a module saved by cmd/luawasmc against
-// the C-Lua rt_* runtime (embedded lua51_sjlj.wasm) on wasmtime.
+// the C-Lua rt_* runtime (embedded lua51_sjlj.wasm) on wasmtime — or on
+// the pure-Go wazero production engine when GLUA_WASM_ENGINE=wazero
+// (ledger row 32: one blob, two hosts).
 //
 //	luawasm-run [-v] artifact.wasm [args...]
 //
@@ -37,8 +39,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "luawasm-run: %v\n", err)
 		os.Exit(1)
 	}
-	e := testdiff.NewWasmEngine("run")
-	e.Precompiled = bin
+	e := testdiff.NewRunEngine("run", bin)
 	log := e.Run(testdiff.Case{
 		Name:   in, // arg[0] / chunkname: the path as typed
 		Dir:    dir,

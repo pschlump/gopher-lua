@@ -37,6 +37,22 @@ import (
 
 func u32[T int32 | int | uint32](v T) uint64 { return uint64(uint32(v)) }
 
+// NewRunEngine returns the wasm-backend engine for the standalone runners
+// (glua -W, luawasm-run): the wasmtime differential oracle by default, or
+// the wazero production engine (ledger row 32 — one blob, two hosts) when
+// GLUA_WASM_ENGINE=wazero. The _cli-tests WAZERO=1 leg selects it so the
+// black-box suite runs its wasm legs on the production engine unchanged.
+func NewRunEngine(name string, precompiled []byte) Engine {
+	if strings.EqualFold(os.Getenv("GLUA_WASM_ENGINE"), "wazero") {
+		e := NewWazeroEngine(name)
+		e.Precompiled = precompiled
+		return e
+	}
+	e := NewWasmEngine(name)
+	e.Precompiled = precompiled
+	return e
+}
+
 // WazeroEngine compiles and executes scripts through the wasm backend on
 // wazero (the production engine). Construction mirrors WasmEngine.
 type WazeroEngine struct {

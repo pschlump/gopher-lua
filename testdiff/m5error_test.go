@@ -11,12 +11,7 @@ import (
 	"testing"
 )
 
-// ledgeredErrSkips: suite cases whose divergence has a ruling (each skip
-// cites its row in docs/Lua-Wasm-Divergence-Ledger.md).
-var ledgeredErrSkips = map[string]string{
-	// (empty — rows 20's unclean unwind and 28's missing prefix were
-	// fixed with the call_body rebasing in M6; so00/so01/pc10 pass)
-}
+// ledgeredErrSkips lives in skips.go (shared with cmd/testdiff).
 
 func TestWasmErrorSuite(t *testing.T) {
 	dir := "../_wasm-err-tests"

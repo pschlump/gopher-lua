@@ -29,14 +29,16 @@ go test ./testdiff/ -run TestWasmFullMatrix -v   # run a single differential gat
 # main gates: TestWasmFullMatrix (_wasm-tests), TestWasmErrorSuite (_wasm-err-tests),
 #             TestWasmGluaFull (_glua-tests), TestCLuaConformance (_lua5.1-tests)
 
-# CLI differential runner (exit 1 on any diff)
+# CLI differential runner (exit 1 on any diff). wasm = wasmtime oracle
+# host; wazero = the pure-Go production engine (same blob — ledger row 32)
 go run ./cmd/testdiff -corpus _wasm-tests -engines interp,wasm
 go run ./cmd/testdiff -corpus _wasm-err-tests -engines interp,wasm
 go run ./cmd/testdiff -corpus _glua-tests -engines interp,clua
+go run ./cmd/testdiff -corpus _wasm-tests -engines interp,wazero   # production-engine legs
 
 # Compile / run wasm artifacts
 go run ./cmd/luawasmc [-o out.wasm] script.lua
-go run ./cmd/luawasm-run [-v] artifact.wasm [args...]
+go run ./cmd/luawasm-run [-v] artifact.wasm [args...]   # GLUA_WASM_ENGINE=wazero selects the production engine
 cmd/glua/glua -w out.wasm script.lua   # compile (or -e 'stat')
 cmd/glua/glua -W artifact.wasm         # run precompiled (also auto-detected by \x00asm magic)
 
@@ -45,7 +47,8 @@ runtime/build.sh            # rebuild lua51_sjlj.wasm → copies into testdiff/
 runtime/tests/run.sh        # native rt_* ABI unit tests: plain + ASan + UBSan
 
 # CLI black-box tests (wc-clone in Lua, interp vs wasm paths)
-cd _cli-tests && make
+cd _cli-tests && make                 # default: wasm legs on wasmtime
+cd _cli-tests && make test WAZERO=1   # M6b: wasm legs on the wazero production engine
 ```
 
 After rebuilding the runtime blob, run `go clean -testcache` — go-test caching can mask a stale embedded `lua51_sjlj.wasm`.

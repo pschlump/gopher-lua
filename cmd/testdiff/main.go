@@ -3,9 +3,10 @@
 //
 //	go run ./cmd/testdiff -corpus _glua-tests -engines interp,interp
 //
-// Exit code 1 on any diff. Engine names are currently interp (the
-// gopher-lua oracle); C-Lua-wasm (M2) and the wasm backend (M4) plug in
-// here without changing the invocation.
+// Exit code 1 on any diff. Engine names: interp (the gopher-lua oracle),
+// clua (stock C Lua 5.1 in wasm), wasm (the Lua→wasm backend on wasmtime,
+// the dev oracle host), wazero (the same backend on the pure-Go production
+// engine — M6b's engine-parity leg, ledger row 32).
 package main
 
 import (
@@ -34,8 +35,12 @@ func main() {
 			e := testdiff.NewWasmEngine(fmt.Sprintf("wasm-%c", 'a'+i))
 			e.SkipUnsupported = true
 			engines = append(engines, e)
+		case "wazero":
+			e := testdiff.NewWazeroEngine(fmt.Sprintf("wazero-%c", 'a'+i))
+			e.SkipUnsupported = true
+			engines = append(engines, e)
 		default:
-			fmt.Fprintf(os.Stderr, "unknown engine %q (known: interp, clua, wasm)\n", name)
+			fmt.Fprintf(os.Stderr, "unknown engine %q (known: interp, clua, wasm, wazero)\n", name)
 			os.Exit(2)
 		}
 	}
@@ -45,13 +50,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "load corpus: %v\n", err)
 		os.Exit(2)
 	}
-	cases, skippedList := testdiff.FilterSkips(cases, map[string]string{
-		// Ledgered divergences (docs/Lua-Wasm-Divergence-Ledger.md): the
-		// gopher message dialect (M5d) made error wording byte-exact, and
-		// the M6 stack-discipline fixes cured table.sort (row 10u was
-		// call_body's dangling base — sort grows the Lua stack across its
-		// nested luaD_calls). No skips remain for this corpus.
-	})
+	// the ledgered skip maps live in one place (skips.go) so this CLI leg
+	// and the go-test gates can never disagree about what is excluded
+	cases, skippedList := testdiff.FilterSkips(cases, testdiff.CorpusSkips(*corpus))
 	results := testdiff.RunCorpus(cases, engines)
 
 	diffs := 0

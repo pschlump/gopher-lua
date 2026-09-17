@@ -3,23 +3,12 @@ package testdiff
 // M5e gates: the backend over the full corpora, differentially against
 // the interpreter oracle. _wasm-tests is the opcode matrix; _glua-tests
 // is the fork's own conformance suite. Every skip cites its divergence
-// ledger row (docs/Lua-Wasm-Divergence-Ledger.md).
+// ledger row (docs/Lua-Wasm-Divergence-Ledger.md; the shared maps live
+// in skips.go so cmd/testdiff applies the same ones).
 
 import (
 	"testing"
 )
-
-// gluaWasmSkips: _glua-tests cases with a ruled divergence (each cites
-// its row in docs/Lua-Wasm-Divergence-Ledger.md).
-var gluaWasmSkips = map[string]string{
-	"coroutine.lua": "coroutines out of scope for the Redis subset — row 22",
-	"issues.lua":    "yield across C boundary (coroutines) — row 22",
-	"db.lua":        "debug.getinfo introspection over wasm frames — row 23",
-	"goto.lua":      "loadstring-mixed C-interpreted chunks — row 24",
-	"vm.lua":        "loadstring + gopher parser-error wording (register overflow) — row 24",
-	"math.lua":      "library-error wording/behavior (math.max arity text) — row 25",
-	"strings.lua":   "library-error wording/behavior (string.dump unsupported in the fork) — row 25",
-}
 
 // wasmGluaFull runs interp vs wasm over a corpus and fails on any
 // unruled divergence.

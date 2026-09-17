@@ -173,15 +173,16 @@ Available options are:
 
 // runWasm executes a precompiled wasm module on the wasm engine (the
 // luawasm-run path): args become the script's arg table (arg[1..n]),
-// PRINT/STDOUT events go to stdout, errors to stderr.
+// PRINT/STDOUT events go to stdout, errors to stderr. The engine is
+// wasmtime (the oracle) or, when GLUA_WASM_ENGINE=wazero, the pure-Go
+// production engine (ledger row 32) — the _cli-tests WAZERO=1 leg.
 func runWasm(bin []byte, path string, args []string) int {
 	dir, err := os.Getwd()
 	if err != nil {
 		fmt.Println(err.Error())
 		return 1
 	}
-	e := testdiff.NewWasmEngine("run")
-	e.Precompiled = bin
+	e := testdiff.NewRunEngine("run", bin)
 	log := e.Run(testdiff.Case{
 		Name:   path, // arg[0] / chunkname: the path as typed, like the source path
 		Dir:    dir,

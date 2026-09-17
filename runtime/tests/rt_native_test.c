@@ -42,6 +42,30 @@ int main(void) {
   rt_set_state((rt_addr)(uintptr_t)L);
   CHECK(rt_abi_version() == LUA_RT_ABI);
 
+  /* M6c sandbox: the dev build opens all libs, so rt_sandbox(1) must
+     remove exactly the lockdown list (m6 plan §4.3) and keep the rest */
+  {
+    static const char *killed[] = {"io",     "os",     "package", "require",
+                                   "module", "dofile", "loadfile", "load",
+                                   "loadstring", "debug", NULL};
+    int n, k;
+    luaL_openlibs(L); /* dev-flavor surface for the sandbox to remove */
+    n = rt_sandbox(1);
+    CHECK(n == 10); /* every listed global was present and got nil'd */
+    for (k = 0; killed[k]; k++) {
+      lua_getglobal(L, killed[k]);
+      CHECK(lua_isnil(L, -1));
+      lua_pop(L, 1);
+    }
+    lua_getglobal(L, "pcall");
+    CHECK(lua_isfunction(L, -1));
+    lua_pop(L, 1);
+    lua_getglobal(L, "string");
+    CHECK(lua_istable(L, -1));
+    lua_pop(L, 1);
+    CHECK(rt_sandbox(0) == -1); /* off (and NULL-state) refused */
+  }
+
   /* value construction */
   rt_mknumber(cc[0], 2.5);
   CHECK(ttisnumber(&c[0]) && nvalue(&c[0]) == 2.5);

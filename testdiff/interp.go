@@ -18,6 +18,9 @@ import (
 // of them can be diffed against each other (the M1 self-diff gate).
 type Interp struct {
 	name string
+	// Seed: host RNG seed for the run (0 → 42, the harness contract —
+	// M6c D5 determinism plumbing, mirrors the wasm engines' Seed).
+	Seed int64
 }
 
 // NewInterp returns an interpreter engine with the given display name.
@@ -43,7 +46,7 @@ func (e *Interp) Run(c Case) []string {
 		IncludeGoStackTrace: true,
 	})
 	defer L.Close()
-	installShim(L, emit)
+	installShim(L, emit, e.Seed)
 	// The C driver exposes arg = { [0] = chunkname } (luawasm.c); align the
 	// oracle so scripts touching the GLOBAL arg see the same surface. (The
 	// compat `arg` LOCAL is unaffected — NeedsArg is cleared when `...` is
@@ -85,7 +88,7 @@ func serializeGlobals(L *lua.LState) string {
 // equivalent and hooks print into the event log. The shim set is part of
 // the engine contract: every engine (interp today; C-Lua-wasm at M2 and
 // the backend at M4) must provide the same replacements.
-func installShim(L *lua.LState, emit func(event, payload string)) {
+func installShim(L *lua.LState, emit func(event, payload string), seed int64) {
 	// print → event log
 	printFn := func(L *lua.LState) int {
 		top := L.GetTop()
@@ -174,7 +177,10 @@ func installShim(L *lua.LState, emit func(event, payload string)) {
 	// srand(1) start. The oracle therefore replaces both functions with a
 	// per-run source. Every engine must provide this same shim (design
 	// doc §7); see the divergence ledger.
-	rng := rand.New(rand.NewSource(42))
+	if seed == 0 {
+		seed = 42 // harness contract: every run starts at seed 42
+	}
+	rng := rand.New(rand.NewSource(seed))
 	mathRandom := func(L *lua.LState) int {
 		switch L.GetTop() {
 		case 0:

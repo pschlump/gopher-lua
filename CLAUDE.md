@@ -43,7 +43,7 @@ cmd/glua/glua -w out.wasm script.lua   # compile (or -e 'stat')
 cmd/glua/glua -W artifact.wasm         # run precompiled (also auto-detected by \x00asm magic)
 
 # C runtime (needs wasi-sdk; default WASI_SDK=$HOME/wasi-sdk-dl/wasi-sdk-34.0-arm64-macos)
-runtime/build.sh            # rebuild lua51_sjlj.wasm → copies into testdiff/
+runtime/build.sh            # rebuild lua51_sjlj.wasm + lua51_prod.wasm → copies into testdiff/
 runtime/tests/run.sh        # native rt_* ABI unit tests: plain + ASan + UBSan
 
 # CLI black-box tests (wc-clone in Lua, interp vs wasm paths)

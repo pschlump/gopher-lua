@@ -212,6 +212,43 @@ void rt_set_state(rt_addr p) {
   rt_wasm_depth = 0;
 }
 
+/* ---- M6c: sandbox globals lockdown (host flag, m6 plan §4.3) ----
+**
+** rt_sandbox(1) nils the untrusted-script surface out of _G: io, os,
+** package, require, module, dofile, loadfile, load, loadstring, debug.
+** Kept: string/table/math, pcall/xpcall/error/assert/select/unpack,
+** collectgarbage, tostring/tonumber/type/rawget/rawset/rawequal/
+** setmetatable/getmetatable/ipairs/pairs/next, print (host shim).
+**
+** Applies to the state set by rt_set_state (host calls lnewstate →
+** rt_set_state → rt_sandbox). In the prod flavor (LUAWASM_PROD) the
+** libs/entries compile out entirely and every name is already absent —
+** rt_sandbox still runs (belt-and-suspenders) and returns 0. In the dev
+** blob it removes the opened surface at runtime, closing ledger row 24
+** by removal (no runtime compilation surface) wherever the host enables
+** it. Returns the number of globals that were actually present (and are
+** now nil) — dev opens 10, prod sees 0; tests pin both.
+*/
+static const char *const rt_sandbox_nil[] = {
+    "io",    "os",     "package", "require", "module", "dofile",
+    "loadfile", "load", "loadstring", "debug", NULL};
+
+int32_t rt_sandbox(int32_t on) {
+  int n = 0;
+  if (!on || curL == NULL) return -1;
+  for (const char *const *p = rt_sandbox_nil; *p != NULL; p++) {
+    lua_getglobal(curL, *p);
+    int was_there = !lua_isnil(curL, -1);
+    lua_pop(curL, 1);
+    if (was_there) {
+      lua_pushnil(curL);
+      lua_setglobal(curL, *p);
+      n++;
+    }
+  }
+  return n;
+}
+
 int32_t rt_err_pending(void) { return err_pending; }
 
 

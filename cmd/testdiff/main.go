@@ -6,7 +6,8 @@
 // Exit code 1 on any diff. Engine names: interp (the gopher-lua oracle),
 // clua (stock C Lua 5.1 in wasm), wasm (the Lua→wasm backend on wasmtime,
 // the dev oracle host), wazero (the same backend on the pure-Go production
-// engine — M6b's engine-parity leg, ledger row 32).
+// engine — M6b's engine-parity leg, ledger row 32), wazero-prod (the M6c
+// sandbox leg: the zero-wasi prod blob + rt_sandbox(1), ledger row 33).
 package main
 
 import (
@@ -39,8 +40,13 @@ func main() {
 			e := testdiff.NewWazeroEngine(fmt.Sprintf("wazero-%c", 'a'+i))
 			e.SkipUnsupported = true
 			engines = append(engines, e)
+		case "wazero-prod":
+			e := testdiff.NewWazeroEngine(fmt.Sprintf("wazero-prod-%c", 'a'+i))
+			e.SkipUnsupported = true
+			e.UseProdBlob()
+			engines = append(engines, e)
 		default:
-			fmt.Fprintf(os.Stderr, "unknown engine %q (known: interp, clua, wasm, wazero)\n", name)
+			fmt.Fprintf(os.Stderr, "unknown engine %q (known: interp, clua, wasm, wazero, wazero-prod)\n", name)
 			os.Exit(2)
 		}
 	}

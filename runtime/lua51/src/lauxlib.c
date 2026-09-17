@@ -524,6 +524,12 @@ LUALIB_API void luaL_unref (lua_State *L, int t, int ref) {
 ** =======================================================
 */
 
+#ifndef LUAWASM_PROD
+/* M6c: prod has no file loader (base_funcs drops loadfile/dofile), so the
+   whole FILE-based reader compiles out — its undefineds (fread/getc/
+   fclose/feof/ferror/ungetc/freopen) otherwise pull wasi-libc's stdio
+   cluster at link time, whose stderr/stdin FILE initializers embed ops
+   function pointers that table-root fd_write/fd_close imports. */
 typedef struct LoadF {
   int extraline;
   FILE *f;
@@ -593,6 +599,7 @@ LUALIB_API int luaL_loadfile (lua_State *L, const char *filename) {
   lua_remove(L, fnameindex);
   return status;
 }
+#endif /* !LUAWASM_PROD */
 
 
 typedef struct LoadS {
@@ -641,17 +648,24 @@ static void *l_alloc (void *ud, void *ptr, size_t osize, size_t nsize) {
 }
 
 
+#ifndef LUAWASM_PROD
+/* M6c: prod has no stdio — the address-taken panic is a table-rooted
+   fd_write edge. With atpanic not installed, G(L)->panic stays NULL and
+   the unprotected path traps instead (ldo.c). */
 static int panic (lua_State *L) {
   (void)L;  /* to avoid warnings */
   fprintf(stderr, "PANIC: unprotected error in call to Lua API (%s)\n",
                    lua_tostring(L, -1));
   return 0;
 }
+#endif
 
 
 LUALIB_API lua_State *luaL_newstate (void) {
   lua_State *L = lua_newstate(l_alloc, NULL);
+#ifndef LUAWASM_PROD
   if (L) lua_atpanic(L, &panic);
+#endif
   return L;
 }
 

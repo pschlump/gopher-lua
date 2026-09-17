@@ -42,7 +42,7 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -Wl,--export=rt_err_value_ptr -Wl,--export=rt_err_stage_value \
   -Wl,--export=rt_tail_stage -Wl,--export=rt_tail_clidx -Wl,--export=rt_tail_nargs \
   -Wl,--export=rt_tail_funcell -Wl,--export=rt_tail_restage \
-  -Wl,--export=rt_set_dialect \
+  -Wl,--export=rt_set_dialect -Wl,--export=rt_sandbox \
   -Wl,--export=lglobals"
 
 # ---- lua51_sjlj.wasm: native EH setjmp, runs on wasmtime ----
@@ -55,6 +55,34 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   $EXPORTS \
   -Wl,-z,stack-size=8388608 -Wl,--strip-all \
   -o lua51_sjlj.wasm luawasm.c rt_abi.c $SRC
+
+# ---- lua51_prod.wasm: M6c production flavor — zero wasi imports ----
+#
+# Same blob, same EH dialect, same ABI and exports (plus rt_sandbox) —
+# differs only by -DLUAWASM_PROD: package/io/os/debug libs, the
+# dofile/loadfile/load/loadstring base entries, stock print, tmpfile(),
+# and exit() compile out, leaving host.* as the only imports. The host
+# applies the globals lockdown via rt_sandbox(1) (rt_abi.c); a Go test
+# parses the artifact's import section and fails the build's gate if any
+# wasi_snapshot_preview1 import leaks back in.
+#
+# The io/os/package/debug lib sources are excluded from the prod link
+# outright: even dead-compiled, their object-level undefined symbols
+# (fopen/freopen/getc/exit/...) pull wasi-libc archive members, and the
+# preopen constructor that chain reaches is rooted in .init_array data —
+# a table slot function-GC cannot drop.
+
+PROD_SRC=$(ls lua51/src/*.c | grep -v -e /liolib.c -e /loslib.c -e /loadlib.c -e /ldblib.c -e /print.c)
+
+"$CC" --sysroot="$SYSROOT" \
+  -O2 -DNDEBUG -mexec-model=reactor -I. \
+  -DLUAWASM_SJLJ -DLUAWASM_PROD \
+  -ffunction-sections -fdata-sections \
+  -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
+  -lsetjmp \
+  $EXPORTS \
+  -Wl,-z,stack-size=8388608 -Wl,--strip-all \
+  -o lua51_prod.wasm luawasm.c rt_abi.c $PROD_SRC
 
 # ---- asyncify variants (documentation path; wazero-compatible) ----
 
@@ -79,7 +107,8 @@ if [ "$1" = "--with-asyncify" ]; then
 fi
 
 cp lua51_sjlj.wasm ../testdiff/lua51_sjlj.wasm
+cp lua51_prod.wasm ../testdiff/lua51_prod.wasm
 
-ls -la lua51_sjlj.wasm
+ls -la lua51_sjlj.wasm lua51_prod.wasm
 [ "$1" = "--with-asyncify" ] && ls -la selftest.wasm lua51.wasm
 exit 0

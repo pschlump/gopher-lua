@@ -196,6 +196,7 @@ static void emit_globals(lua_State *L) {
 }
 
 /* ---- deterministic environment map for os.getenv/os.setenv ---- */
+#ifndef LUAWASM_PROD /* os is a dev-engine surface; prod never opens it */
 
 typedef struct { char *k, *v; } envpair;
 static envpair envmap[8];
@@ -221,6 +222,7 @@ static void env_store(const char *k, const char *v) {
     envmap_n++;
   }
 }
+#endif /* !LUAWASM_PROD */
 
 /* ---- math.random trampoline: sequence lives in the Go host ---- */
 
@@ -252,6 +254,7 @@ static int g_randomseed(lua_State *L) {
 }
 
 /* ---- constant os.* stubs ---- */
+#ifndef LUAWASM_PROD /* dev engines only (prod: os lib never opened) */
 
 static void setfield(lua_State *L, const char *key, int value) {
   lua_pushstring(L, key);
@@ -421,12 +424,15 @@ static int g_setlocale(lua_State *L) {
   }
   return 1;
 }
+#endif /* !LUAWASM_PROD */
 
 /* WASI gaps: tmpfile/system are not provided. system returns -1 (the
    harness shims os.execute; corpus never calls it). tmpfile is backed by
    a unique deterministic name in the preopen FS (math.lua's io.tmpfile
    test needs a working file); the engine removes testdiff.tmp* after the
-   run. */
+   run. Both compile out of the prod flavor — tmpfile's fopen is a
+   path_open/fd_* import, and in prod nothing references either. */
+#ifndef LUAWASM_PROD
 static int tmpfile_counter = 0;
 FILE *tmpfile(void) {
   char name[64];
@@ -434,6 +440,44 @@ FILE *tmpfile(void) {
   return fopen(name, "w+");
 }
 int system(const char *cmd) { (void)cmd; return -1; }
+#else
+/* M6c (prod): lauxlib/liolib/loadlib still COMPILE their file paths (the
+   C sources are always all in the build), so their object-level undefined
+   fopen/freopen pull wasi-libc's fopen.c/freopen.c — and that chain ends
+   in preopens.c, whose constructor is rooted in .init_array data (a table
+   slot) that function-level GC cannot drop, dragging fd_close and the
+   fd_prestat_* imports back in. Defining the two symbols here stops the
+   archive pull at link time; the stubs themselves are never called (no
+   caller remains in prod) and are GC'd away. */
+FILE *fopen(const char *path, const char *mode) {
+  (void)path; (void)mode; return NULL;
+}
+FILE *freopen(const char *path, const char *mode, FILE *f) {
+  (void)path; (void)mode; (void)f; return NULL;
+}
+/* musl's lazy stdio-exit chain is the last fd_write/fd_close root: live
+   vfprintf → __towrite → (weak) __stdio_exit_needed → __stdio_exit.c.obj
+   → weak __stderr_used/__stdin_used/__stdout_used markers → the
+   stderr/stdin/stdout FILE structs, whose static initializers embed the
+   __stdio_write/__stdio_close ops pointers (table-rooted data). Strongly
+   defining the weak marker keeps those objects out of the prod link;
+   nothing in prod ever writes to a real FILE, so the no-op is safe. */
+void __stdio_exit_needed(void) {}
+/* musl's vfprintf/strtod reference the stderr/stdin/stdout FILE structs
+   directly (__stderr_FILE & co), which pulls the objects whose static
+   initializers embed the __stdio_write/__stdio_close ops — the remaining
+   fd_write/fd_close roots. Preempting the archive with zero FILE objects
+   keeps them out of the link. The references sit on error branches prod
+   never executes (all prod formatting goes through snprintf's string
+   FILE); if one ever ran, it would trap loudly on the zero struct rather
+   than silently write to a host fd. */
+/* struct _IO_FILE is opaque in the public header; generous aligned byte
+   arrays stand in for the FILE objects (link-time symbol preemption
+   only — libc indexes into them on error branches prod never runs). */
+char __stderr_FILE[256] __attribute__((aligned(8)));
+char __stdin_FILE[256] __attribute__((aligned(8)));
+char __stdout_FILE[256] __attribute__((aligned(8)));
+#endif
 
 /* ---- host I/O staging buffers ---- */
 
@@ -448,7 +492,9 @@ int32_t lnamebuf(void) { return (int32_t)(size_t)namebuf; }
 /* ---- exported driver API ---- */
 
 static void install_shims(lua_State *L) {
+#ifndef LUAWASM_PROD
   env_store("PATH", "/bin:/usr/bin");
+#endif
 
   lua_pushcfunction(L, g_print);
   lua_setglobal(L, "print");
@@ -460,6 +506,11 @@ static void install_shims(lua_State *L) {
   lua_setfield(L, -2, "randomseed");
   lua_pop(L, 1);
 
+#ifndef LUAWASM_PROD
+  /* prod flavor never opens the os lib — setfield into a nil `os' would
+     raise through the unprotected driver. The dev engines keep the
+     deterministic os.* surface (interp.go installShim is the normative
+     list). */
   lua_getglobal(L, "os");
   lua_pushcfunction(L, g_gettime);  lua_setfield(L, -2, "time");
   lua_pushcfunction(L, g_getclock); lua_setfield(L, -2, "clock");
@@ -470,6 +521,7 @@ static void install_shims(lua_State *L) {
   lua_pushcfunction(L, g_execute);  lua_setfield(L, -2, "execute");
   lua_pushcfunction(L, g_setlocale); lua_setfield(L, -2, "setlocale");
   lua_pop(L, 1);
+#endif
 }
 
 static lua_State *g_state; /* for lglobals after the entry returns */

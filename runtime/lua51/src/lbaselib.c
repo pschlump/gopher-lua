@@ -31,6 +31,10 @@ void rt_where_mark(void);
 ** model but changing `fputs' to put the strings at a proper place
 ** (a console window or a log file, for instance).
 */
+#ifndef LUAWASM_PROD
+/* M6c: the prod flavor's print is the host-event shim (luawasm.c g_print)
+   — the stock body's fputs chain is a fd_write import, so it compiles out
+   and install_shims supplies `print' unconditionally. */
 static int luaB_print (lua_State *L) {
   int n = lua_gettop(L);  /* number of arguments */
   int i;
@@ -51,6 +55,7 @@ static int luaB_print (lua_State *L) {
   fputs("\n", stdout);
   return 0;
 }
+#endif /* !LUAWASM_PROD */
 
 
 static int luaB_tonumber (lua_State *L) {
@@ -275,6 +280,12 @@ static int luaB_ipairs (lua_State *L) {
 }
 
 
+#ifndef LUAWASM_PROD
+/* M6c: the production flavor has no runtime compilation surface (ledger
+   row 24 closed by removal) and no file loader (luaL_loadfile's
+   fopen/freopen chain is what drags the fd_write and path_open wasi
+   imports in). dofile/loadfile/load/loadstring and their helpers compile
+   out below and are absent from base_funcs. */
 static int load_aux (lua_State *L, int status) {
   if (status == 0)  /* OK? */
     return 1;
@@ -341,6 +352,7 @@ static int luaB_dofile (lua_State *L) {
   lua_call(L, 0, LUA_MULTRET);
   return lua_gettop(L) - n;
 }
+#endif /* !LUAWASM_PROD */
 
 
 static int luaB_assert (lua_State *L) {
@@ -465,17 +477,23 @@ static int luaB_newproxy (lua_State *L) {
 static const luaL_Reg base_funcs[] = {
   {"assert", luaB_assert},
   {"collectgarbage", luaB_collectgarbage},
+#ifndef LUAWASM_PROD
   {"dofile", luaB_dofile},
+#endif
   {"error", luaB_error},
   {"gcinfo", luaB_gcinfo},
   {"getfenv", luaB_getfenv},
   {"getmetatable", luaB_getmetatable},
+#ifndef LUAWASM_PROD
   {"loadfile", luaB_loadfile},
   {"load", luaB_load},
   {"loadstring", luaB_loadstring},
+#endif
   {"next", luaB_next},
   {"pcall", luaB_pcall},
+#ifndef LUAWASM_PROD
   {"print", luaB_print},
+#endif
   {"rawequal", luaB_rawequal},
   {"rawget", luaB_rawget},
   {"rawset", luaB_rawset},

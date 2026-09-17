@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/pschlump/gopher-lua/wasm"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/experimental"
@@ -64,10 +65,41 @@ type WazeroEngine struct {
 	// SkipUnsupported: scripts using v1-unsupported opcodes produce a
 	// SKIP-UNSUPPORTED log instead of an engine error (corpus tests)
 	SkipUnsupported bool
+	// RtBin overrides the runtime blob (nil → embedded lua51_sjlj.wasm;
+	// the RTWASM env var still wins). The M6c gates pass lua51ProdWasm.
+	RtBin []byte
+	// Sandbox: call rt_sandbox(1) after rt_set_state — the M6c globals
+	// lockdown (ledger row 33) — and skip the io.flush drain (io is nil).
+	Sandbox bool
+	// Seed: host RNG seed for the run (0 → 42, the harness contract).
+	// Applied after lnewstate (which reseeds to 42 from the C side), so
+	// engines with the same Seed observe identical math.random streams.
+	Seed int64
 }
 
 // NewWazeroEngine returns a wazero-hosted wasm-backend engine.
 func NewWazeroEngine(name string) *WazeroEngine { return &WazeroEngine{name: name} }
+
+// UseProdBlob switches the engine to the embedded production blob with the
+// sandbox lockdown — the M6c "wazero-prod" configuration (ledger rows
+// 33-34): zero wasi imports, rt_sandbox(1) globals surface.
+func (e *WazeroEngine) UseProdBlob() {
+	e.RtBin = lua51ProdWasm
+	e.Sandbox = true
+}
+
+// moduleConfig wires the rt module's host-side stdio/fs surface: only a
+// WASI-importing blob gets the stdout capture and the corpus dir mount —
+// the prod blob gets neither (nothing to capture; no fs to mount).
+func moduleConfig(c Case, wasi bool, stdout *bytes.Buffer) wazero.ModuleConfig {
+	cfg := wazero.NewModuleConfig().WithName("rt")
+	if !wasi {
+		return cfg
+	}
+	return cfg.
+		WithStdout(stdout).WithStderr(stdout).
+		WithFSConfig(wazero.NewFSConfig().WithDirMount(c.Dir, "/"))
+}
 
 func (e *WazeroEngine) Name() string { return e.name }
 
@@ -99,7 +131,26 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	r := wazero.NewRuntimeWithConfig(ctx, rc)
 	defer r.Close(ctx)
 
-	wasi_snapshot_preview1.MustInstantiate(ctx, r)
+	// M6c: WASI is wired only when the blob actually imports it. The prod
+	// blob (lua51_prod.wasm) has zero wasi imports — if one ever leaks back
+	// in, instantiation below fails loudly on the unknown import (the
+	// Go-side artifact gate catches it even earlier).
+	rtBin := lua51SjljWasm
+	if e.RtBin != nil {
+		rtBin = e.RtBin
+	}
+	if p := os.Getenv("RTWASM"); p != "" {
+		if b, e := os.ReadFile(p); e == nil {
+			rtBin = b
+		}
+	}
+	blobNeedsWASI, err := wasm.HasWASIImports(rtBin)
+	if err != nil {
+		return []string{"ENGINE-ERROR\trt blob parse: " + err.Error()}
+	}
+	if blobNeedsWASI {
+		wasi_snapshot_preview1.MustInstantiate(ctx, r)
+	}
 
 	var stdout bytes.Buffer // wasi fd_write capture (replaces the temp file)
 	decoder := &CLua{}
@@ -136,7 +187,7 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	if e.NoopHosts {
 		eventFn = func(kind, ptr, length int32) {}
 	}
-	_, err := r.NewHostModuleBuilder("host").
+	_, err = r.NewHostModuleBuilder("host").
 		NewFunctionBuilder().WithFunc(eventFn).Export("event").
 		NewFunctionBuilder().WithFunc(func() float64 { return rng.Float64() }).Export("random01").
 		NewFunctionBuilder().WithFunc(func(lo, hi int32) int32 {
@@ -149,16 +200,8 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		return []string{"ENGINE-ERROR\thost module: " + err.Error()}
 	}
 
-	rtBin := lua51SjljWasm
-	if p := os.Getenv("RTWASM"); p != "" {
-		if b, e := os.ReadFile(p); e == nil {
-			rtBin = b
-		}
-	}
 	rtInst, err := r.InstantiateWithConfig(ctx, rtBin,
-		wazero.NewModuleConfig().WithName("rt").
-			WithStdout(&stdout).WithStderr(&stdout).
-			WithFSConfig(wazero.NewFSConfig().WithDirMount(c.Dir, "/")))
+		moduleConfig(c, blobNeedsWASI, &stdout))
 	if err != nil {
 		return []string{"ENGINE-ERROR\trt instantiate: " + err.Error()}
 	}
@@ -182,6 +225,12 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		return []string{"ENGINE-ERROR\tlnewstate: " + err.Error()}
 	}
 	Lv := int32(L[0])
+	// M6c: lnewstate just reseeded the host RNG to 42 (the C-side harness
+	// contract); apply the engine's seed on top so identically-seeded
+	// engines observe identical math.random streams (D5 determinism).
+	if e.Seed != 0 {
+		rng = rand.New(rand.NewSource(e.Seed))
+	}
 	ldostring := func(src, chunkname string, nres uint32) error {
 		in, err := call(rtInst, "linbuf")
 		if err != nil {
@@ -202,6 +251,15 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	// NULL-derefs land in mapped page 0 and surface as wild call_indirects
 	if _, err := call(rtInst, "rt_set_state", u32(Lv)); err != nil {
 		return []string{"ENGINE-ERROR\trt_set_state: " + err.Error()}
+	}
+	// M6c: the sandbox globals lockdown (ledger row 33) — nils io, os,
+	// package, require, module, dofile, loadfile, load, loadstring, debug
+	// out of _G on either blob (dev: runtime removal; prod: they never
+	// existed, the call is belt-and-suspenders and returns 0).
+	if e.Sandbox {
+		if _, err := call(rtInst, "rt_sandbox", 1); err != nil {
+			return []string{"ENGINE-ERROR\trt_sandbox: " + err.Error()}
+		}
 	}
 	// v1 GC stop: register cells are not GC roots (the M3 ABI obligation);
 	// the M6 cap+fresh-VM posture (ledger row 11) replaces arena lifecycle
@@ -265,8 +323,11 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		emit("GLOBALS", "<lglobals failed: "+err.Error()+">")
 	}
 	// Ledger row 29: best-effort io.flush before reading the capture (the
-	// driver returns without libc exit(), so the atexit flush never runs)
-	_ = ldostring("io.flush()", "=flush", 0)
+	// driver returns without libc exit(), so the atexit flush never runs).
+	// Skipped under Sandbox — io is nil there, the drain is a no-op error.
+	if !e.Sandbox {
+		_ = ldostring("io.flush()", "=flush", 0)
+	}
 
 	if out := stdout.Bytes(); len(out) > 0 {
 		for _, line := range bytes.Split(bytes.TrimRight(out, "\n"), []byte("\n")) {

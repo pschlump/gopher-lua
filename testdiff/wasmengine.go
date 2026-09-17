@@ -25,6 +25,7 @@ import (
 	"github.com/pschlump/gopher-lua"
 	"github.com/pschlump/gopher-lua/luawasm"
 	"github.com/pschlump/gopher-lua/parse"
+	"github.com/pschlump/gopher-lua/wasm"
 )
 
 // gcStop runs collectgarbage('stop') in the runtime state via the M2
@@ -175,6 +176,14 @@ type WasmEngine struct {
 	// SkipUnsupported: scripts using v1-unsupported opcodes produce a
 	// SKIP-UNSUPPORTED log instead of an engine error (corpus tests)
 	SkipUnsupported bool
+	// RtBin overrides the runtime blob (nil → embedded lua51_sjlj.wasm;
+	// the RTDBG env var still wins). M6c gates pass lua51ProdWasm.
+	RtBin []byte
+	// Sandbox: call rt_sandbox(1) after rt_set_state (M6c globals
+	// lockdown, ledger row 33) and skip the io.flush drain.
+	Sandbox bool
+	// Seed: host RNG seed (0 → 42); applied after lnewstate (D5).
+	Seed int64
 }
 
 // NewWasmEngine returns a wasm-backend engine with the given name.
@@ -235,9 +244,29 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 
 	rng := rand.New(rand.NewSource(42))
 	linker := wt.NewLinker(engine)
-	if err := linker.DefineWasi(); err != nil {
-		return []string{"ENGINE-ERROR\t" + err.Error()}
+
+	// M6c: blob selection + WASI wiring driven by the blob's own imports
+	// (prod blob = zero wasi imports; a leak fails instantiation loudly).
+	rtBin := lua51SjljWasm
+	if e.RtBin != nil {
+		rtBin = e.RtBin
 	}
+	if p := os.Getenv("RTDBG"); p != "" {
+		if b, e := os.ReadFile(p); e == nil {
+			rtBin = b
+		}
+	}
+	blobNeedsWASI, err := wasm.HasWASIImports(rtBin)
+	if err != nil {
+		return []string{"ENGINE-ERROR\trt blob parse: " + err.Error()}
+	}
+	var stdoutFile *os.File // non-nil iff the blob writes to wasi stdout
+	if blobNeedsWASI {
+		if err := linker.DefineWasi(); err != nil {
+			return []string{"ENGINE-ERROR\t" + err.Error()}
+		}
+	}
+
 	decoder := &CLua{}
 	eventFn := func(kind, ptr, length int32) {
 		if raw := memRead(ptr, length); raw != nil {
@@ -292,27 +321,24 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		return []string{"ENGINE-ERROR\t" + err.Error()}
 	}
 
-	wasi := wt.NewWasiConfig()
-	if err := wasi.PreopenDir(c.Dir, "/", true); err != nil {
-		return []string{"ENGINE-ERROR\t" + err.Error()}
-	}
-	stdoutFile, err := os.CreateTemp("", "wasmstdout-*")
-	if err != nil {
-		return []string{"ENGINE-ERROR\t" + err.Error()}
-	}
-	stdoutFile.Close()
-	defer os.Remove(stdoutFile.Name())
-	if err := wasi.SetStdoutFile(stdoutFile.Name()); err != nil {
-		return []string{"ENGINE-ERROR\t" + err.Error()}
-	}
-	store.SetWasi(wasi)
-
-	rtBin := lua51SjljWasm
-	if p := os.Getenv("RTDBG"); p != "" {
-		if b, e := os.ReadFile(p); e == nil {
-			rtBin = b
+	if blobNeedsWASI {
+		wasi := wt.NewWasiConfig()
+		if err := wasi.PreopenDir(c.Dir, "/", true); err != nil {
+			return []string{"ENGINE-ERROR\t" + err.Error()}
 		}
+		f, err := os.CreateTemp("", "wasmstdout-*")
+		if err != nil {
+			return []string{"ENGINE-ERROR\t" + err.Error()}
+		}
+		f.Close()
+		defer os.Remove(f.Name())
+		if err := wasi.SetStdoutFile(f.Name()); err != nil {
+			return []string{"ENGINE-ERROR\t" + err.Error()}
+		}
+		stdoutFile = f
+		store.SetWasi(wasi)
 	}
+
 	rtMod, err := wt.NewModule(engine, rtBin)
 	if err != nil {
 		return []string{"ENGINE-ERROR\t" + err.Error()}
@@ -356,10 +382,24 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	if err != nil {
 		return []string{"ENGINE-ERROR\tlnewstate: " + err.Error()}
 	}
+	// M6c: lnewstate just reseeded the host RNG to 42 (the C-side harness
+	// contract); apply the engine's seed on top so identically-seeded
+	// engines observe identical math.random streams (D5 determinism).
+	if e.Seed != 0 {
+		rng = rand.New(rand.NewSource(e.Seed))
+	}
 	// the ABI operates on this state (curL in rt_abi.c) — without it,
 	// NULL-derefs land in mapped page 0 and surface as wild call_indirects
 	if _, err := call(rtInst, "rt_set_state", L); err != nil {
 		return []string{"ENGINE-ERROR\trt_set_state: " + err.Error()}
+	}
+	// M6c: the sandbox globals lockdown (ledger row 33) — nils io, os,
+	// package, require, module, dofile, loadfile, load, loadstring, debug
+	// out of _G on either blob.
+	if e.Sandbox {
+		if _, err := call(rtInst, "rt_sandbox", 1); err != nil {
+			return []string{"ENGINE-ERROR\trt_sandbox: " + err.Error()}
+		}
 	}
 	// v1 GC stop: register cells are not GC roots (the M3 ABI obligation —
 	// a full GC-rooted frame arrives with the M6 arena lifecycle); any
@@ -456,11 +496,15 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		copy(mem[nameA:], []byte("=flush"))
 		_, _ = call(rtInst, "ldostring", L, int(in), len(src), int(nameA), 0)
 	}
-	eFlush()
+	if !e.Sandbox { // io is nil under the sandbox — nothing to drain
+		eFlush()
+	}
 
-	if out, err := os.ReadFile(stdoutFile.Name()); err == nil && len(out) > 0 {
-		for _, line := range bytes.Split(bytes.TrimRight(out, "\n"), []byte("\n")) {
-			emit("STDOUT", string(line))
+	if stdoutFile != nil {
+		if out, err := os.ReadFile(stdoutFile.Name()); err == nil && len(out) > 0 {
+			for _, line := range bytes.Split(bytes.TrimRight(out, "\n"), []byte("\n")) {
+				emit("STDOUT", string(line))
+			}
 		}
 	}
 	return log

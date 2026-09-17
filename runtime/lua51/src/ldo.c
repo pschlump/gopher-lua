@@ -106,6 +106,13 @@ void luaD_throw (lua_State *L, int errcode) {
       lua_unlock(L);
       G(L)->panic(L);
     }
+#ifdef LUAWASM_PROD
+    /* M6c: exit() would import proc_exit (the prod blob has zero wasi
+       imports). This branch is unreachable by construction — every export
+       runs under a protected region (M5 invariant) — so a trap is exactly
+       the loud failure we want if that invariant ever breaks. */
+    __builtin_trap();
+#endif
     exit(EXIT_FAILURE);
   }
 }

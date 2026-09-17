@@ -25,6 +25,14 @@ import (
 //go:embed lua51_sjlj.wasm
 var lua51SjljWasm []byte
 
+// lua51_prod.wasm — the M6c production flavor of the same blob: zero
+// wasi_snapshot_preview1 imports (host.* only), sandbox-ready libs
+// (base/table/string/math), rt_sandbox exported. The M6c gates
+// (m6c_test.go) parse this artifact's own bytes as a build gate.
+//
+//go:embed lua51_prod.wasm
+var lua51ProdWasm []byte
+
 // value-protocol tags (must match runtime/luawasm.c)
 const (
 	ptNil = iota

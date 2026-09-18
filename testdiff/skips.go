@@ -34,17 +34,10 @@ var gluaWasmSkips = map[string]string{
 }
 
 // wasmTestsSkips: _wasm-tests cases with a ruled divergence (each cites
-// its row in docs/Lua-Wasm-Divergence-Ledger.md).
-var wasmTestsSkips = map[string]string{
-	// M6e fuzzer find (luafuzz seed 778 case 41 → minimized): the
-	// while-condition shape (truthy-const or X) — fix pending row 41.
-	"whlc00.lua": "while-cond dead-TEST + long-jump pseudo mislowered — row 41",
-	"whlc01.lua": "while-cond dead-TEST + long-jump pseudo mislowered — row 41",
-	"whlc02.lua": "while-cond dead-TEST + long-jump pseudo mislowered — row 41",
-	"whlc03.lua": "const and/or chain in nested if silently ends the wasm log — row 41",
-	"nz00.lua":   "-0.0 constant corrupts metamethod-arith constant reads — row 42",
-	"nz01.lua":   "__call arg 0 read as -0 in certain constant-pool layouts — row 42",
-}
+// its row in docs/Lua-Wasm-Divergence-Ledger.md). Rows 41/42 were
+// fixed (branchPartner for the NOP'd jump partner; LNumber2I/ConstIndex
+// -0.0 sign) — whlc00-03 and nz00-01 were unskipped with the fix.
+var wasmTestsSkips = map[string]string{}
 
 // ledgeredErrSkips: _wasm-err-tests cases whose divergence has a ruling
 // (each skip cites its row in docs/Lua-Wasm-Divergence-Ledger.md).

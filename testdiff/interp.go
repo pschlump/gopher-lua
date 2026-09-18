@@ -227,7 +227,6 @@ func installShim(L *lua.LState, emit func(event, payload string), seed int64) {
 	}))
 }
 
-
 // daysFromCivil: days since 1970-01-01 from a civil date (Howard
 // Hinnant's algorithm — the same one luawasm.c uses, ledger row 5).
 func daysFromCivil(y, m, d int) int64 {

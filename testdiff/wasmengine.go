@@ -15,9 +15,11 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -465,12 +467,24 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	// statically (the base never moves) and the slice captured here on the
 	// main goroutine stays valid. The guest's back-edge polls read the
 	// flag and raise rt_deadline's ordinary (pcall-catchable) error.
+	//
+	// Teardown race (found by the M6e soak, ~4k cases in): a callback
+	// firing in the same instant the run returns used to write into the
+	// mapping AFTER the store was dropped — SIGTRAP, whole process down.
+	// The done flag + runtime.KeepAlive close the window: once the main
+	// call returns, new firings skip the write, and the mapping stays
+	// alive until Run itself returns.
+	var watchdogDone int32
+	var timer *time.Timer
 	if e.Deadline > 0 {
 		if a, err := call(rtInst, "rt_ctrl_addr"); err == nil {
 			flagAddr := uint32(toI32(a))
 			memBase := guestMem.UnsafeData(store)
-			timer := time.AfterFunc(e.Deadline, func() {
+			timer = time.AfterFunc(e.Deadline, func() {
 				// 4-byte little-endian 1 — one aligned store
+				if atomic.LoadInt32(&watchdogDone) != 0 {
+					return
+				}
 				b := memBase[flagAddr : flagAddr+4 : flagAddr+4]
 				b[0], b[1], b[2], b[3] = 1, 0, 0, 0
 			})
@@ -479,6 +493,14 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	}
 
 	status, err := call(scriptInst, "lua_main", frame)
+	// disarm the watchdog before any teardown path (the SIGTRAP race);
+	// KeepAlive holds the mapping live until Run itself returns
+	atomic.StoreInt32(&watchdogDone, 1)
+	if timer != nil {
+		timer.Stop()
+	}
+	runtime.KeepAlive(store)
+	runtime.KeepAlive(engine)
 	if err != nil {
 		return append(log, "ENGINE-ERROR\ttrap: "+err.Error())
 	}

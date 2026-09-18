@@ -150,57 +150,57 @@ func TestGenMatrixCorpus(t *testing.T) {
 	// ---- closures (M5a A4) ----
 	add("clo00", "local f = function() return 7 end\nprint(f())\n")
 	add("clo01", "local function add(a, b) return a + b end\nprint(add(3, 4))\n")
-	add("clo02", "local fs = {}\nfor i = 1, 3 do fs[i] = function() return i end end\nprint(fs[1](), fs[2](), fs[3]())\n") // distinct per-iteration closures
-	add("clo03", "local function counter()\n  local n = 0\n  return function() n = n + 1 return n end\nend\nlocal c = counter()\nc() c()\nprint(c())\n") // shared upvalue write-through
-	add("clo04", "local function outer()\n  local x = 1\n  local function inner() x = x + 10 return x end\n  inner() inner()\n  return x\nend\nprint(outer())\n") // write-through visible to creator
-	add("clo05", "local fs = {}\nfor i = 1, 3 do\n  local j = i * 10\n  fs[i] = function() return j end\nend\nprint(fs[1](), fs[2](), fs[3]())\n") // closure over body local
-	add("clo06", "local f\nfor i = 1, 3 do\n  f = function() return i end\n  if i == 1 then break end\nend\nprint(f())\n") // break closes the upvalue
-	add("clo07", "local function a()\n  local x = 1\n  return function()\n    local y = 2\n    return function() return x + y end\n  end\nend\nprint(a()()())\n") // nested 3 deep, captures at both levels
-	add("clo08", "local function make(n)\n  return function() return n * 2 end\nend\nprint(make(5)(), make(21)())\n") // capture a param
-	add("clo09", "local t = {}\nlocal function get() return t end\nget().k = 5\nprint(t.k)\n") // closure-returned table stays identity-equal
-	add("clo10", "local function fib(n)\n  if n < 2 then return n end\n  return fib(n - 1) + fib(n - 2)\nend\nprint(fib(10))\n") // self-recursive local (upvalue capture of own name)
-	add("clo11", "local function g() return 1, 2, 3 end\nlocal a, b, c = g()\nprint(a, b, c)\n") // multret from a closure
+	add("clo02", "local fs = {}\nfor i = 1, 3 do fs[i] = function() return i end end\nprint(fs[1](), fs[2](), fs[3]())\n")                                                                                                                       // distinct per-iteration closures
+	add("clo03", "local function counter()\n  local n = 0\n  return function() n = n + 1 return n end\nend\nlocal c = counter()\nc() c()\nprint(c())\n")                                                                                         // shared upvalue write-through
+	add("clo04", "local function outer()\n  local x = 1\n  local function inner() x = x + 10 return x end\n  inner() inner()\n  return x\nend\nprint(outer())\n")                                                                                // write-through visible to creator
+	add("clo05", "local fs = {}\nfor i = 1, 3 do\n  local j = i * 10\n  fs[i] = function() return j end\nend\nprint(fs[1](), fs[2](), fs[3]())\n")                                                                                               // closure over body local
+	add("clo06", "local f\nfor i = 1, 3 do\n  f = function() return i end\n  if i == 1 then break end\nend\nprint(f())\n")                                                                                                                       // break closes the upvalue
+	add("clo07", "local function a()\n  local x = 1\n  return function()\n    local y = 2\n    return function() return x + y end\n  end\nend\nprint(a()()())\n")                                                                                // nested 3 deep, captures at both levels
+	add("clo08", "local function make(n)\n  return function() return n * 2 end\nend\nprint(make(5)(), make(21)())\n")                                                                                                                            // capture a param
+	add("clo09", "local t = {}\nlocal function get() return t end\nget().k = 5\nprint(t.k)\n")                                                                                                                                                   // closure-returned table stays identity-equal
+	add("clo10", "local function fib(n)\n  if n < 2 then return n end\n  return fib(n - 1) + fib(n - 2)\nend\nprint(fib(10))\n")                                                                                                                 // self-recursive local (upvalue capture of own name)
+	add("clo11", "local function g() return 1, 2, 3 end\nlocal a, b, c = g()\nprint(a, b, c)\n")                                                                                                                                                 // multret from a closure
 	add("clo12", "local fns = {}\nfor i = 1, 2 do\n  for j = 1, 2 do\n    fns[#fns + 1] = function() return i * 10 + j end\n  end\nend\nlocal out = {}\nfor k, f in ipairs(fns) do out[k] = tostring(f()) end\nprint(table.concat(out, ' '))\n") // two captured loop vars
-	add("clo13", "local function apply(f, v) return f(v) end\nprint(apply(function(x) return x * 3 end, 5))\n") // closure as argument
+	add("clo13", "local function apply(f, v) return f(v) end\nprint(apply(function(x) return x * 3 end, 5))\n")                                                                                                                                  // closure as argument
 	// ---- C→wasm callbacks through the adapter (M5a A4 matrix) ----
-	add("cb00", "local t = {3, 1, 2}\ntable.sort(t, function(a, b) return a > b end)\nprint(t[1], t[2], t[3])\n") // sort comparator (was ledger row 10)
-	add("cb01", "print(('hello world'):gsub('o', function(m) return m:upper() end))\n") // gsub function replacement
-	add("cb02", "print(pcall(function() return 1, 2 end))\n") // pcall of a wasm closure
+	add("cb00", "local t = {3, 1, 2}\ntable.sort(t, function(a, b) return a > b end)\nprint(t[1], t[2], t[3])\n")                   // sort comparator (was ledger row 10)
+	add("cb01", "print(('hello world'):gsub('o', function(m) return m:upper() end))\n")                                             // gsub function replacement
+	add("cb02", "print(pcall(function() return 1, 2 end))\n")                                                                       // pcall of a wasm closure
 	add("cb03", "local mt = {__index = function(t, k) return k .. '!' end}\nlocal t = setmetatable({}, mt)\nprint(t.foo, t.bar)\n") // __index function metamethod
 	// ---- varargs (M5b) ----
 	add("var00", "local function f(...) return ... end\nprint(f(1, 2, 3))\n")
-	add("var01", "local function f(...) local a, b = ... return a, b end\nprint(f(7))\n") // nil-padding
+	add("var01", "local function f(...) local a, b = ... return a, b end\nprint(f(7))\n")   // nil-padding
 	add("var02", "local function f(...) return select('#', ...) end\nprint(f(nil, nil))\n") // count with nils
 	add("var03", "local function f(...) return select(-1, ...) end\nprint(f('a', 'b', 'c'))\n")
-	add("var04", "local function f(...) local t = {...} return #t, t[1], t[3] end\nprint(f('x', 'y', 'z'))\n") // constructor
+	add("var04", "local function f(...) local t = {...} return #t, t[1], t[3] end\nprint(f('x', 'y', 'z'))\n")         // constructor
 	add("var05", "local function g(a, b) return a + b end\nlocal function f(...) return g(...) end\nprint(f(3, 4))\n") // ... as sole call args
 	add("var06", "local t = {}\nfunction t.f(...) return ... end\nprint(t.f(1, 2))\n")
-	add("var07", "local function f(...) local n = 0\nfor _, v in ipairs({...}) do n = n + v end\nreturn n end\nprint(f(1, 2, 3))\n") // vararg iterator
-	add("var08", "local function f(...) return arg[1], arg.n end\nprint(f(7, 8))\n") // compat arg contents
-	add("var09", "local function f(a, ...) return a, select('#', ...) end\nprint(f(1, 2, 3))\n") // params + varargs split
-	add("var10", "local function f(...) return (...) end\nprint(f(9))\n") // single value
-	add("var11", "local function f(...) return ... end\nprint(f())\n") // zero varargs
-	add("var12", "local function f(...) local a, b = ... return b end\nprint(f(1, 2, 3))\n") // truncation
+	add("var07", "local function f(...) local n = 0\nfor _, v in ipairs({...}) do n = n + v end\nreturn n end\nprint(f(1, 2, 3))\n")                               // vararg iterator
+	add("var08", "local function f(...) return arg[1], arg.n end\nprint(f(7, 8))\n")                                                                               // compat arg contents
+	add("var09", "local function f(a, ...) return a, select('#', ...) end\nprint(f(1, 2, 3))\n")                                                                   // params + varargs split
+	add("var10", "local function f(...) return (...) end\nprint(f(9))\n")                                                                                          // single value
+	add("var11", "local function f(...) return ... end\nprint(f())\n")                                                                                             // zero varargs
+	add("var12", "local function f(...) local a, b = ... return b end\nprint(f(1, 2, 3))\n")                                                                       // truncation
 	add("var13", "local function h(...) return ... end\nlocal function g(...) return h(...) end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n") // const+varargs, two levels (the M5b scratch-collision repro)
 	add("var14", "local function f(...) return unpack({...}) end\nprint(f('p', 'q'))\n")
 	add("var15", "local function f(a, b, ...) return a, b, ... end\nprint(f(1, 2, 3, 4))\n") // mixed params + varargs through
-	add("var16", "local function f(...) return arg.n end\nprint(f())\n") // arg.n with zero varargs
+	add("var16", "local function f(...) return arg.n end\nprint(f())\n")                     // arg.n with zero varargs
 	add("var17", "local function f(...) return select(2, ...) end\nprint(f(1, 2, 3))\n")
 	add("var18", "local function f(...) return table.concat({...}, '-') end\nprint(f('a', 'b', 'c'))\n")
 	add("var19", "local function f(fmt, ...) return string.format(fmt, ...) end\nprint(f('%d-%s', 7, 'q'))\n") // leading fixed arg then varargs to a C function
-	add("var20", "local function f(...) local x = ... return arg == nil end\nprint(f(1, 2))\n") // ... used → the arg local is never filled (compile.go:1188 clears NeedsArg) → nil, not the global
+	add("var20", "local function f(...) local x = ... return arg == nil end\nprint(f(1, 2))\n")                // ... used → the arg local is never filled (compile.go:1188 clears NeedsArg) → nil, not the global
 	// ---- tailcalls (M5c: the trampoline; staged for wasm-closure callees,
 	// rt_call fallback otherwise) ----
-	add("tco00", "local function f(n) if n == 0 then return 'done' end return f(n-1) end\nprint(f(100000))\n") // flat 10⁵
+	add("tco00", "local function f(n) if n == 0 then return 'done' end return f(n-1) end\nprint(f(100000))\n")                                                                                                     // flat 10⁵
 	add("tco01", "local odd\nlocal function even(n) if n == 0 then return true end return odd(n-1) end\nfunction odd(n) if n == 0 then return false end return even(n-1) end\nprint(even(100001), odd(100001))\n") // mutual (pre-declared locals)
-	add("tco02", "local function f(x) return print(x) end\nf('tp')\n") // C-function tailcall → rt_call fallback
-	add("tco03", "local acc = 0\nlocal function f(n) acc = acc + 1 if n == 0 then return acc end return f(n-1) end\nprint(f(50000))\n") // upvalue writes across the chain
-	add("tco04", "local function g(...) return ... end\nlocal function f(...) return g(...) end\nprint(f(1, 2, 3))\n") // vararg tailcall
-	add("tco05", "local function add(a, b) return a + b end\nlocal function go(x) return add(x, x) end\nprint(go(21))\n") // multi-arg staged tailcall
-	add("tco06", "local function f(n) if n == 0 then error('deep') end return f(n-1) end\nprint(pcall(f, 10000))\n") // error through a 10⁴ staged chain (message heads compared; wording is row 9 → skip-annotated if it diverges)
-	add("tco07", "local mt = {__call = function(self, n) if n == 0 then return 'cd' end return self(n-1) end}\nlocal f = setmetatable({}, mt)\nprint(f(5))\n") // __call chain, shallow
-	add("tco08", "local function g(...) return ... end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n") // const+varargs tailcall
-	add("tco09", "local mt = {__call = function(self, n) if n == 0 then return 'cd' end return self(n-1) end}\nlocal f = setmetatable({}, mt)\nprint(f(120))\n") // deep __call+tailcall chain (row 18 pin — fixed with row 31's call_body rebasing; 120 < RTW_MAX_DEPTH=150, whose depth divergence is row 20)
+	add("tco02", "local function f(x) return print(x) end\nf('tp')\n")                                                                                                                                             // C-function tailcall → rt_call fallback
+	add("tco03", "local acc = 0\nlocal function f(n) acc = acc + 1 if n == 0 then return acc end return f(n-1) end\nprint(f(50000))\n")                                                                            // upvalue writes across the chain
+	add("tco04", "local function g(...) return ... end\nlocal function f(...) return g(...) end\nprint(f(1, 2, 3))\n")                                                                                             // vararg tailcall
+	add("tco05", "local function add(a, b) return a + b end\nlocal function go(x) return add(x, x) end\nprint(go(21))\n")                                                                                          // multi-arg staged tailcall
+	add("tco06", "local function f(n) if n == 0 then error('deep') end return f(n-1) end\nprint(pcall(f, 10000))\n")                                                                                               // error through a 10⁴ staged chain (message heads compared; wording is row 9 → skip-annotated if it diverges)
+	add("tco07", "local mt = {__call = function(self, n) if n == 0 then return 'cd' end return self(n-1) end}\nlocal f = setmetatable({}, mt)\nprint(f(5))\n")                                                     // __call chain, shallow
+	add("tco08", "local function g(...) return ... end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n")                                                                                          // const+varargs tailcall
+	add("tco09", "local mt = {__call = function(self, n) if n == 0 then return 'cd' end return self(n-1) end}\nlocal f = setmetatable({}, mt)\nprint(f(120))\n")                                                   // deep __call+tailcall chain (row 18 pin — fixed with row 31's call_body rebasing; 120 < RTW_MAX_DEPTH=150, whose depth divergence is row 20)
 
 	t.Logf("wrote %d cases to %s", len(cases), dir)
 }

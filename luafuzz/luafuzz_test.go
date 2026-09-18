@@ -352,17 +352,12 @@ func TestLuafuzzSelfDiff(t *testing.T) {
 }
 
 // TestLuafuzzWasmMini: the interp-vs-wasm same-day-bug leg over a
-// fresh generated slice. SKIPPED while backend rows 41/42 are open —
-// the M6e soak found layout-dependent miscompiles (const and/or
-// chains in conditions skip bodies / silently end runs; __call arg 0
-// read as -0 in certain pool layouts) that make generated slices
-// diverge well beyond the pinned corpus cases. Un-skip when those
-// rows close; the soak clock cannot start before then either.
+// fresh generated slice (short-skipped: the wasmtime engine is slow to
+// instantiate per case).
 func TestLuafuzzWasmMini(t *testing.T) {
 	if testing.Short() {
 		t.Skip("heavy: wasmtime per-case instantiation (CI -short skips)")
 	}
-	t.Skip("backend rows 41/42 open (M6e findings) — un-skip when fixed")
 	engines, err := BuildEngines([]string{"interp", "wasm"}, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)

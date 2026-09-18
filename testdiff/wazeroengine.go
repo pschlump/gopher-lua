@@ -28,6 +28,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pschlump/gopher-lua/wasm"
@@ -202,8 +203,8 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		NewFunctionBuilder().WithFunc(eventFn).Export("event").
 		NewFunctionBuilder().WithFunc(func() float64 { return rng.Float64() }).Export("random01").
 		NewFunctionBuilder().WithFunc(func(lo, hi int32) int32 {
-			return int32(rng.Intn(int(hi-lo+1)) + int(lo))
-		}).Export("randomint").
+		return int32(rng.Intn(int(hi-lo+1)) + int(lo))
+	}).Export("randomint").
 		NewFunctionBuilder().WithFunc(func(seed int64) { rng = rand.New(rand.NewSource(seed)) }).Export("randomseed").
 		NewFunctionBuilder().WithFunc(dispatch).Export("wasm_dispatch").
 		Instantiate(ctx)
@@ -318,10 +319,15 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	// linear memory at the control-block flag (wazero's Memory.Write is a
 	// plain buffer copy; no engine state touched, safe off-thread). The
 	// guest's back-edge polls raise rt_deadline's ordinary error.
+	var watchdogDone int32
 	if e.Deadline > 0 {
 		if a, err := call(rtInst, "rt_ctrl_addr"); err == nil {
 			flagAddr := uint32(a[0])
 			timer := time.AfterFunc(e.Deadline, func() {
+				// teardown race: skip once the run has returned (M6e soak)
+				if atomic.LoadInt32(&watchdogDone) != 0 {
+					return
+				}
 				_ = mem.Write(flagAddr, deadlineFlagLE)
 			})
 			defer timer.Stop()

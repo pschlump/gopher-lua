@@ -633,9 +633,16 @@ func (ls *LState) closeAllUpvalues() { // +inline-start
 } // +inline-end
 
 func (ls *LState) raiseError(level int, format string, args ...interface{}) {
-	if !ls.hasErrorFunc {
-		ls.closeAllUpvalues()
-	}
+	// NOTE: upvalues are NOT closed here. The old blanket
+	// closeAllUpvalues() also closed the upvalues of frames that
+	// SURVIVE the unwind (C Lua closes only above the pcall boundary,
+	// luaD_pcall's luaF_close(L, old_base)) — so after a caught error,
+	// a surviving closure's SETUPVAL wrote the closed copy while the
+	// owning frame's register kept the stale value (fuzzer find, row
+	// 44: pcall-then-upvalue-write lost the write on interp, wasm
+	// matched stock C). PCall's recovery closes exactly the dying
+	// frames' upvalues (closeUpvalues(base)); upvalues are index-based,
+	// so nothing dangles between raise and recover.
 	message := format
 	if len(args) > 0 {
 		message = fmt.Sprintf(format, args...)
@@ -1522,9 +1529,8 @@ func (ls *LState) Error(lv LValue, level int) {
 	if str, ok := lv.(LString); ok {
 		ls.raiseError(level, "%s", string(str))
 	} else {
-		if !ls.hasErrorFunc {
-			ls.closeAllUpvalues()
-		}
+		// non-string error values: no raise-time upvalue close — see
+		// raiseError's note (row 44); PCall's recovery owns the close
 		ls.Push(lv)
 		ls.Panic(ls)
 	}
@@ -1827,6 +1833,13 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 		ls.hasErrorFunc = false
 		rcv := recover()
 		if rcv != nil {
+			// close exactly the dying frames' upvalues (register index
+			// >= base — every frame the pcall pushed lives at or above
+			// it; surviving frames keep theirs open, matching C Lua's
+			// luaD_pcall luaF_close(L, old_base)). Raise no longer
+			// closes (row 44); without this, recovered slots would be
+			// reused while stale open upvalues still alias them.
+			ls.closeUpvalues(base)
 			if _, ok := rcv.(*ApiError); !ok {
 				err = newApiErrorS(ApiErrorPanic, fmt.Sprint(rcv))
 				if ls.Options.IncludeGoStackTrace {
@@ -1845,6 +1858,8 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 					ls.Panic = oldpanic
 					rcv := recover()
 					if rcv != nil {
+						// the errfunc itself panicked — its frames die too
+						ls.closeUpvalues(base)
 						if _, ok := rcv.(*ApiError); !ok {
 							err = newApiErrorS(ApiErrorPanic, fmt.Sprint(rcv))
 							if ls.Options.IncludeGoStackTrace {

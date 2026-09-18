@@ -1,8 +1,9 @@
--- M6e fuzz find (row 42): the mere presence of a -0.0 CONSTANT in the
--- chunk corrupts the constant index a metamethod's arithmetic reads —
--- t(0) with __call returning x*2 gives -0 on wasm (it read the -0.0
--- kcell instead of the 2), 0 on interp. Any -0.0 literal anywhere in
--- the chunk triggers it; computed -0.0 does not.
+-- M6e fuzz find (row 42), FIXED: this looked like constant-pool
+-- corruption but was two upstream fork bugs — LNumber2I canonicalized
+-- every computed -0.0 to +0.0, and ConstIndex merged the 0 literal
+-- onto the -0.0 pool slot, so t(0) actually passed -0.0. Interp then
+-- printed 0 (canonicalized), wasm -0 (stock C behavior). Both fixed;
+-- this pins the agreement.
 local t2 = {-0.0, 1, -0.0}
 local t = setmetatable({}, { __call = function(s, x) return x * 2 end })
 print(t(0))

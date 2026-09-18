@@ -25,12 +25,20 @@
 //	        < 2^31, tonumber over plain-integer strings only, no
 //	        zero-arg math.max, no string.dump, select index ≥ 1)
 //	row 33: no io/os surface (prod sandbox nils it; dev shim covers it)
-//	row 38: no non-finite number→string coercion (tostring/.. of
-//	        ±inf/nan; math.huge is finite in the fork, infinite in C)
+//	row 38: no non-finite/precision-cutoff number→string coercion in
+//	        `..`/tostring/table.concat operands (safeNumStrPool;
+//	        math.huge is finite in the fork, infinite in C)
 //	row 39: pairs only over dense sequences (hash-part iteration order
 //	        differs: interp sorted vs C ltable slot order)
+//	row 40: binary-arith operands never scalar-local/t[k]/call reads —
+//	        the "coerced-type" error-text corner is an open dialect gap
 //	§8.2:   # only over dense sequences (border semantics unspecified
 //	        with holes/trailing nils)
+//
+// Rows 41/42 (condition-chain mislowering; -0.0 sign loss) are FIXED —
+// their shapes (const and/or conditions, -0.0 everywhere arithmetically)
+// are back in the fuzz surface and pinned by _wasm-tests whlc00-03,
+// nz00-01.
 //
 // The M6d deadline is armed on every run as the safety net: guarded
 // loops should never need it, a both-engine expiry is DL-TIE (neutral),
@@ -87,8 +95,14 @@ func Generate(masterSeed int64, idx int) []byte {
 
 type tblInfo struct {
 	name  string
-	dense bool // dense sequence: constructor 1..n or insert-built (#, pairs, ipairs safe)
+	dense bool // dense array part: constructor 1..n or insert-built (#/ipairs safe)
 	hasMT bool
+	// pairsable: never gains a hash key (sequence constructor, only
+	// table.insert appends since). pairs order over an array part with
+	// ≤1 hash key is deterministic across engines; ≥2 hash keys is the
+	// row-39 iteration-order divergence — any t[k]= / t.ident= write
+	// that can add a hash key clears the flag.
+	pairsable bool
 }
 
 type fnInfo struct {
@@ -117,6 +131,62 @@ type gen struct {
 	scalars []string
 	tables  []tblInfo
 	funcs   []fnInfo
+
+	// loopDepth: active loop nesting. Bounds scale with depth — the
+	// product across a nest must stay far under the case deadline
+	// (interp finishes ~5M iterations inside 1.5 s; the wasm side pays
+	// the rt_* ABI per operation and does not — the first soak filed
+	// that as a HANG before this budget existed).
+	loopDepth int
+
+	// iterTables: tables under an active pairs/ipairs loop — assigning
+	// NEW keys during traversal is unspecified (Lua 5.1 manual: only
+	// modifying existing fields is allowed) and the engines legitimately
+	// differ (interp visited the added key, C's rehashing next did not —
+	// found by the fuzzer, minimized from soak case 59). Key-assignment
+	// to these tables is suppressed while the loop is open.
+	iterTables []string
+}
+
+func (g *gen) isIterated(name string) bool {
+	for _, n := range g.iterTables {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// clearPairsable: a key write that can add a hash key bans the table
+// from later pairs iteration (row 39).
+func (g *gen) clearPairsable(name string) {
+	for i := range g.tables {
+		if g.tables[i].name == name {
+			g.tables[i].pairsable = false
+		}
+	}
+}
+
+// pickNonIteratedTable: a table not under an active pairs/ipairs loop
+// (key-assignment to the iterated table itself is the unspecified
+// mutation corner). Nil when every in-scope table is being iterated.
+func (g *gen) pickNonIteratedTable() *tblInfo {
+	if len(g.tables) == 0 {
+		return nil
+	}
+	for try := 0; try < 4; try++ {
+		t := g.pickT()
+		if !g.isIterated(t.name) {
+			return &t
+		}
+	}
+	for i := len(g.tables) - 1; i >= 0; i-- {
+		if !g.isIterated(g.tables[i].name) {
+			t := g.tables[i]
+			return &t
+		}
+	}
+	return nil
 }
 
 // ---- emit helpers ----
@@ -158,11 +228,13 @@ func (g *gen) restore(m scopeMark) {
 
 var numPool = []string{
 	"0", "1", "2", "3", "5", "7", "10", "42", "100", "255", "256", "1000",
-	"65536", "0.5", "-1", "-2", "-2.5", "1e3", "1e15", "1e-9",
+	"65536", "0.5", "-1", "-2", "-2.5", "-0.0", "1e3", "1e15", "1e-9",
 	"0.1", "3.5", "1e308", "9007199254740993",
-	// -0.0 removed (row 42): any -0.0 constant in the chunk corrupts
-	// metamethod-arith constant reads until the backend fix lands
-	// (pinned by _wasm-tests/nz00.lua)
+	// -0.0 restored with the row-42 fixes (LNumber2I sign preservation +
+	// ConstIndex keeping 0 and -0.0 distinct): computed negative zeros
+	// now agree across engines. It stays out of concat/tostring operand
+	// position (safeNumStrPool) — that's the ruled row-38 formatting
+	// divergence.
 }
 
 // intPool: %d-format-safe integers (< 2^31, row 25) and loop bounds.
@@ -245,19 +317,11 @@ func (g *gen) num(d int) string {
 	switch r := g.rnd.Intn(20); {
 	case r < 6:
 		op := g.pick([]string{"+", "-", "*", "/", "%", "^"})
-		l, rr := g.arithOperand(), g.arithOperand()
-		l, rr = noFoldNegZero(op, l, rr)
-		return fmt.Sprintf("(%s %s %s)", l, op, rr)
+		return fmt.Sprintf("(%s %s %s)", g.arithOperand(), op, g.arithOperand())
 	case r < 8:
 		// operand parenthesized: a pool literal like "-2" after the
-		// unary minus would render "(--2)" — a comment, not an expr;
-		// and a zero operand would fold to a -0.0 constant (row 42)
-		for {
-			inner := g.num(d - 1)
-			if inner != "0" && inner != "0.0" {
-				return fmt.Sprintf("(-(%s))", inner)
-			}
-		}
+		// unary minus would render "(--2)" — a comment, not an expr
+		return fmt.Sprintf("(-(%s))", g.num(d-1))
 	case r < 10:
 		if len(g.tables) > 0 {
 			t := g.pickT()
@@ -308,25 +372,6 @@ func (g *gen) arithOperand() string {
 	default:
 		return g.pick(numPool)
 	}
-}
-
-// noFoldNegZero: constFold (compile.go) evaluates constant arith at
-// compile time — `0 * -1` / `0 % -1` would fold to a -0.0 CONSTANT,
-// and any -0.0 constant in the pool trips row 42. Pairing a zero
-// literal with a negative literal under * / % / ^ is rewritten to a
-// positive operand (folding to +0 instead).
-func noFoldNegZero(op, l, r string) (string, string) {
-	switch op {
-	case "*", "%", "^":
-		zr := func(s string) bool { return s == "0" || s == "0.0" || s == "-0" }
-		if zr(l) && strings.HasPrefix(r, "-") {
-			return l, strings.TrimPrefix(r, "-")
-		}
-		if zr(r) && strings.HasPrefix(l, "-") {
-			return strings.TrimPrefix(l, "-"), r
-		}
-	}
-	return l, r
 }
 
 // str: a string-valued expression.
@@ -403,38 +448,9 @@ func (g *gen) boolExpr(d int) string {
 	case r < 6:
 		return fmt.Sprintf("(not %s)", g.anyScalar(d-1))
 	case r < 8:
-		// row 41: and/or operands never bare literals — constant
-		// chains mislower in condition position (skipped loop bodies,
-		// silent early exits)
-		return fmt.Sprintf("(%s and %s)", g.nonConstBool(d-1), g.nonConstBool(d-1))
+		return fmt.Sprintf("(%s and %s)", g.anyScalar(d-1), g.anyScalar(d-1))
 	default:
-		return fmt.Sprintf("(%s or %s)", g.nonConstBool(d-1), g.nonConstBool(d-1))
-	}
-}
-
-// nonConstBool: a boolean expression with at least one runtime value —
-// scalar ref, comparison, or not-of-those. Literal-only shapes fold to
-// constants and hit the row-41 dead-TEST mislowering in condition
-// position; pinned by _wasm-tests/whlc00-03 until the backend fix.
-func (g *gen) nonConstBool(d int) string {
-	switch g.rnd.Intn(4) {
-	case 0:
-		if len(g.scalars) > 0 {
-			return g.pick(g.scalars)
-		}
-		fallthrough
-	case 1:
-		op := g.pick([]string{"==", "~=", "<", "<=", ">", ">="})
-		if g.rnd.Intn(4) == 0 {
-			return fmt.Sprintf("(%s %s %s)", g.str(d-1), op, g.str(d-1))
-		}
-		return fmt.Sprintf("(%s %s %s)", g.num(d-1), op, g.num(d-1))
-	case 2:
-		inner := g.nonConstBool(d - 1)
-		return fmt.Sprintf("(not %s)", inner)
-	default:
-		op := g.pick([]string{"==", "~=", "<", "<=", ">", ">="})
-		return fmt.Sprintf("(%s %s %s)", g.num(d-1), op, g.num(d-1))
+		return fmt.Sprintf("(%s or %s)", g.anyScalar(d-1), g.anyScalar(d-1))
 	}
 }
 
@@ -610,11 +626,12 @@ func (g *gen) stmtAssign() {
 		}
 		g.linef("%s = %s", g.pick(g.scalars), g.anyScalar(1))
 	case r < 7:
-		if len(g.tables) == 0 {
+		t := g.pickNonIteratedTable()
+		if t == nil {
 			g.stmtLocalDecl()
 			return
 		}
-		t := g.pickT()
+		g.clearPairsable(t.name)
 		if g.rnd.Intn(2) == 0 {
 			g.linef("%s[%s] = %s", t.name, g.pick(intPool), g.anyScalar(1))
 		} else {
@@ -662,10 +679,19 @@ func (g *gen) blockBody(n int) {
 
 func (g *gen) stmtNumFor() {
 	g.spend(2)
+	if g.loopDepth >= 3 {
+		g.stmtPrint() // nest cap — the iteration product must stay bounded
+		return
+	}
 	iv := g.newFor()
 	a := g.pick(intPool)
 	k := g.pick([]string{"0", "3", "5", "10", "20"})
-	if g.rnd.Intn(6) == 0 { // float flavor
+	if g.loopDepth == 1 {
+		k = g.pick([]string{"0", "2", "3"})
+	} else if g.loopDepth == 2 {
+		k = g.pick([]string{"0", "1", "2"})
+	}
+	if g.rnd.Intn(6) == 0 && g.loopDepth == 0 { // float flavor
 		g.linef("for %s = 0, 2.5, 0.5 do", iv)
 	} else if g.rnd.Intn(2) == 0 {
 		g.linef("for %s = %s, %s, -1 do", iv, a, k) // downward
@@ -674,7 +700,9 @@ func (g *gen) stmtNumFor() {
 	}
 	m := g.mark()
 	g.push()
+	g.loopDepth++
 	g.blockBody(1 + g.rnd.Intn(2))
+	g.loopDepth--
 	g.linef("print(%s, %s)", iv, iv)
 	g.pop()
 	g.restore(m)
@@ -683,26 +711,34 @@ func (g *gen) stmtNumFor() {
 
 func (g *gen) stmtGenFor() {
 	g.spend(2)
+	if g.loopDepth >= 3 {
+		g.stmtPrint() // nest cap
+		return
+	}
 	if len(g.tables) == 0 {
 		g.stmtTableDef()
 	}
 	t := g.pickT()
-	if !t.dense {
+	if !t.dense || !t.pairsable {
 		// row 39: build a fresh dense sequence instead
 		name := g.newTableN()
-		g.tables = append(g.tables, tblInfo{name: name, dense: true})
+		g.tables = append(g.tables, tblInfo{name: name, dense: true, pairsable: true})
 		g.linef("local %s = {%s, %s, %s}", name, g.lit(), g.lit(), g.lit())
-		t = tblInfo{name: name, dense: true}
+		t = tblInfo{name: name, dense: true, pairsable: true}
 	}
 	fn := "ipairs"
 	if g.rnd.Intn(3) == 0 {
-		fn = "pairs" // dense sequence → identical order across engines
+		fn = "pairs" // hash-free sequence → identical order across engines
 	}
 	g.linef("for kk%d, vv%d in %s(%s) do", g.nFor, g.nFor, fn, t.name)
 	m := g.mark()
 	g.push()
+	g.iterTables = append(g.iterTables, t.name)
+	g.loopDepth++
 	g.linef("print(kk%d, vv%d)", g.nFor, g.nFor)
 	g.blockBody(1)
+	g.loopDepth--
+	g.iterTables = g.iterTables[:len(g.iterTables)-1]
 	g.pop()
 	g.restore(m)
 	g.linef("end")
@@ -711,14 +747,23 @@ func (g *gen) stmtGenFor() {
 
 func (g *gen) stmtWhile() {
 	g.spend(2)
+	if g.loopDepth >= 3 {
+		g.stmtPrint() // nest cap
+		return
+	}
 	guard := g.newGuard()
 	limit := g.pick([]string{"3", "5", "7", "12", "30"})
+	if g.loopDepth == 2 {
+		limit = "3"
+	}
 	g.linef("local %s = 0", guard)
 	g.linef("while %s do", g.boolExpr(1))
 	m := g.mark()
 	g.push()
+	g.loopDepth++
 	g.linef("%s = %s + 1", guard, guard)
 	g.blockBody(1 + g.rnd.Intn(2))
+	g.loopDepth--
 	g.linef("if %s > %s then break end", guard, limit)
 	g.pop()
 	g.restore(m)
@@ -744,9 +789,17 @@ func (g *gen) stmtRepeat() {
 }
 
 // stmtPcall: pcall-wrapped core-error corner; prints ok + caught value.
+// Error-raising pcalls are throttled by loop depth: the raise path is
+// the expensive part (Go panic/recover vs the runtime's SJLJ staging
+// ≈5-10× slower), and a pcall-of-error inside a 100k-iteration nest
+// deadlines the wasm leg while interp finishes — a HANG finding that
+// is throughput, not correctness (fuzzer find, first 10k soak).
 func (g *gen) stmtPcall() {
 	g.spend(1)
 	risky := g.riskyExpr()
+	if g.loopDepth >= 2 || (g.loopDepth == 1 && g.rnd.Intn(4) != 0) {
+		risky = g.anyScalar(0) // pcall machinery still runs, no raise
+	}
 	g.linef("do")
 	m := g.mark()
 	g.push()
@@ -907,6 +960,7 @@ func (g *gen) stmtTableDef() {
 	g.spend(1)
 	name := g.newTableN()
 	dense := false
+	pairsable := false
 	switch g.rnd.Intn(3) {
 	case 0: // dense sequence
 		n := 2 + g.rnd.Intn(4)
@@ -916,6 +970,7 @@ func (g *gen) stmtTableDef() {
 		}
 		g.linef("local %s = {%s}", name, strings.Join(vals, ", "))
 		dense = true
+		pairsable = true
 	case 1: // hash-only string keys (never pairs/#-ed)
 		g.linef("local %s = {[%q] = %s, [%q] = %s}", name,
 			strings.Trim(g.pick(identPool), `"`), g.lit(),
@@ -926,13 +981,13 @@ func (g *gen) stmtTableDef() {
 			strings.Trim(g.pick(identPool), `"`), g.lit())
 		dense = true
 	}
-	g.tables = append(g.tables, tblInfo{name: name, dense: dense})
+	g.tables = append(g.tables, tblInfo{name: name, dense: dense, pairsable: pairsable})
 	if dense {
 		switch g.rnd.Intn(3) {
 		case 0:
 			g.linef("print(#%s, %s[1])", name, name)
 		case 1:
-			g.linef("table.insert(%s, %s)", name, g.lit())
+			g.linef("table.insert(%s, %s)", name, g.lit()) // append keeps pairsable
 			g.linef("print(#%s, %s[#%s])", name, name, name)
 		default:
 			g.linef("print(%s[%s])", name, g.pick(intPool))

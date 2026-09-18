@@ -63,7 +63,7 @@ func reentryEmitScript(t *testing.T) []byte {
 	}
 	writeBytes := func(k int, s string) {
 		for i := 0; i < len(s); i++ {
-			d.LocalGet(1).I32Const(int32(16*k+i)).I32Add().I32Const(int32(s[i])).I32Store8(0)
+			d.LocalGet(1).I32Const(int32(16*k + i)).I32Add().I32Const(int32(s[i])).I32Store8(0)
 		}
 	}
 	internInPlace := func(k int, s string) {
@@ -367,10 +367,10 @@ func TestWasmReentrySpike(t *testing.T) {
 	}
 
 	want := []string{
-		"PRINT\t42",          // value round-trip through the adapter
-		"PRINT\t42",          // two-deep nesting: f → rt_call → g
-		"PRINT\tfalse\tnil",  // forced -1: the staged VALUE (nil), not bytes
-		"PRINT\tfalse\tnil",  // error through two adapter levels + pcall
+		"PRINT\t42",         // value round-trip through the adapter
+		"PRINT\t42",         // two-deep nesting: f → rt_call → g
+		"PRINT\tfalse\tnil", // forced -1: the staged VALUE (nil), not bytes
+		"PRINT\tfalse\tnil", // error through two adapter levels + pcall
 	}
 	got := []string{}
 	for _, l := range lines {

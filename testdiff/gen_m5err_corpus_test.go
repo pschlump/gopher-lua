@@ -31,10 +31,10 @@ func TestGenM5ErrCorpus(t *testing.T) {
 	// gopher: "cannot perform <op> operation between <t1> and <t2>"
 	n := 0
 	pre := map[string]string{
-		"nil":  "local x\n",
-		"bool": "local b = true\n",
+		"nil":   "local x\n",
+		"bool":  "local b = true\n",
 		"table": "local t = {}\n",
-		"str":  "local s = 'nope'\n",
+		"str":   "local s = 'nope'\n",
 	}
 	for _, v := range []string{"nil", "bool", "table"} {
 		for _, op := range []string{"+", "-", "*", "/", "%", "^"} {
@@ -47,7 +47,7 @@ func TestGenM5ErrCorpus(t *testing.T) {
 	add("ar12", "local b = true\nprint(-b)\n") // UNM on boolean
 	add("ar13", "local t = {}\nprint(-t)\n")
 	add("ar14", "local s = 'q'\nprint(#s == 0 and -s or -s)\n") // unm string coercion fails
-	add("ar15", "print('x' * 'y')\n")                            // string-string arith
+	add("ar15", "print('x' * 'y')\n")                           // string-string arith
 
 	// ---- concat (gopher: "cannot perform concat operation between <t1> and <t2>") ----
 	add("cc00", "local x\nprint(x .. 'a')\n")
@@ -67,7 +67,7 @@ func TestGenM5ErrCorpus(t *testing.T) {
 	add("ix04", "local n = 5\nprint(n[true])\n")
 	add("ix05", "local b = true\nprint(b.foo)\n")
 	add("ix06", "local f = print\nprint(f.field)\n") // function index is legal (nil) — kept as a control
-	add("ix07", "local x\nx.foo = 1\n")               // set
+	add("ix07", "local x\nx.foo = 1\n")              // set
 	add("ix08", "local x\nx[3] = 1\n")
 	add("ix09", "local n = 2.5\nn.foo = 1\n")
 	add("ix10", "local s = 'str'\ns.foo = 1\n") // string set errors

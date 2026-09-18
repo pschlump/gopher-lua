@@ -110,13 +110,14 @@ func (fe *funcEmitter) emitCompare(op, A, B, C, pc int) {
 	f.I32Const(fe.line(pc))
 	f.Call(fe.b.imp(fn))
 	fe.checkStatus()
-	// if (cond ~= A) then pc++ (skip the JMP) else take the JMP
+	// if (cond ~= A) then pc++ (skip the partner) else take the partner
+	// (a NOP partner — a rewritten jump-to-next — falls to pc+2; row 41)
 	fe.scratchAddr(0)
 	f.I32Load(0)
 	f.I32Const(int32(A)).I32Ne().If(wasm.Void)
 	fe.setBlk(fe.blockOf(pc + 2))
 	f.Else()
-	fe.setBlk(fe.blockOf(fe.jumpTarget(pc + 1)))
+	fe.setBlk(fe.branchPartner(pc))
 	f.End()
 }
 

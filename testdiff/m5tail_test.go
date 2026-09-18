@@ -18,7 +18,7 @@ func TestM5Tailcalls(t *testing.T) {
 		"upvalue":     "local acc = 0\nlocal function f(n) acc = acc + 1 if n == 0 then return acc end return f(n-1) end\nprint(f(200000))\n",
 		"vararg":      "local function g(...) return ... end\nlocal function f(...) return g(...) end\nprint(f(1, 2, 3))\n",
 		"multiarg":    "local function add(a, b) return a + b end\nlocal function go(x) return add(x, x) end\nprint(go(21))\n",
-		"errchain":    "local function f(n) if n == 0 then error('boom') end return f(n-1) end\nlocal ok, e = pcall(f, 10000)\nprint(ok, e ~= nil)\n", // wording is row 9; assert the catch itself
+		"errchain":    "local function f(n) if n == 0 then error('boom') end return f(n-1) end\nlocal ok, e = pcall(f, 10000)\nprint(ok, e ~= nil)\n",               // wording is row 9; assert the catch itself
 		"callchain":   "local mt = {__call = function(self, n) if n == 0 then return 'cd' end return self(n-1) end}\nlocal f = setmetatable({}, mt)\nprint(f(5))\n", // deep __call chains are ledger row 18
 		"constvararg": "local function g(...) return ... end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n",
 		"tailret":     "local function f(n) if n > 0 then return f(n-1) end return 'end' end\nprint(f(10))\n",

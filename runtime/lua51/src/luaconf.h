@@ -534,7 +534,18 @@
 #define luai_numsub(a,b)	((a)-(b))
 #define luai_nummul(a,b)	((a)*(b))
 #define luai_numdiv(a,b)	((a)/(b))
-#define luai_nummod(a,b)	((a) - floor((a)/(b))*(b))
+/* gopher-lua parity (M6e, row 43): the fork's luaModulo is fmod +
+   sign-adjust (_vm.go); stock 5.1's floor formula
+   ((a) - floor((a)/(b))*(b)) double-rounds — 3%0.1 evaluates to 0
+   here (3/0.1 rounds to exactly 30.0) vs the fork's exact
+   0.0999999999999998. The interpreter is the spec, so the runtime
+   mirrors it. GNU statement-expression; every call site passes plain
+   locals (lvm.c, lcode.c, rt_abi.c arith_body). */
+#define luai_nummod(a,b)					\
+  ({ lua_Number luai_m_ = fmod(a,b);				\
+     if (((b) > 0 && luai_m_ < 0) || ((b) < 0 && luai_m_ > 0))	\
+       luai_m_ += (b);						\
+     luai_m_; })
 #define luai_numpow(a,b)	(pow(a,b))
 #define luai_numunm(a)		(-(a))
 #define luai_numeq(a,b)		((a)==(b))

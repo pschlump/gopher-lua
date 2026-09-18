@@ -360,6 +360,21 @@ func (fe *funcEmitter) blockOf(pc int) int {
 	return len(fe.blockPC) - 1
 }
 
+// branchPartner: the successor when a compare/TEST does NOT skip. The
+// fork emits these ops with a JMP partner, but the finish pass rewrites
+// a jump-to-next partner to OP_NOP — SetOpCode only, operand bits left
+// stale (compile.go:1909). A NOP partner executes as nothing on the
+// interpreter and falls through to pc+2; decoding the stale bits as
+// sBx landed on blockOf's last-block fallback, skipping whole loop
+// bodies or silently returning early (row 41, found by the M6e
+// fuzzer: `while ("A" or "hello") do … end` never ran its body).
+func (fe *funcEmitter) branchPartner(pc int) int {
+	if pc+1 < len(fe.code) && int(fe.code[pc+1]>>26) == lua.OP_JMP {
+		return fe.blockOf(fe.jumpTarget(pc + 1))
+	}
+	return fe.blockOf(pc + 2)
+}
+
 func (fe *funcEmitter) emitBlockBody(start, end int) {
 	code := fe.code
 	f := fe.f
@@ -497,23 +512,23 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.truth(A)
 			fe.f.LocalSet(fe.lT0)
 			fe.f.LocalGet(fe.lT0).I32Const(int32(C)).I32Eq().If(wasm.Void)
-			// falsiness == C ⟺ truthiness == (C==0): pc++ (skip the JMP)
+			// falsiness == C ⟺ truthiness == (C==0): pc++ (skip the partner)
 			fe.setBlk(fe.blockOf(pc + 2))
 			fe.f.Else()
-			// the JMP runs → its target
-			fe.setBlk(fe.blockOf(fe.jumpTarget(pc + 1)))
+			// the partner runs → its target (a NOP partner → pc+2; row 41)
+			fe.setBlk(fe.branchPartner(pc))
 			fe.f.End()
 			terminal = true
 		case lua.OP_TESTSET:
 			fe.truth(B)
 			fe.f.LocalSet(fe.lT0)
 			fe.f.LocalGet(fe.lT0).I32Const(int32(C)).I32Ne().If(wasm.Void)
-			// falsiness != C ⟺ truthiness != (C==0): R(A) := R(B), JMP runs
+			// falsiness != C ⟺ truthiness != (C==0): R(A) := R(B), partner runs
 			fe.copyCell(func() { fe.cellAddr(A) }, func() { fe.cellAddr(B) })
 			fe.bumpTop(A + 1)
-			fe.setBlk(fe.blockOf(fe.jumpTarget(pc + 1)))
+			fe.setBlk(fe.branchPartner(pc))
 			fe.f.Else()
-			// falsiness == C: pc++ (skip the JMP) → pc+2
+			// falsiness == C: pc++ (skip the partner) → pc+2
 			fe.setBlk(fe.blockOf(pc + 2))
 			fe.f.End()
 			terminal = true

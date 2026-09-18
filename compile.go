@@ -519,10 +519,30 @@ func (fc *funcContext) GetLabelPc(label int) int {
 	return fc.labelPc[label]
 }
 
+// constEqual: LValue equality for the constant pool that keeps -0.0
+// and +0.0 distinct. Go's float == (and therefore interface ==) treats
+// them equal, so the dedup used to fold a source `0` onto a `-0.0`
+// slot (or vice versa — whichever literal interned first won), which
+// is observable (1/x, %.14g printing) and deviates from stock Lua 5.1,
+// which does not dedup constants at all (row 42, found by the M6e
+// fuzzer). NaN literals never dedup (NaN != NaN), matching their
+// never-equal semantics.
+func constEqual(a, b LValue) bool {
+	na, ok := a.(LNumber)
+	if !ok {
+		return a == b
+	}
+	nb, ok := b.(LNumber)
+	if !ok {
+		return false
+	}
+	return na == nb && math.Signbit(float64(na)) == math.Signbit(float64(nb))
+}
+
 func (fc *funcContext) ConstIndex(value LValue) int {
 	ctype := value.Type()
 	for i, lv := range fc.Proto.Constants {
-		if lv.Type() == ctype && lv == value {
+		if lv.Type() == ctype && constEqual(lv, value) {
 			return i
 		}
 	}

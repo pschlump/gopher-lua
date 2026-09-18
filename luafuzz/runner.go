@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -31,16 +33,60 @@ const (
 	ClassHang    Class = "HANG"   // deadline on exactly one engine
 	ClassGenBug  Class = "GENBUG" // generator emitted invalid source
 	ClassSkip    Class = "SKIP"   // backend refused (scope leak — post-M5 this is a bug)
+	ClassWedge   Class = "WEDGE"  // hung past the wall guard in two fresh processes
 )
 
 // isFindingClass: outcomes that dirty a night and need a ledger row
 // (or a generator-scoping note) before the 7-night clock counts.
 func isFindingClass(c Class) bool {
 	switch c {
-	case ClassDiverge, ClassTrap, ClassEngine, ClassPanic, ClassHang, ClassGenBug, ClassSkip:
+	case ClassDiverge, ClassTrap, ClassEngine, ClassPanic, ClassHang, ClassGenBug, ClassSkip, ClassWedge:
 		return true
 	}
 	return false
+}
+
+// ---- wall guard / wedge marker ----
+//
+// A wedged engine call never returns, so the guard is a timer that
+// marks and hard-exits; the outer runner loop (bin/run-fuzzer.sh)
+// restarts the chunk. First wedge on a case = assumed process-state
+// (the overnight wasmtime accumulation); second wedge in a FRESH
+// process = a real case-level hang → WEDGE finding, skipped.
+
+type wedgeMarker struct {
+	Idx   int `json:"idx"`
+	Count int `json:"count"`
+}
+
+func wedgePath(dir string) string { return filepath.Join(dir, "wedge-marker") }
+
+func readWedgeMarker(dir string) *wedgeMarker {
+	raw, err := os.ReadFile(wedgePath(dir))
+	if err != nil {
+		return nil
+	}
+	var m wedgeMarker
+	if json.Unmarshal(raw, &m) != nil {
+		return nil
+	}
+	return &m
+}
+
+func clearWedgeMarker(dir string) { os.Remove(wedgePath(dir)) }
+
+func armWallGuard(dir string, idx int, wall time.Duration) *time.Timer {
+	return time.AfterFunc(wall, func() {
+		count := 1
+		if m := readWedgeMarker(dir); m != nil && m.Idx == idx {
+			count = m.Count + 1
+		}
+		b, _ := json.Marshal(wedgeMarker{Idx: idx, Count: count})
+		_ = atomicWrite(wedgePath(dir), b, 0o644)
+		fmt.Fprintf(os.Stderr, "luafuzz: wall guard — case %d wedged %ds (mark %d), exiting for chunk restart\n",
+			idx, int(wall.Seconds()), count)
+		os.Exit(99)
+	})
 }
 
 const deadlineText = "context deadline exceeded"
@@ -383,6 +429,12 @@ func RunChunk(ctx context.Context, o Options, engines []testdiff.Engine) (*Chunk
 	lastIP := sess.Nets[0].IP
 	stopped := false
 
+	// A wedge marker left by a wall-guarded exit for a case this chunk
+	// has already passed (it completed elsewhere) is stale — drop it.
+	if m := readWedgeMarker(o.Dir); m != nil && m.Idx < st.NextCase {
+		clearWedgeMarker(o.Dir)
+	}
+
 	for !stopped {
 		select {
 		case <-ctx.Done():
@@ -409,10 +461,45 @@ func RunChunk(ctx context.Context, o Options, engines []testdiff.Engine) (*Chunk
 			out = CaseOutcome{Idx: idx, Class: ClassGenBug, Execs: 0,
 				Detail: err.Error()}
 			out.Sig = sigOf(firstWords(err.Error(), 8))
+		} else if m := readWedgeMarker(o.Dir); m != nil && m.Idx == idx && m.Count >= 2 {
+			// The case wedged a FRESH process too — not process-state
+			// noise but a real un-pollable hang (the M6d blind spot
+			// made visible). Record it as a finding and move on.
+			out = CaseOutcome{Idx: idx, Class: ClassWedge, Execs: 0,
+				Detail: "case wedged past the wall guard in two processes"}
+			out.Sig = sigOf(out.Detail)
+			clearWedgeMarker(o.Dir)
 		} else {
+			// Wall guard: a legit case is bounded by the per-case
+			// deadline (a few seconds worst case). Anything still
+			// running after 90 s means the PROCESS is wedged (the
+			// overnight failure mode: wasmtime resource accumulation
+			// past ~10k runs). Mark, exit hard; the outer runner loop
+			// restarts the chunk — a fresh process replays this case
+			// fine (verified); a second wedge on the same case (the
+			// marker survives, armWallGuard increments it) promotes it
+			// to a WEDGE finding in the branch above.
+			guard := armWallGuard(o.Dir, idx, 90*time.Second)
 			out = RunCase(engines, caseDir, idx, src)
+			guard.Stop()
+			clearWedgeMarker(o.Dir) // completed: any wedge mark is stale
 		}
 		day := nowISO(o.Now())
+
+		// Bound the process: every wasm-engine run creates a wasmtime
+		// Store that statically maps the blob's 256 MiB max-memory plus
+		// ~8 GB of arm64 guard region — freed only by Go finalizers.
+		// At the GC's own cadence ~4k stores pile up (RSS ~6 GB, VSZ
+		// ~32 TB) and the kernel silently kills the process at ~case
+		// 3980 (three independent runs, no traceback even under
+		// GOTRACEBACK=crash). Forcing collection every 64 cases keeps
+		// the mapping count flat; every 512 also returns RSS.
+		if rep.Cases%64 == 63 {
+			runtime.GC()
+			if rep.Cases%512 == 511 {
+				debug.FreeOSMemory()
+			}
+		}
 
 		// journal first — the durable record survives anything
 		jl := journalLine{I: idx, Cls: string(out.Class), Ms: out.Ms, X: out.Execs, T: day}

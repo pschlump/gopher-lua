@@ -19,6 +19,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -172,6 +173,9 @@ func CompileSource(source []byte, name string) ([]byte, error) {
 // WasmEngine compiles and executes scripts through the wasm backend.
 type WasmEngine struct {
 	name string
+	// one shared wasmtime Engine (lazy) — see Run
+	engineOnce sync.Once
+	wtEngine   *wt.Engine
 	// NoopHosts: replace host shims with no-ops (trap triage)
 	NoopHosts bool
 	// Precompiled module bytes (nil → compile from source)
@@ -237,9 +241,17 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	defer os.Chdir(wd)
 
 	_ = context.Background()
-	cfg := wt.NewConfig()
-	cfg.SetWasmExceptions(true)
-	engine := wt.NewEngineWithConfig(cfg)
+	// One wasmtime Engine per WasmEngine (lazy, shared across Runs —
+	// engines are designed for sharing; this is the compilation cache,
+	// not per-run state). The M6e soak GC fix (runner.go) bounds the
+	// per-run Stores; reusing the Engine cuts the per-case object churn
+	// that fed the finalizer backlog.
+	e.engineOnce.Do(func() {
+		cfg := wt.NewConfig()
+		cfg.SetWasmExceptions(true)
+		e.wtEngine = wt.NewEngineWithConfig(cfg)
+	})
+	engine := e.wtEngine
 	store := wt.NewStore(engine)
 
 	var guestMem *wt.Memory

@@ -108,6 +108,24 @@ func soakCmd(o luafuzz.Options) int {
 	}
 	defer luafuzz.ReleaseLock(lock, o.Dir)
 
+	// Process-bounded chunks (M6e overnight lesson): every wasm-engine
+	// run creates a wasmtime Store that statically maps the blob's
+	// 256 MiB max-memory plus arm64 guard regions and spawns rayon /
+	// trap-handler threads — resources Go finalizers reclaim far too
+	// slowly. Two overnight runs and a diagnostic run all degraded at
+	// a few thousand cases (RSS ~6-12 GB, VSZ ~32 TB, one hard wedge
+	// with parked wasmtime threads at ~10k). The soak therefore runs
+	// in ≤ chunkLen-case processes and RE-EXECS itself for the next
+	// chunk — the OS reclaims everything at exit, and the journal
+	// makes the restart seamless (the design's crash-anywhere rule).
+	const chunkLen = 2000
+	userN := o.MaxCases
+	chunkN := userN
+	if chunkN <= 0 || chunkN > chunkLen {
+		chunkN = chunkLen
+	}
+	o.MaxCases = chunkN
+
 	engines, err := luafuzz.BuildEngines(o.Engines, o.Deadline)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "luafuzz: %v\n", err)
@@ -119,9 +137,11 @@ func soakCmd(o luafuzz.Options) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	interrupted := false
 	go func() {
 		if _, ok := <-sig; ok {
 			fmt.Println("\nluafuzz: interrupt — finishing case, snapshotting…")
+			interrupted = true
 			cancel()
 			<-sig // second signal: drop everything (journal is durable)
 			os.Exit(130)
@@ -139,6 +159,31 @@ func soakCmd(o luafuzz.Options) int {
 	fmt.Printf("chunk #%d: %d cases, %d execs, %.1fs fuzz time, %d findings (stop: %s, %.1fs wall)\n",
 		rep.Session.ID, rep.Cases, rep.Execs, rep.WallMs/1e3, rep.Findings,
 		orDefault(rep.StopReason, "clean end"), time.Since(start).Seconds())
+
+	// next chunk? Only when THIS chunk ended on its internal case cap
+	// while the user's own budget (-n / -max / bare) still wants more.
+	// Interrupts, duration caps, errors, and explicit single-chunk -n
+	// bounds all end here instead.
+	more := !interrupted && rep.StopReason == "case cap" && ctx.Err() == nil
+	remainingN := userN - int(rep.Cases)
+	remainingD := o.MaxDur - time.Since(start)
+	if userN > 0 && remainingN <= 0 {
+		more = false
+	}
+	if o.MaxDur > 0 && remainingD <= 0 {
+		more = false
+	}
+	if more {
+		// rewrite only the budget flags of the ORIGINAL argv and exec;
+		// everything durable (journals, snapshot, lock pid) is on disk
+		args := chunkArgs(os.Args, remainingN, remainingD)
+		luafuzz.ReleaseLock(lock, o.Dir)
+		if err := syscall.Exec(selfPath(), args, os.Environ()); err != nil {
+			fmt.Fprintf(os.Stderr, "luafuzz: re-exec: %v\n", err)
+			return 2
+		}
+	}
+
 	if st, err := luafuzz.LoadState(o.Dir, time.Now); err == nil {
 		printStatus(st, o)
 	}
@@ -146,6 +191,45 @@ func soakCmd(o luafuzz.Options) int {
 		return 1
 	}
 	return 0
+}
+
+// selfPath: the running binary's absolute path (os.Args[0] may be
+// PATH-relative).
+func selfPath() string {
+	if p, err := os.Executable(); err == nil {
+		return p
+	}
+	return os.Args[0]
+}
+
+// chunkArgs: the next chunk's argv = the ORIGINAL argv with only the
+// budget flags (-n/-max, both forms) removed, then fresh ones appended.
+// Everything else — -dir, -engines, -deadline, -nets, … — carries
+// through unchanged. Zero remaining budgets drop their flag.
+func chunkArgs(orig []string, remainingN int, remainingD time.Duration) []string {
+	var args []string
+	skip := 0
+	for _, a := range orig {
+		if skip > 0 {
+			skip--
+			continue
+		}
+		if a == "-n" || a == "-max" {
+			skip = 1 // drop the value too; re-appended below
+			continue
+		}
+		if strings.HasPrefix(a, "-n=") || strings.HasPrefix(a, "-max=") {
+			continue
+		}
+		args = append(args, a)
+	}
+	if remainingN > 0 {
+		args = append(args, "-n", fmt.Sprint(remainingN))
+	}
+	if remainingD > 0 {
+		args = append(args, "-max", remainingD.Round(time.Second).String())
+	}
+	return args
 }
 
 func orDefault(s, d string) string {

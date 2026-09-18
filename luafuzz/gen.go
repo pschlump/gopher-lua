@@ -691,6 +691,13 @@ func (g *gen) stmtNumFor() {
 	} else if g.loopDepth == 2 {
 		k = g.pick([]string{"0", "1", "2"})
 	}
+	if g.loopDepth >= 1 {
+		// DOWNWARD loops count a-k iterations (the overnight HANG at
+		// c0003075: `for i2 = 255, 1, -1` at depth 2 — shrinking k
+		// alone left 255 trips; ~1.16M events deadlined the wasm leg
+		// while interp finished). Shrink the start bound too.
+		a = g.pick([]string{"2", "3", "5", "7"})
+	}
 	if g.rnd.Intn(6) == 0 && g.loopDepth == 0 { // float flavor
 		g.linef("for %s = 0, 2.5, 0.5 do", iv)
 	} else if g.rnd.Intn(2) == 0 {

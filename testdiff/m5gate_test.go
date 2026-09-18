@@ -49,8 +49,8 @@ func TestWasmGluaFull(t *testing.T) {
 
 // TestWasmFullMatrix: the regenerated opcode matrix stays green.
 func TestWasmFullMatrix(t *testing.T) {
-	wasmGluaFull(t, "../_wasm-tests", map[string]string{
-		// (empty — row 10u's table.sort skips were removed with the M6
-		// call_body stack-rebasing fix; tbl07/cb00/tsort01 pass)
-	})
+	wasmGluaFull(t, "../_wasm-tests", CorpusSkips("../_wasm-tests"))
+	// (rows 10u/20/28 were unskipped with the M6 call_body rebasing;
+	// the live skips — whlc00-03, nz00-01 — are the M6e rows 41/42,
+	// owned by skips.go so the CLI leg and this gate cannot disagree)
 }

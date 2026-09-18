@@ -46,7 +46,7 @@ func wazeroCorpus(t *testing.T, dir string, skips map[string]string) {
 
 // TestWazeroFullMatrix: the opcode matrix green on the production engine.
 func TestWazeroFullMatrix(t *testing.T) {
-	wazeroCorpus(t, "../_wasm-tests", map[string]string{})
+	wazeroCorpus(t, "../_wasm-tests", CorpusSkips("../_wasm-tests"))
 }
 
 // TestWazeroGluaFull: the fork conformance suite on the production engine

@@ -1,6 +1,6 @@
 
 
-.PHONY: build test glua
+.PHONY: build test glua fuzz-soak fuzz-status
 
 # Build information (git commit, tag, build date) is injected at link time via
 # -ldflags; version.go is static and never regenerated.
@@ -20,3 +20,9 @@ test:
 
 
 
+
+fuzz-soak: build
+	go run ./cmd/luafuzz -soak
+
+fuzz-status:
+	go run ./cmd/luafuzz -status

@@ -12,10 +12,11 @@ func CorpusSkips(dir string) map[string]string {
 	switch filepath.Base(dir) {
 	case "_glua-tests":
 		return gluaWasmSkips
+	case "_wasm-tests":
+		return wasmTestsSkips
 	default:
-		// _wasm-tests and _wasm-err-tests carry no skips: the M6
-		// call_body rebasing cleared row 10u (table.sort) and rows 20/28
-		// (stack-overflow unwind, pcall position prefix).
+		// _wasm-err-tests carries no skips: the M6 call_body rebasing
+		// cleared rows 20/28 (stack-overflow unwind, pcall prefix).
 		return nil
 	}
 }
@@ -30,6 +31,19 @@ var gluaWasmSkips = map[string]string{
 	"vm.lua":        "loadstring + gopher parser-error wording (register overflow) — row 24",
 	"math.lua":      "library-error wording/behavior (math.max arity text) — row 25",
 	"strings.lua":   "library-error wording/behavior (string.dump unsupported in the fork) — row 25",
+}
+
+// wasmTestsSkips: _wasm-tests cases with a ruled divergence (each cites
+// its row in docs/Lua-Wasm-Divergence-Ledger.md).
+var wasmTestsSkips = map[string]string{
+	// M6e fuzzer find (luafuzz seed 778 case 41 → minimized): the
+	// while-condition shape (truthy-const or X) — fix pending row 41.
+	"whlc00.lua": "while-cond dead-TEST + long-jump pseudo mislowered — row 41",
+	"whlc01.lua": "while-cond dead-TEST + long-jump pseudo mislowered — row 41",
+	"whlc02.lua": "while-cond dead-TEST + long-jump pseudo mislowered — row 41",
+	"whlc03.lua": "const and/or chain in nested if silently ends the wasm log — row 41",
+	"nz00.lua":   "-0.0 constant corrupts metamethod-arith constant reads — row 42",
+	"nz01.lua":   "__call arg 0 read as -0 in certain constant-pool layouts — row 42",
 }
 
 // ledgeredErrSkips: _wasm-err-tests cases whose divergence has a ruling

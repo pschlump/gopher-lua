@@ -20,29 +20,42 @@ func mainAux() int {
 	var opt_e, opt_l, opt_p, opt_w string
 	var opt_i, opt_v, opt_dt, opt_dc, opt_W bool
 	var opt_m int
+	// Every option takes its single-letter and a full-word spelling (-v,
+	// -version); both names bind the same variable, and Go's flag package
+	// already accepts -name and --name alike.
 	flag.StringVar(&opt_e, "e", "", "")
+	flag.StringVar(&opt_e, "execute", "", "")
 	flag.StringVar(&opt_l, "l", "", "")
+	flag.StringVar(&opt_l, "require", "", "")
 	flag.StringVar(&opt_p, "p", "", "")
+	flag.StringVar(&opt_p, "cpuprofile", "", "")
 	flag.StringVar(&opt_w, "w", "", "")
+	flag.StringVar(&opt_w, "wasm", "", "")
 	flag.IntVar(&opt_m, "mx", 0, "")
+	flag.IntVar(&opt_m, "memlimit", 0, "")
 	flag.BoolVar(&opt_i, "i", false, "")
+	flag.BoolVar(&opt_i, "interactive", false, "")
 	flag.BoolVar(&opt_v, "v", false, "")
+	flag.BoolVar(&opt_v, "version", false, "")
 	flag.BoolVar(&opt_dt, "dt", false, "")
+	flag.BoolVar(&opt_dt, "dumpast", false, "")
 	flag.BoolVar(&opt_dc, "dc", false, "")
+	flag.BoolVar(&opt_dc, "dumpcode", false, "")
 	flag.BoolVar(&opt_W, "W", false, "")
+	flag.BoolVar(&opt_W, "runwasm", false, "")
 	flag.Usage = func() {
 		fmt.Println(`Usage: glua [options] [script [args]].
 Available options are:
-  -e stat  execute string 'stat'
-  -l name  require library 'name'
-  -mx MB   memory limit(default: unlimited)
-  -dt      dump AST trees
-  -dc      dump VM codes
-  -i       enter interactive mode after executing 'script'
-  -p file  write cpu profiles to the file
-  -w file  compile 'script' (or -e stat) to a wasm module, write to 'file' and exit
-  -W       run 'script' as a precompiled wasm module (cmd/luawasmc or -w output)
-  -v       show version information (git tag/commit, build date)`)
+  -e stat,  -execute stat      execute string 'stat'
+  -l name,  -require name      require library 'name'
+  -mx MB,   -memlimit MB       memory limit(default: unlimited)
+  -dt,      -dumpast           dump AST trees
+  -dc,      -dumpcode          dump VM codes
+  -i,       -interactive       enter interactive mode after executing 'script'
+  -p file,  -cpuprofile file   write cpu profiles to the file
+  -w file,  -wasm file         compile 'script' (or -e stat) to a wasm module, write to 'file' and exit
+  -W,       -runwasm           run 'script' as a precompiled wasm module (cmd/luawasmc or -w output)
+  -v,       -version           show version information (git tag/commit, build date)`)
 	}
 	flag.Parse()
 	if len(opt_p) != 0 {

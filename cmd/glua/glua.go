@@ -42,7 +42,7 @@ Available options are:
   -p file  write cpu profiles to the file
   -w file  compile 'script' (or -e stat) to a wasm module, write to 'file' and exit
   -W       run 'script' as a precompiled wasm module (cmd/luawasmc or -w output)
-  -v       show version information`)
+  -v       show version information (git tag/commit, build date)`)
 	}
 	flag.Parse()
 	if len(opt_p) != 0 {
@@ -66,8 +66,10 @@ Available options are:
 		L.SetMx(opt_m)
 	}
 
+	// -v: version banner (release line + link-time git tag/commit/date);
+	// -i prints the same banner before entering the REPL.
 	if opt_v || opt_i {
-		fmt.Println(lua.PackageCopyRight)
+		fmt.Println(versionInfo())
 	}
 
 	if len(opt_l) > 0 {

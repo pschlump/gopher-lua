@@ -34,22 +34,23 @@ type funcEmitter struct {
 	lVlo, lVhi                uint32 // i64
 	lF0                       uint32 // f64
 
-	blocks  map[int]int // pc -> block id
-	blockPC []int       // block id -> start pc
+	blocks  map[int]int  // pc -> block id
+	blockPC []int        // block id -> start pc
+	pseudo  map[int]bool // pc is an upvalue-capture pseudo (never real code)
 }
 
 func (b *backend) newFuncEmitter(p *lua.FunctionProto) *funcEmitter {
 	f := b.m.NewFunction([]wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32}, []wasm.ValueType{wasm.I32})
 	f.Local(wasm.I32).Local(wasm.I32).Local(wasm.I32).Local(wasm.I32).Local(wasm.I32) // 4..8
-	f.Local(wasm.I64).Local(wasm.I64)                                               // 9,10
-	f.Local(wasm.F64)                                                               // 11
+	f.Local(wasm.I64).Local(wasm.I64)                                                 // 9,10
+	f.Local(wasm.F64)                                                                 // 11
 	return &funcEmitter{
 		b: b, f: f, proto: p,
 		pi:    b.protoInfoOf(p),
 		nregs: int(p.NumUsedRegisters),
 		np:    int(p.NumParameters),
 		code:  p.Code,
-		lTop: 4, lBlk: 5, lSt: 6, lT0: 7, lT1: 8,
+		lTop:  4, lBlk: 5, lSt: 6, lT0: 7, lT1: 8,
 		lVlo: 9, lVhi: 10, lF0: 11,
 	}
 }
@@ -139,7 +140,7 @@ func (fe *funcEmitter) dynCellAddr(baseReg int) *wasm.Function {
 // vararg cells live above the register window (the adapter's split —
 // plan §3.2): varargBase = frame + 16*framecells, framecells = nregs+4
 func (fe *funcEmitter) varargCell(j int) *wasm.Function {
-	return fe.f.LocalGet(0).I32Const(int32(cellSize*(fe.nregs+4+j))).I32Add()
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + 4 + j))).I32Add()
 }
 
 // vararg cell indexed by lT1 (dynamic copy loops)
@@ -184,7 +185,10 @@ func (fe *funcEmitter) setBoolCellA(a int, cond func()) {
 	fe.cellAddr(a)
 	f.LocalGet(fe.lT0).I32Store(0)
 	fe.cellAddr(a)
-	f.I32Const(1).I32Store8(8)
+	// full 4-byte tag store: tt is an int — a 1-byte store leaves recycled
+	// (non-zero-fresh) cell memory with garbage upper tag bytes, which the
+	// C runtime's ttype() then reads whole (fuzzer rows 45+: reused frames)
+	f.I32Const(1).I32Store(8)
 }
 
 // checkStatus: st := <status on stack>; if st == RT_ERR return -1 (the
@@ -235,7 +239,7 @@ func (fe *funcEmitter) emitBody() {
 	f.Loop(wasm.Void)
 	f.LocalGet(fe.lT0).I32Const(int32(fe.nregs)).I32GeS().BrIf(1)
 	f.LocalGet(0).LocalGet(fe.lT0).I32Const(16).I32Mul().I32Add().
-		I32Const(0).I32Store8(8) // tag = nil
+		I32Const(0).I32Store(8) // tag = nil (full 4 bytes — see setBoolCellA)
 	f.LocalGet(fe.lT0).I32Const(1).I32Add().LocalSet(fe.lT0)
 	f.Br(0)
 	f.End()
@@ -296,24 +300,32 @@ func (fe *funcEmitter) emitBody() {
 }
 
 func (fe *funcEmitter) partitionBlocks() {
+	// map of upvalue-capture pseudo-instructions (the slots after each
+	// OP_CLOSURE — see the OP_CLOSURE case below). A jump whose target
+	// lands on one (the compiler leaves UNREACHABLE jumps with stale
+	// backward targets, e.g. `while false` under a constant-false `if`)
+	// must never start a block there: the pseudo would be emitted as real
+	// code, clobbering the closure register with an upvalue read (fuzzer
+	// finding c0119720: "attempt to call a non-function object").
+	fe.markPseudos()
 	leaders := map[int]bool{0: true}
 	code := fe.code
 	for pc := 0; pc < len(code); pc++ {
 		inst := code[pc]
 		switch int(inst >> 26) {
 		case lua.OP_JMP, lua.OP_FORLOOP, lua.OP_FORPREP:
-			leaders[fe.jumpTarget(pc)] = true
-			leaders[pc+1] = true
+			leaders[fe.realPc(fe.jumpTarget(pc))] = true
+			leaders[fe.realPc(pc+1)] = true
 		case lua.OP_EQ, lua.OP_LT, lua.OP_LE, lua.OP_TEST, lua.OP_TESTSET, lua.OP_TFORLOOP:
-			leaders[pc+2] = true
+			leaders[fe.realPc(pc+2)] = true
 			if pc+1 < len(code) && int(code[pc+1]>>26) == lua.OP_JMP {
-				leaders[fe.jumpTarget(pc+1)] = true
+				leaders[fe.realPc(fe.jumpTarget(pc+1))] = true
 			}
 		case lua.OP_RETURN, lua.OP_TAILCALL:
-			leaders[pc+1] = true
+			leaders[fe.realPc(pc+1)] = true
 		case lua.OP_LOADBOOL:
 			if int(inst>>9)&0x1ff != 0 { // C
-				leaders[pc+2] = true
+				leaders[fe.realPc(pc+2)] = true
 			}
 		case lua.OP_MOVEN:
 			pc += int(inst>>9) & 0x1ff // consume the C fused MOVEs
@@ -353,8 +365,35 @@ func (fe *funcEmitter) jumpTarget(pc int) int {
 	return pc + 1 + sbx
 }
 
+// markPseudos: flag the upvalue-capture pseudo-instruction slots (the
+// NumUpvalues instructions following each OP_CLOSURE).
+func (fe *funcEmitter) markPseudos() {
+	fe.pseudo = make(map[int]bool)
+	for pc := 0; pc < len(fe.code); pc++ {
+		if int(fe.code[pc]>>26) == lua.OP_CLOSURE {
+			n := int(fe.proto.FunctionPrototypes[int(fe.code[pc]&0x3ffff)].NumUpvalues)
+			for k := 1; k <= n && pc+k < len(fe.code); k++ {
+				fe.pseudo[pc+k] = true
+			}
+			pc += n
+		}
+	}
+}
+
+// realPc: advance a pc that may sit on a capture pseudo to the next real
+// instruction. Unreachable-but-present jump targets can land there.
+func (fe *funcEmitter) realPc(pc int) int {
+	for fe.pseudo[pc] && pc < len(fe.code) {
+		pc++
+	}
+	return pc
+}
+
 func (fe *funcEmitter) blockOf(pc int) int {
 	if id, ok := fe.blocks[pc]; ok {
+		return id
+	}
+	if id, ok := fe.blocks[fe.realPc(pc)]; ok {
 		return id
 	}
 	return len(fe.blockPC) - 1
@@ -414,7 +453,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 		case lua.OP_LOADNIL:
 			for k := A; k <= B; k++ {
 				fe.cellAddr(k)
-				fe.f.I32Const(0).I32Store8(8)
+				fe.f.I32Const(0).I32Store(8)
 			}
 			fe.bumpTop(B + 1)
 		case lua.OP_GETGLOBAL:

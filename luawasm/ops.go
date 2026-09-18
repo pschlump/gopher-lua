@@ -29,7 +29,7 @@ func (fe *funcEmitter) emitArith(op, A, B, C, pc int) {
 		fe.arithF64(op)
 		f.F64Store(0)
 		fe.cellAddr(A)
-		f.I32Const(rtNumTag).I32Store8(8)
+		f.I32Const(rtNumTag).I32Store(8) // full 4-byte tag (recycled-cell safety)
 		fe.bumpTop(A + 1)
 		f.Else()
 		f.I32Const(int32(op))
@@ -76,7 +76,7 @@ func (fe *funcEmitter) emitUnm(A, B, pc int) {
 	fe.cellAddr(B).F64Load(0)
 	f.F64Neg().F64Store(0)
 	fe.cellAddr(A)
-	f.I32Const(rtNumTag).I32Store8(8)
+	f.I32Const(rtNumTag).I32Store(8) // full 4-byte tag (recycled-cell safety)
 	fe.bumpTop(A + 1)
 	f.Else()
 	f.I32Const(int32(lua.OP_UNM))
@@ -324,7 +324,7 @@ func (fe *funcEmitter) emitForloop(A, pc int) {
 	fe.cellAddr(A + 3)
 	f.LocalGet(fe.lF0).F64Store(0)
 	fe.cellAddr(A + 3)
-	f.I32Const(3).I32Store8(8) // loop var is a number: set the tag too
+	f.I32Const(3).I32Store(8) // loop var is a number: set the tag too (full 4 bytes)
 	fe.setBlk(fe.blockOf(fe.jumpTarget(pc)))
 	f.Else()
 	fe.setBlk(fe.blockOf(pc + 1))
@@ -422,7 +422,7 @@ func (fe *funcEmitter) emitVararg(A, B int) {
 		f.LocalGet(fe.lVhi).I64Store(8)
 		f.Else()
 		fe.cellAddr(A + i)
-		f.I32Const(0).I32Store8(8) // tag = nil
+		f.I32Const(0).I32Store(8) // tag = nil (full 4 bytes)
 		f.End()
 	}
 	fe.bumpTop(A + m)

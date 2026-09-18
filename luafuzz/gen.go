@@ -36,9 +36,14 @@
 //	        with holes/trailing nils)
 //
 // Rows 41/42 (condition-chain mislowering; -0.0 sign loss) are FIXED —
-// their shapes (const and/or conditions, -0.0 everywhere arithmetically)
-// are back in the fuzz surface and pinned by _wasm-tests whlc00-03,
-// nz00-01.
+// their shapes (const and/or conditions) are back in the fuzz surface
+// and pinned by _wasm-tests whlc00-03, nz00-01. The -0.0 LITERAL stays
+// out of the pools: arithmetic on computed negative zeros now agrees,
+// but printing one rides row 38 ("0" vs "-0").
+//
+// row 48 (2026-09-18 findings): no "^" — Go math.Pow (interp) vs musl's
+// correctly-rounded pow disagree by 1 ulp on ~a third of operand pairs,
+// even 0.1^2.
 //
 // The M6d deadline is armed on every run as the safety net: guarded
 // loops should never need it, a both-engine expiry is DL-TIE (neutral),
@@ -139,6 +144,13 @@ type gen struct {
 	// that as a HANG before this budget existed).
 	loopDepth int
 
+	// funcDepth: nesting inside a function BODY. A function's loops are
+	// sized one level deeper than their lexical depth — the body can't
+	// see the loops its CALL SITES sit in (overnight HANG c0238352: a
+	// 236-trip downward for at a function's top level ran inside a
+	// 31×13×4 caller nest = 765k events, deadlining one engine).
+	funcDepth int
+
 	// iterTables: tables under an active pairs/ipairs loop — assigning
 	// NEW keys during traversal is unspecified (Lua 5.1 manual: only
 	// modifying existing fields is allowed) and the engines legitimately
@@ -146,6 +158,15 @@ type gen struct {
 	// found by the fuzzer, minimized from soak case 59). Key-assignment
 	// to these tables is suppressed while the loop is open.
 	iterTables []string
+}
+
+// effLoopDepth: the depth loop bounds are selected for — one deeper
+// inside function bodies (see funcDepth).
+func (g *gen) effLoopDepth() int {
+	if g.funcDepth > 0 {
+		return g.loopDepth + 1
+	}
+	return g.loopDepth
 }
 
 func (g *gen) isIterated(name string) bool {
@@ -228,13 +249,13 @@ func (g *gen) restore(m scopeMark) {
 
 var numPool = []string{
 	"0", "1", "2", "3", "5", "7", "10", "42", "100", "255", "256", "1000",
-	"65536", "0.5", "-1", "-2", "-2.5", "-0.0", "1e3", "1e15", "1e-9",
+	"65536", "0.5", "-1", "-2", "-2.5", "1e3", "1e15", "1e-9",
 	"0.1", "3.5", "1e308", "9007199254740993",
-	// -0.0 restored with the row-42 fixes (LNumber2I sign preservation +
-	// ConstIndex keeping 0 and -0.0 distinct): computed negative zeros
-	// now agree across engines. It stays out of concat/tostring operand
-	// position (safeNumStrPool) — that's the ruled row-38 formatting
-	// divergence.
+	// no "-0.0" (2026-09-18): arithmetic values were restored with the
+	// row-42 fixes, but any print of one rides the ruled row-38
+	// formatting divergence (interp "0" vs wasm "-0" — HANG-case
+	// collateral, c0238352's single diff line). Pinned coverage lives in
+	// the corpus (nz00/01).
 }
 
 // intPool: %d-format-safe integers (< 2^31, row 25) and loop bounds.
@@ -316,7 +337,12 @@ func (g *gen) num(d int) string {
 	}
 	switch r := g.rnd.Intn(20); {
 	case r < 6:
-		op := g.pick([]string{"+", "-", "*", "/", "%", "^"})
+		// no "^": Go's math.Pow (interp) and musl's correctly-rounded pow
+		// (runtime) disagree by 1 ulp on ~a third of operand pairs — even
+		// 0.1^2 (repeated squaring vs correct rounding). Ledgered libm
+		// ruling (row 38 class); the durable fix is porting Go's
+		// exp/log/pow into the runtime for byte-parity.
+		op := g.pick([]string{"+", "-", "*", "/", "%"})
 		return fmt.Sprintf("(%s %s %s)", g.arithOperand(), op, g.arithOperand())
 	case r < 8:
 		// operand parenthesized: a pool literal like "-2" after the
@@ -679,26 +705,26 @@ func (g *gen) blockBody(n int) {
 
 func (g *gen) stmtNumFor() {
 	g.spend(2)
-	if g.loopDepth >= 3 {
+	if g.effLoopDepth() >= 3 {
 		g.stmtPrint() // nest cap — the iteration product must stay bounded
 		return
 	}
 	iv := g.newFor()
 	a := g.pick(intPool)
 	k := g.pick([]string{"0", "3", "5", "10", "20"})
-	if g.loopDepth == 1 {
+	if d := g.effLoopDepth(); d == 1 {
 		k = g.pick([]string{"0", "2", "3"})
-	} else if g.loopDepth == 2 {
+	} else if d == 2 {
 		k = g.pick([]string{"0", "1", "2"})
 	}
-	if g.loopDepth >= 1 {
+	if g.effLoopDepth() >= 1 {
 		// DOWNWARD loops count a-k iterations (the overnight HANG at
 		// c0003075: `for i2 = 255, 1, -1` at depth 2 — shrinking k
 		// alone left 255 trips; ~1.16M events deadlined the wasm leg
 		// while interp finished). Shrink the start bound too.
 		a = g.pick([]string{"2", "3", "5", "7"})
 	}
-	if g.rnd.Intn(6) == 0 && g.loopDepth == 0 { // float flavor
+	if g.rnd.Intn(6) == 0 && g.effLoopDepth() == 0 { // float flavor
 		g.linef("for %s = 0, 2.5, 0.5 do", iv)
 	} else if g.rnd.Intn(2) == 0 {
 		g.linef("for %s = %s, %s, -1 do", iv, a, k) // downward
@@ -754,13 +780,13 @@ func (g *gen) stmtGenFor() {
 
 func (g *gen) stmtWhile() {
 	g.spend(2)
-	if g.loopDepth >= 3 {
+	if g.effLoopDepth() >= 3 {
 		g.stmtPrint() // nest cap
 		return
 	}
 	guard := g.newGuard()
 	limit := g.pick([]string{"3", "5", "7", "12", "30"})
-	if g.loopDepth == 2 {
+	if g.effLoopDepth() >= 2 {
 		limit = "3"
 	}
 	g.linef("local %s = 0", guard)
@@ -913,7 +939,9 @@ func (g *gen) stmtFuncDef() {
 			g.linef("return %s(n - 1)", name) // tailcall (M5c trampoline)
 		}
 	} else {
+		g.funcDepth++
 		g.blockBody(1 + g.rnd.Intn(2))
+		g.funcDepth--
 		if vararg {
 			switch g.rnd.Intn(3) {
 			case 0:

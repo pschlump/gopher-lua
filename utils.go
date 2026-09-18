@@ -140,17 +140,39 @@ func isArrayKey(v LNumber) bool {
 	return isInteger(v) && v < LNumber(int((^uint(0))>>1)) && v > LNumber(0) && v < LNumber(MaxArrayIndex)
 }
 
+// parseNumber: string → LNumber with stock Lua 5.1 semantics (the vendored
+// runtime's luaO_str2d/strtod, which the wasm engines run): leading zeros
+// stay DECIMAL. The old ParseInt(s, 0) read "0255" as octal 173 — the
+// fuzzer caught `-(0 .. 255)` printing -173 on interp vs -255 on wasm.
+// Hex integers keep working via the 0x prefix (sign allowed, matching
+// strtod); underscores are not digits (Go's base-0 syntax is not Lua's).
 func parseNumber(number string) (LNumber, error) {
 	var value LNumber
-	number = strings.Trim(number, " \t\n")
-	if v, err := strconv.ParseInt(number, 0, LNumberBit); err != nil {
-		if v2, err2 := strconv.ParseFloat(number, LNumberBit); err2 != nil {
-			return LNumber(0), err2
-		} else {
-			value = LNumber(v2)
+	number = strings.Trim(number, " \t\n\v\f\r")
+	if strings.IndexByte(number, '_') >= 0 {
+		return LNumber(0), fmt.Errorf("invalid number: %s", number)
+	}
+	body := number
+	if len(body) > 0 && (body[0] == '-' || body[0] == '+') {
+		body = body[1:]
+	}
+	isHex := len(body) > 1 && body[0] == '0' && (body[1] == 'x' || body[1] == 'X')
+	if isHex {
+		// strtod parses hex integers and hex floats ("0x1.8p3"); Go's
+		// ParseFloat needs a p-exponent, so take hex ints here first
+		if v, err := strconv.ParseInt(number, 0, LNumberBit); err == nil {
+			return LNumber(v), nil
 		}
+		if v, err := strconv.ParseUint(number, 0, LNumberBit); err == nil {
+			return LNumber(v), nil
+		}
+	} else if v, err := strconv.ParseInt(number, 10, LNumberBit); err == nil {
+		return LNumber(v), nil
+	}
+	if v2, err2 := strconv.ParseFloat(number, LNumberBit); err2 == nil {
+		value = LNumber(v2)
 	} else {
-		value = LNumber(v)
+		return LNumber(0), err2
 	}
 	return value, nil
 }

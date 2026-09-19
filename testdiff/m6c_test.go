@@ -23,7 +23,7 @@ import (
 // lua51ProdSHA256 pins the embedded prod blob. Rebuild runtime/build.sh →
 // update this constant (the artifact test is the self-check that forces
 // the bump). Brittle by design (A8: checksummed artifact).
-const lua51ProdSHA256 = "1e36a6de33023e54f8d6292fc040872a01067e7ccb2e4fd0f21653ded12b0a6c"
+const lua51ProdSHA256 = "6dd4a8451655c810913a82b14ba439f9b4de4cb9c61d848224d0b0d09ebe513f"
 
 func TestM6cProdBlobArtifact(t *testing.T) {
 	imps, err := wasm.Imports(lua51ProdWasm)

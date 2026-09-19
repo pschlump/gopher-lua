@@ -7,7 +7,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 CC=${CC:-clang}
-SRC="tests/rt_native_test.c lua51/src/*.c"
+SRC="tests/rt_native_test.c gnumfmt.c lua51/src/*.c"
 CFLAGS="-DLUA_CORE -DRT_ABI_NATIVE64 -DNDEBUG -I."
 
 run_build() {

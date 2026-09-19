@@ -520,7 +520,13 @@
 */
 #define LUA_NUMBER_SCAN		"%lf"
 #define LUA_NUMBER_FMT		"%.14g"
-#define lua_number2str(s,n)	sprintf((s), LUA_NUMBER_FMT, (n))
+/* Fork dialect patch (row 38 fix): in the gopher dialect (rt_set_dialect(1))
+** numbers render exactly like the interp oracle's LNumber.String() — full
+** integer digits for integer-valued floats, Go-shortest %g otherwise, and
+** "+Inf"/"-Inf"/"NaN" texts (gnumfmt.c). The stock %.14g stays for the
+** clua oracle (dialect 0). Longest output 25 bytes incl. NUL. */
+void rt_gnumfmt(char *s, double n);
+#define lua_number2str(s,n)	rt_gnumfmt((s), (n))
 #define LUAI_MAXNUMBER2STR	32 /* 16 digits, sign, point, and \0 */
 #define lua_str2number(s,p)	strtod((s), (p))
 

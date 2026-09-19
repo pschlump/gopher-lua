@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "rt_abi.h"
+#include "gnumfmt.h"
 #include "lua51/src/lauxlib.h"
 #include "lua51/src/ldo.h"
 #include "lua51/src/lfunc.h"
@@ -90,6 +91,19 @@ static int rt_where_set;
 void rt_set_dialect(int32_t d) { rt_dialect = (int)d; }
 int rt_gopher_dialect(void) { return rt_dialect; }
 
+/* lua_number2str hook (luaconf.h): the gopher dialect renders numbers
+** exactly like the interp oracle's LNumber.String() (gnumfmt.c — the
+** Go-1.27 strconv shortest-'g' port plus the fork's integer fast path);
+** the stock clua oracle keeps %.14g. Used by tostring, `..` concat and
+** table.concat — everything that funnels through luaV_tostring. */
+void rt_gnumfmt(char *s, double n) {
+  if (!rt_dialect) {
+    sprintf(s, "%.14g", n);
+    return;
+  }
+  gn_lua_number_to_string(s, n);
+}
+
 void rt_where_mark(void) { rt_where_set = 1; }
 
 int rt_line_depth(void) { return rt_line_sp; }
@@ -109,18 +123,14 @@ const char *rt_gtypename_safe(const TValue *v) {
   return names[t];
 }
 
-/* gopher key/value repr for index messages: key.String() — integers
-   plain, others %.14g */
+/* gopher key/value repr for index messages: key.String() — the fork's
+   exact number rendering (gnumfmt.c; integers plain, Go-shortest %g
+   otherwise), string/bool/typename as before */
 static void rt_grepr(char *buf, size_t cap, const TValue *v) {
   switch (ttype(v)) {
-  case LUA_TNUMBER: {
-    lua_Number n = nvalue(v);
-    if (n == (lua_Number)(long long)n)
-      snprintf(buf, cap, "%lld", (long long)n);
-    else
-      snprintf(buf, cap, "%.14g", (double)n);
+  case LUA_TNUMBER:
+    gn_lua_number_to_string(buf, (double)nvalue(v));
     break;
-  }
   case LUA_TSTRING:
     snprintf(buf, cap, "%s", svalue(v));
     break;

@@ -66,7 +66,7 @@ MEMMAX="-Wl,--max-memory=268435456"
   -lsetjmp \
   $EXPORTS $MEMMAX \
   -Wl,-z,stack-size=8388608 -Wl,--strip-all \
-  -o lua51_sjlj.wasm luawasm.c rt_abi.c $SRC
+  -o lua51_sjlj.wasm luawasm.c rt_abi.c gnumfmt.c $SRC
 
 # ---- lua51_prod.wasm: M6c production flavor — zero wasi imports ----
 #
@@ -94,7 +94,7 @@ PROD_SRC=$(ls lua51/src/*.c | grep -v -e /liolib.c -e /loslib.c -e /loadlib.c -e
   -lsetjmp \
   $EXPORTS $MEMMAX \
   -Wl,-z,stack-size=8388608 -Wl,--strip-all \
-  -o lua51_prod.wasm luawasm.c rt_abi.c $PROD_SRC
+  -o lua51_prod.wasm luawasm.c rt_abi.c gnumfmt.c $PROD_SRC
 
 # ---- asyncify variants (documentation path; wazero-compatible) ----
 

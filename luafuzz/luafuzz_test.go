@@ -372,3 +372,41 @@ func TestLuafuzzWasmMini(t *testing.T) {
 		}
 	}
 }
+
+// TestGenerateEventBudget: the per-case print volume must stay far
+// under the wasm leg's throughput at the 1.5 s soak deadline (~60k
+// events ≈ 23 µs each through the rt_* ABI). The compound-nest HANGs
+// (c0238352, c0003075, c0158534 — the last one a repeat that never
+// counted toward loopDepth, so its nested loops were sized one level
+// shallower) are all generator-budget bugs, not engine bugs; this
+// pins the distribution's tail: max PRINT events over a generated
+// slice stays an order of magnitude under the deadline's capacity.
+func TestGenerateEventBudget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("heavy: 3000 interp runs (CI -short skips)")
+	}
+	const (
+		seed = int64(999)
+		n    = 3000
+		cap  = 20000 // ~1/3 of the wasm leg's 1.5 s capacity
+	)
+	eng := testdiff.NewInterp("budget")
+	dir := t.TempDir()
+	worst, worstIdx := 0, -1
+	for idx := 0; idx < n; idx++ {
+		src := Generate(seed, idx)
+		log := eng.Run(testdiff.Case{Name: CaseName(idx), Dir: dir, Source: src})
+		c := 0
+		for _, l := range log {
+			if strings.HasPrefix(l, "PRINT") {
+				c++
+			}
+		}
+		if c > worst {
+			worst, worstIdx = c, idx
+		}
+	}
+	if worst > cap {
+		t.Errorf("case %d produced %d print events (cap %d) — a loop-nest budget regressed", worstIdx, worst, cap)
+	}
+}

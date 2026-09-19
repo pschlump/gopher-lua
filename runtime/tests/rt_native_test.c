@@ -306,6 +306,67 @@ int main(void) {
     CHECK(rt_deadline_flag() == 0);
   }
 
+  /* ---- row 38 fix (2026-09-19): fork-exact number→string ----
+  ** gn_lua_number_to_string ports the interp oracle's LNumber.String()
+  ** (goldens generated FROM the fork on darwin/arm64; the port was also
+  ** swept against the oracle over 7.9M values — random bit patterns,
+  ** binade/decimal boundaries — zero mismatches). Note 2^63 prints
+  ** saturated (arm64 float64→int64): "9223372036854775807". */
+  {
+    static const struct { double v; const char *want; } gold[] = {
+      {0x1.c6bf52634032p+49, "1000000000000100"},         /* c0071344 */
+      {0x1.2aaaaaaaaaaabp+00, "1.1666666666666667"},      /* c0750767 */
+      {0x1.010101010101p-07, "0.00784313725490196"},      /* c1034921 */
+      {0x1p+53, "9007199254740992"},                      /* c0916336/c1066545 */
+      {0x1.c6bf52634p+49, "1000000000000000"},            /* 1e15 full digits */
+      {0x1.1c37937e08p+53, "10000000000000000"},
+      {0x1.2d6878p+20, "1.2345675e+06"},                  /* %v goes e-form at 1e6 */
+      {0x1.e847fp+19, "999999.5"},
+      {0x1.4f8b588e368f1p-17, "1e-05"},                   /* …and below 1e-4 */
+      {0x1.ad7f29abcaf48p-24, "1e-07"},
+      {0x1p-1074, "5e-324"},                              /* smallest subnormal */
+      {0x1.1ccf385ebc8ap+1023, "1e+308"},
+      {0x1.5555555555555p-02, "0.3333333333333333"},
+      {-0x1.5555555555555p-02, "-0.3333333333333333"},
+      {0x0p+00, "0"},                                     /* -0.0 → "0" (row 42) */
+      {0x1.0000000000001p-1022, "2.225073858507202e-308"},
+      {0x1p+63, "9223372036854775807"},                   /* saturated 2^63 */
+      {-0x1p+63, "-9223372036854775808"},
+      {0x1.02207973f644p+63, "9.3e+18"},                  /* beyond ±2^63 */
+      {-0x1.02207973f644p+63, "-9.3e+18"},
+      {0x1.999999999999ap-04, "0.1"},
+      {0x1.e848p+19, "1000000"},
+      {0x1.b1ae4d6e2ef5p+69, "1e+21"},
+      {0x1.0000000000001p+00, "1.0000000000000002"},
+      {0x1.fffffffffffffp+1023, "1.7976931348623157e+308"},
+      {INFINITY, "+Inf"},
+      {-INFINITY, "-Inf"},
+      {NAN, "NaN"},
+    };
+    size_t gi;
+    char buf[64];
+    for (gi = 0; gi < sizeof gold / sizeof gold[0]; gi++) {
+      gn_lua_number_to_string(buf, gold[gi].v);
+      if (strcmp(buf, gold[gi].want) != 0) {
+        failures++;
+        printf("FAIL %d: gnumfmt(%g) = %s want %s\n", __LINE__,
+               gold[gi].v, buf, gold[gi].want);
+      }
+    }
+    /* the lua_number2str hook is dialect-gated: stock %.14g for the
+    ** clua oracle, fork texts for the wasm engine */
+    {
+      int prev_dialect = rt_gopher_dialect();
+      rt_set_dialect(1);
+      rt_gnumfmt(buf, 1e15 + 100);
+      CHECK(strcmp(buf, "1000000000000100") == 0);
+      rt_set_dialect(0);
+      rt_gnumfmt(buf, 1e15 + 100);
+      CHECK(strcmp(buf, "1.0000000000001e+15") == 0);
+      rt_set_dialect(prev_dialect);
+    }
+  }
+
   if (failures == 0) printf("RT-NATIVE PASS\n");
   else printf("RT-NATIVE FAIL (%d)\n", failures);
   return failures;

@@ -25,9 +25,13 @@
 //	        < 2^31, tonumber over plain-integer strings only, no
 //	        zero-arg math.max, no string.dump, select index ≥ 1)
 //	row 33: no io/os surface (prod sandbox nils it; dev shim covers it)
-//	row 38: no non-finite/precision-cutoff number→string coercion in
-//	        `..`/tostring/table.concat operands (safeNumStrPool;
-//	        math.huge is finite in the fork, infinite in C)
+//	row 38: math.huge is never emitted (finite MaxFloat64 in the fork,
+//	        true infinity in C — a VALUE divergence, still ruled). The
+//	        row's number→string FORMATTING family is FIXED (row 49,
+//	        2026-09-19): the runtime now renders numbers exactly like
+//	        LNumber.String() in the gopher dialect (runtime/gnumfmt.c),
+//	        so tostring/concat/table.concat over ANY finite double
+//	        agree — the safeNumStrPool below stays as defense in depth.
 //	row 39: pairs only over dense sequences (hash-part iteration order
 //	        differs: interp sorted vs C ltable slot order)
 //	row 40: binary-arith operands never scalar-local/t[k]/call reads —
@@ -37,9 +41,11 @@
 //
 // Rows 41/42 (condition-chain mislowering; -0.0 sign loss) are FIXED —
 // their shapes (const and/or conditions) are back in the fuzz surface
-// and pinned by _wasm-tests whlc00-03, nz00-01. The -0.0 LITERAL stays
-// out of the pools: arithmetic on computed negative zeros now agrees,
-// but printing one rides row 38 ("0" vs "-0").
+// and pinned by _wasm-tests whlc00-03, nz00-01. Since row 49 fixed
+// number→string rendering, the -0.0 LITERAL is back in numPool
+// (2026-09-19): tostring/print of a negative zero is "0" on both
+// engines (pinned by _wasm-tests/gnf01.lua + the native gnumfmt
+// goldens).
 //
 // row 48 (2026-09-18 findings): no "^" — Go math.Pow (interp) vs musl's
 // correctly-rounded pow disagree by 1 ulp on ~a third of operand pairs,
@@ -250,12 +256,11 @@ func (g *gen) restore(m scopeMark) {
 var numPool = []string{
 	"0", "1", "2", "3", "5", "7", "10", "42", "100", "255", "256", "1000",
 	"65536", "0.5", "-1", "-2", "-2.5", "1e3", "1e15", "1e-9",
-	"0.1", "3.5", "1e308", "9007199254740993",
-	// no "-0.0" (2026-09-18): arithmetic values were restored with the
-	// row-42 fixes, but any print of one rides the ruled row-38
-	// formatting divergence (interp "0" vs wasm "-0" — HANG-case
-	// collateral, c0238352's single diff line). Pinned coverage lives in
-	// the corpus (nz00/01).
+	"0.1", "3.5", "1e308", "9007199254740993", "-0.0",
+	// "-0.0" restored (2026-09-19): row 42 fixed its arithmetic, row 49
+	// fixed its rendering (tostring/print of -0.0 is "0" on both
+	// engines — gnumfmt.c). Corpus pins: nz00/01 (row 42), gnf01
+	// (row 49).
 }
 
 // intPool: %d-format-safe integers (< 2^31, row 25) and loop bounds.
@@ -270,12 +275,13 @@ var identPool = []string{"zz", "k1", "name", "Q"} // table string keys
 // posIntPool: math.random bounds (Intn(≤0) panics Go's rand).
 var posIntPool = []string{"1", "2", "3", "6", "10", "42"}
 
-// safeNumStrPool: numeric literals whose number→string coercion is
-// byte-identical across engines (empirically probed, M6e bring-up):
-// the fork prints integer-valued floats as full integers while C's
-// %.14g switches to exponent form past 14 significant digits, and
-// int64(-0.0) drops the sign — so 1e15, 2^53, 1e308 and -0.0 stay out
-// of `..`/tostring operand position (row 38).
+// safeNumStrPool: numeric literals for `..`/tostring/table.concat
+// LITERAL operand position. Since row 49 (2026-09-19) made the
+// runtime's number→string conversion fork-exact for every finite
+// double, this pool is defense in depth rather than a divergence
+// boundary — it stays narrow so a formatting regression surfaces as a
+// small diff (and computed values — the row-49 finding path — reach
+// these positions regardless of the pool).
 var safeNumStrPool = []string{
 	"0", "1", "2", "3", "5", "7", "10", "42", "100", "255", "256", "1000",
 	"65536", "0.5", "-1", "-2", "-2.5", "0.1", "3.5", "1e-9",
@@ -340,7 +346,7 @@ func (g *gen) num(d int) string {
 		// no "^": Go's math.Pow (interp) and musl's correctly-rounded pow
 		// (runtime) disagree by 1 ulp on ~a third of operand pairs — even
 		// 0.1^2 (repeated squaring vs correct rounding). Ledgered libm
-		// ruling (row 38 class); the durable fix is porting Go's
+		// ruling (row 48); the durable fix is porting Go's
 		// exp/log/pow into the runtime for byte-parity.
 		op := g.pick([]string{"+", "-", "*", "/", "%"})
 		return fmt.Sprintf("(%s %s %s)", g.arithOperand(), op, g.arithOperand())
@@ -443,8 +449,8 @@ var smallInts = []string{"65", "66", "97", "98", "48", "10"}
 func (g *gen) pickFmt() fmtSpec { return fmtSpecs[g.rnd.Intn(len(fmtSpecs))] }
 
 // concatOperand: only literals participate in `..`, numbers from the
-// coercion-safe pool (row 38: non-finite formatting AND the
-// integer-valued/precision-cutoff corner).
+// conservative safeNumStrPool (see its comment — defense in depth
+// since row 49, not a divergence boundary).
 func (g *gen) concatOperand() string {
 	if g.rnd.Intn(2) == 0 {
 		return g.pick(strPool)
@@ -711,6 +717,13 @@ func (g *gen) stmtNumFor() {
 	}
 	iv := g.newFor()
 	a := g.pick(intPool)
+	if g.effLoopDepth() == 0 {
+		// the OUTERMOST numeric for is the product nothing else
+		// shrinks — a 255-start downward for under a 13-trip while
+		// with a depth-2 for is ~60k events, inside the wasm leg's
+		// deadline noise (c0158534 family; trips stay ≤ 43 here).
+		a = g.pick([]string{"3", "5", "7", "10", "12", "20", "42"})
+	}
 	k := g.pick([]string{"0", "3", "5", "10", "20"})
 	if d := g.effLoopDepth(); d == 1 {
 		k = g.pick([]string{"0", "2", "3"})
@@ -786,7 +799,14 @@ func (g *gen) stmtWhile() {
 	}
 	guard := g.newGuard()
 	limit := g.pick([]string{"3", "5", "7", "12", "30"})
-	if g.effLoopDepth() >= 2 {
+	if d := g.effLoopDepth(); d == 1 {
+		// 30 stays a TOP-LEVEL-only luxury: a 31-trip while is the
+		// biggest per-level multiplier left, and at depth 1+ it sits
+		// under another loop's product (fn bodies size their loops
+		// at eff 1 too — a 31-trip body while under a hot call site
+		// is the c0158534 compound shape).
+		limit = g.pick([]string{"3", "5", "7", "12"})
+	} else if d >= 2 {
 		limit = "3"
 	}
 	g.linef("local %s = 0", guard)
@@ -806,15 +826,27 @@ func (g *gen) stmtWhile() {
 
 func (g *gen) stmtRepeat() {
 	g.spend(2)
+	if g.effLoopDepth() >= 3 {
+		g.stmtPrint() // nest cap
+		return
+	}
 	guard := g.newGuard()
 	limit := g.pick([]string{"2", "4", "6"})
 	g.linef("local %s = 0", guard)
 	g.linef("repeat")
 	m := g.mark()
 	g.push()
+	// A repeat IS a loop for nesting: it must count toward
+	// effLoopDepth like while/for do. Until 2026-09-19 it didn't —
+	// loops nested under it were sized one level shallower (and the
+	// depth-2/3 caps never triggered), so `repeat(7) × for(43) ×
+	// while(31) × for(5)` = ~100k print events deadlined the wasm leg
+	// while interp finished (HANG c0158534).
+	g.loopDepth++
 	g.linef("%s = %s + 1", guard, guard)
 	g.blockBody(1)
 	g.linef("if %s > %s then break end", guard, limit)
+	g.loopDepth--
 	g.pop()
 	g.restore(m)
 	g.linef("until %s or %s > %s", g.boolExpr(0), guard, limit)
@@ -1134,8 +1166,8 @@ func (g *gen) stmtLib() {
 	case 4:
 		name := g.newTableN()
 		g.tables = append(g.tables, tblInfo{name: name, dense: true})
-		// safe pool: table.concat renders numbers engine-natively
-		// (row 38) — 1e15 et al. must not reach it
+		// safe pool: table.concat renders numbers engine-natively; the
+		// pool is conservative since row 49 (see safeNumStrPool)
 		g.linef("local %s = {%s, %s, %s}", name, g.pick(safeNumStrPool), g.pick(safeNumStrPool), g.pick(safeNumStrPool))
 		switch g.rnd.Intn(3) {
 		case 0:

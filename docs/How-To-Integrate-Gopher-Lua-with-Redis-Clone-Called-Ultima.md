@@ -28,12 +28,17 @@ a correction** — that is the repo culture (probe, don't trust).
 
 **Status snapshot (2026-09-22).**
 
-- gopher-lua: through **M6e** (commit `b6c6edb` on master). Compiler,
-  backend, runtime blob, sandbox flavor, caps/deadline, determinism gates —
-  all green on the corpora. **The `host/` package (its own M7 item,
-  design §6) does not exist yet** — building it is part of this effort.
+- gopher-lua: through **M6e**, plus **M8a of this guide DONE (same day)**:
+  the `host/` package is built and gated (`go test ./host/ -race` ×2
+  green, `CGO_ENABLED=0 go build ./host/` green, examples run), the
+  runtime blob carries the M7a additions (`host.host_call` import +
+  `rt_hostfn`/`rt_encode_value` exports, §4.2), and `lua_main` returns
+  the dispatch status verbatim (§4.2c). All pre-existing repo gates
+  re-ran green on the rebuilt blob. What remains of gopher-lua's own M7
+  ("API freeze") is field hardening from Ultima-side use.
 - Ultima: M0–M7 done; M8's streams/bitfield/geo/PF\*/SSUBSCRIBE landed.
-  `EVAL`/`SCRIPT` are absent from the command table and the manifest.
+  `EVAL`/`SCRIPT` are absent from the command table and the manifest —
+  **M8b–M8e of this guide are the remaining work.**
 
 ---
 
@@ -56,8 +61,11 @@ a correction** — that is the repo culture (probe, don't trust).
   opens base/table/string/math only (ledger rows 33–34). Scripts importing
   them fail at load with a normal "module not found"-class Lua error.
 - Coroutines, `loadstring`-generated code at runtime, `debug` introspection
-  inside scripts — backend v1 limits (divergence ledger rows 22–25). They
-  fail at **compile time** with a clean error, never a trap.
+  inside scripts — backend v1 limits (divergence ledger rows 22–25).
+  `loadstring`/`load` are nil under the sandbox; coroutine scripts compile
+  (the lib exists) but are a **ledgered behavioral divergence** — the
+  Ultima differential skips them with reasons, they are not silently
+  trusted.
 - Verbatim (whole-script) replication — single node, effects-only (§3 D2).
 
 ---
@@ -197,7 +205,7 @@ repos.
 | S5 | **Hard deadline via the M6d watchdog, plus a soft `lua-time-limit` BUSY phase.** Over the soft limit, other clients' normal commands get `-BUSY`; at the hard deadline the watchdog flag kills the script mid-loop. Partial effects are **kept** and already AOF-captured; the scripting client gets a script-timeout error. | Redis cannot preempt (SCRIPT KILL / SHUTDOWN NOSAVE only). Ultima can — better ops, but a **documented divergence**: a killed script's earlier writes persist. Must be recorded in the Ultima docs and probed tests must not assume Redis's all-or-nothing-by-blocking behavior. |
 | S6 | **Determinism: the host seeds `math.random` per run** from a configurable base (default: derived from server run-id + a per-run counter — *not* wall clock). | gopher-lua D5 gates (5×-identical logs) require host-seeded RNG; scripts stay reproducible for testing. Redis's own seeding is unobservable to clients either way. |
 | S7 | **Number formatting for RESP is host-side** (`strconv`), not Lua `tostring`. Integral floats → RESP integer; otherwise shortest round-trip decimal. | The blob's number→string dialect has known 1-ulp/wording corners (ledger rows 38-survivor, 40, 48). Conversion happens in Go on the raw f64, so those corners cannot leak into replies. |
-| S8 | **No `cjson`/`bit`/`cmsgpack`/coroutines/`loadstring` in v1.** Scripts using them fail at compile with the ordinary Lua error. | Production blob surface (rows 33–34) + backend v1 limits (rows 22–25). Failures are clean errors, never traps. |
+| S8 | **No `cjson`/`bit`/`cmsgpack` in v1; `loadstring` nil; coroutines compile but stay a ledgered divergence.** The prod blob opens base/table/string/math only; `loadstring`/`load` are sandboxed to nil; coroutine scripts COMPILE (the sandbox keeps the `coroutine` lib) but their engine behavior is a ledgered differential skip (row 22) — treat them as unsupported in the Ultima gate (skip with reason), not as compile-time rejects. | Production blob surface (rows 33–34) + backend v1 limits (rows 22–25). Failures that do occur are clean errors, never traps. |
 | S9 | **`redis.call` re-checks ACL, arity, `noscript`, and deny-OOM per call**, using the calling connection's identity; keys are computed from the command's own key spec at runtime (not from static FirstKey, which cannot express `numkeys`). | Redis 7 semantics; Ultima already has per-connection auth state on `ConnState`. |
 | S10 | **The `host` package lives in the gopher-lua repo and knows nothing about Ultima.** The `redis` table is injected by Ultima through a host-package callback seam. | Keeps the public API generic (design §6) and avoids an import cycle / repo coupling. |
 
@@ -246,16 +254,23 @@ type Script struct {
 }
 
 type RunOptions struct {
-    Keys, Argv []string            // staged as the KEYS / ARGV globals
-    Deadline  time.Time            // watchdog writes ctrl+0x10 (M6d D4)
-    MaxPages  uint32               // memory cap → rt_set_memlimit → rt_oom error
-    Seed      int64                // host RNG seed (S6; applied post-lnewstate)
+    Keys, Argv []string      // staged as the KEYS / ARGV globals
+    Deadline  time.Duration  // watchdog writes ctrl+0x10 (M6d D4); ctx
+                             // cancellation arms the same flag (or wazero's
+                             // Call(ctx) aborts outright — both clean kills)
+    Seed      int64          // host RNG seed (S6; applied post-lnewstate)
 }
 
 type HostFunc func(vm *VM, args []Value) ([]Value, error)
-▸ func (e *Engine) RegisterGlobal(tableName, fnName string, f HostFunc)
-  // Installs tableName.fnName as a Lua function backed by a Go callback.
-  // Used by Ultima for redis.call/pcall/error_reply/status_reply.
+func (e *Engine) RegisterGlobal(table, name string, f HostFunc) error
+  // Installs table.name as a Lua function backed by a Go callback (the
+  // bridge for redis.call/pcall/error_reply/status_reply). Frozen once
+  // the first VM exists; each VM snapshots the registry at creation.
+
+// The memory budget is an ENGINE option — WithMemoryBudgetBytes(n) —
+// because rt_set_memlimit must precede lnewstate (M6d D3), i.e. it is
+// per-image, not per-run. 0 = unlimited (the blob's 256 MiB linear-
+// memory max is the hard backstop either way).
 
 func (e *Engine) NewVM() (*VM, error)
 func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (Result, error)
@@ -263,9 +278,25 @@ func (vm *VM) Close() error
 func (e *Engine) Run(ctx context.Context, s *Script, opt RunOptions) (Result, error)
 // Engine.Run = NewVM + Run + Close (S4 default deployment).
 
+// As-built v1 laws (differ from the original sketch):
+// • ONE SCRIPT PER VM IMAGE: proto indices are per-script (0-based) into
+//   a per-image registry, so a second script would collide. Re-running
+//   the SAME script on a VM is the Redis-classic shared-globals mode.
+//   Engine.Run (fresh VM) sidesteps the law entirely.
+// • ONE WAZERO RUNTIME PER VM (not shared): module names resolve inside
+//   a runtime's namespace at instantiation (the script imports "rt"), so
+//   concurrently-live images cannot share one runtime. Script COMPILATION
+//   stays cached at the Engine level; only wazero's per-instance module
+//   compilation is repaid per VM.
+// • Measured on darwin/arm64 (interpreter engine — the conservative
+//   case): fresh VM ≈ 44 ms, re-run on a bound image ≈ 60 µs (~700×).
+//   Hot paths pool VMs per script (see examples/evalserver); a pooled-
+//   runtime refinement is the M8e item (R3).
+
 type Result struct { Values []Value }   // script return values, converted
-type Value struct { Kind ValueKind; Num float64; Str string; Bool bool;
-                    Arr []Value; Map map[string]Value; Err string }
+// Value as built: Kind (wire tag), Num, Str, Pairs []KV, More bool —
+// see host/wire.go. ScriptError carries the exact error Value; TrapError
+// is the backend-bug class (log module SHA + meta, never a script error).
 ```
 
 `Compile` must not re-derive `testdiff.CompileSource` by importing testdiff
@@ -277,44 +308,84 @@ proto, err := lua.Compile(chunk, name)          // root package, clean
 bin, err := luawasm.Compile(proto, name)        // luawasm, clean
 ```
 
-### 4.2 Two small runtime additions (C, this repo, rebuilt into the blob)
+### 4.2 Runtime additions (C, this repo, rebuilt into the blob) — **as built (M8a)**
 
-Both are additive to the frozen ABI v3 surface — new exports/imports, no
-changes to existing contracts. Rebuild via `runtime/build.sh`, copy the
-blob into `host/` (and `testdiff/`), bump the SHA pins, `go clean
--testcache`, re-run the full gates (`make test`, the M6c artifact test).
+Additive to the frozen ABI v3 surface — new exports/imports plus one
+script-module entry contract, no changes to existing C contracts. Rebuild
+via `runtime/build.sh` (it copies the prod blob into `host/` too), bump
+the SHA pins (`host/blob.go`, `testdiff/m6c_test.go`), `go clean
+-testcache`, re-run the full gates (`make test`, the M6c matrix).
 
-**(a) Lua→Go host functions (`redis.call`).** The pattern already exists:
-`host.wasm_dispatch` is a Go function the C side calls mid-execution. Add
-the mirror for value-carrying calls:
+**(a) Lua→Go host functions (`redis.call`) — `rt_hostfn` +
+`host.host_call`.** Marshaling rides the *tag-first wire protocol* the
+blob already speaks for print/globals events (`PT_*` tags,
+`runtime/luawasm.c` `enc_value`), not raw TValue cells — strings travel
+inline as bytes and table arguments arrive fully expanded, so the Go side
+needs zero layout knowledge and `redis.error_reply({err=...})`-style
+table arguments are visible to the bridge:
 
-```c
-/* rt_abi.c — register a Go-backed function on a table */
-void rt_hostfn(const char *table, const char *name, int fnidx);
-/* Creates a lua_CFunction trampoline bound to fnidx; the trampoline
-** marshals argc/argv cells to a staging window and calls the new import
-**   host.host_call (fnidx, argvAddr, argc, cap) -> (nret, retAddr | -1)
-** then unmarshals nret cells back onto the Lua stack. Errors return -1
-** with the error TValue staged via the existing rt_err_* protocol. */
+```text
+args   = u32 count, count × value   (guest→host; tables expanded, with
+                                     cycle/deep/truncation sentinels)
+result = u32 count, count × value   (host→guest; decoder pushes each as
+                                     an ordinary Lua value)
+error  = 1 value + return -1        (decoded, pushed, lua_error'd)
+value  = 0 nil | 1 false | 2 true | 3 f64 | 4 u32len+bytes |
+         5 u32n + n×(key value)
 ```
 
-The Go side (`host/hostfn.go`) implements `host.host_call` by invoking the
-registered `HostFunc`. Trampolines run on the goroutine holding the VM
-mutex — no new deadlock surface (A9 law, unchanged). The prod blob import
-list grows from five to six; `testdiff/m6c_test.go` and `host/blob.go`
-update their `want` slices in lockstep.
+`rt_hostfn(tablePtr, namePtr, fnidx)` installs a `lua_CFunction`
+trampoline as `<table>.<name>` (names are NUL-terminated bytes in
+`namebuf`; registration runs protected via `lua_cpcall`). The trampoline
+encodes args into `evbuf`, calls the new import `host.host_call(fnidx,
+argsPtr, argsLen, retPtr, retCap)`, and decodes returns from a dedicated
+256 KB staging buffer. Three hard-won rules baked into the C:
 
-**(b) String readback.** Error strings already come out via
-`rt_err_stage_copy`; results need the same for arbitrary strings. Add:
+- **Errors raise with `rt_where_mark()`** (position already decided) so
+  the adapter's re-raise adds no `chunk:line:` prefix — command error
+  texts propagate verbatim (Redis semantics; without the mark every
+  `redis.call` failure gains a `=script:1:` prefix).
+- **Every push in the guest-side decoder does `luaD_checkstack` first.**
+  An unchecked 65-deep table return overran the stack block and corrupted
+  adjacent memory — the guest spun forever (found by the chaos-host gate;
+  shallow returns never grew the stack, so only deep ones tripped it).
+- **Decode depth caps** (64 nesting) and count caps (4096 results) turn
+  malformed host bytes into clean Lua errors, never traps.
+
+The Go side (`host/hostfn.go`) implements `host.host_call`: decode args →
+`HostFunc` (panics contained) → encode results. Trampolines run on the
+goroutine holding the VM mutex — no new deadlock surface (A9 law). The
+prod blob import list grew from five to six; `testdiff/m6c_test.go` and
+`host/blob.go` pin the new set in lockstep, and every dev-engine host in
+`testdiff/` gained a refusing `host_call` stub.
+
+**(b) Result readback — `rt_encode_value` (replaces the originally
+sketched `rt_value_tostring`).** Rather than teaching the host the
+`TString`/`Table` memory layouts, one export encodes any TValue cell in
+the same wire protocol:
 
 ```c
-int32_t rt_value_tostring(int32_t cellAddr, int32_t bufAddr, int32_t cap);
-/* If the TValue at cellAddr is a string, copy bytes to buf → length;
-** otherwise -1. Host uses it after lua_main to convert result cells. */
+int32_t rt_encode_value(int32_t cell, int32_t dst, int32_t cap);
+/* Encode the cell's value (tables expanded, strings inline) at dst.
+** Returns the FULL encoded length — the host detects truncation when
+** the return exceeds cap and retries through an rt_frame_alloc buffer. */
 ```
 
-Numeric/bool/nil/table cells already decode directly from the 16-byte cell
-(Appendix B), so this closes the only gap.
+The host reads script results and error values through it
+(`rt_err_value_ptr`'s cell encodes the same way), so Appendix B's tag
+table is the only value contract — symmetric, and the layouts stay an
+implementation detail of the blob.
+
+**(c) `lua_main` returns the dispatch status verbatim (backend emitter
+change).** The as-built `emitMain` collapsed the dispatcher's return to
+0/1 and passed `want=0` — the result count never survived the entry and
+multret returns were truncated. `luawasm/backend.go` now emits
+`dispatch(0, frame, 0, 0, want=-1)` and returns its value unchanged:
+`nret ≥ 0` (nret results staged at `frame+0..16n`) or a negative error
+code with the error TValue staged as before. This matches the §4.5
+design sketch; the differential engines' status checks moved from
+`!= 0` to `< 0` (`testdiff/wasmengine.go`, `testdiff/wazeroengine.go`),
+and the full corpora re-ran green on the new contract.
 
 ### 4.3 The run protocol (normative step list)
 
@@ -337,7 +408,8 @@ differential-harness event log:
 4. **Instantiate the script module** as `"script"`; wire `wasm_dispatch`
    to `scriptInst.ExportedFunction("lua_dispatch")`, returning `-3`
    (refused) before it exists (`:175-189`).
-5. **Caps before state**: `rt_set_memlimit` if `MaxPages`/byte budget set —
+5. **Caps before state**: `rt_set_memlimit` from the engine's
+   `WithMemoryBudgetBytes` —
    must precede `lnewstate` so the whole VM lifetime counts (`:237-241`).
 6. `lnewstate` → `rt_set_state(L)` (`:243`, `:272`). Apply the run seed
    *after* `lnewstate` (which reseeds the host RNG to 42) (`:249-253`).
@@ -370,7 +442,7 @@ differential-harness event log:
     buffer → message bytes; non-string errors via `rt_err_value_ptr` and
     the 16-byte TValue render (`:341-360`).
 16. **Result path** (status ≥ 0 = nret): read nret cells at `frame+0..`,
-    decode per Appendix B, strings via `rt_value_tostring` (§4.2b). Convert
+    decode per §4.2b (each cell through `rt_encode_value`). Convert
     to `Result` (§5.6 does RESP after this point).
 17. `lclose(L)` on VM `Close` (v1 fresh-per-run closes eagerly).
 
@@ -691,7 +763,7 @@ both repos, `make lint` in Ultima, and the gopher-lua repo's full gate set
 after any blob rebuild. Commit prefixes follow the repo convention
 (`M8a: ...` in both repos).
 
-### M8a — gopher-lua `host/` package core (in this repo)
+### M8a — gopher-lua `host/` package core (in this repo) — **done (2026-09-22)**
 
 Deliverables: §4.1 package skeleton; blob embed + pin + self-check; run
 protocol steps 1–17 minus host functions; compile cache; result readback
@@ -701,6 +773,18 @@ existing gates re-run).
 
 **Exit gate**: §4.7 all green. `CGO_ENABLED=0 go build ./host/...`
 succeeds. No behavior change in any existing gate.
+
+*As built:* `host/{blob,wire,host,vm,hostfn}.go` + `host_test.go` (21
+tests: results/readback, binary-safe KEYS/ARGV, hostfn round-trips and
+verbatim error texts, panic containment, chaos host incl. the 65-deep
+stack-overrun regression, deadline kill + reuse + ctx cancel, memory
+budget, 5× determinism, sandbox surface, concurrent fresh VMs, shared-VM
+serialization, one-script law, print sink) and
+`examples/{eval,evalserver,sharedvm}` (evalserver demonstrates the
+per-script VM pool the measured 44 ms/60 µs split motivates). The §4.2c
+`lua_main` contract change is the one deviation from "no behavior change
+in existing gates" — it is invisible to every corpus (status checks moved
+`!= 0` → `< 0` in the two engines) and all suites re-ran green.
 
 ### M8b — Ultima EVAL without redis.call (pure scripts)
 
@@ -812,7 +896,7 @@ conventions panic otherwise).
 | R4 | Nested PauseAll (EVAL inside EXEC). | Must be verified in M8c before release; if token re-entrancy is not a no-op, serialize scripts and EXEC against a shared "strict path" mutex. |
 | R5 | Hard-kill keeps partial effects (S5 divergence from Redis's UNKILLABLE stance). | Documented decision; differential cases structured so Redis's behavior is only asserted where observable. |
 | R6 | Known number-dialect corners (ledger rows 38-survivor `math.huge` rendering, 40 arith error text, 48 pow 1-ulp). | Host-side RESP formatting (S7) keeps them out of replies; scripts observing `tostring(0.1^2)` still see the ledgered behavior — carry the rows into Ultima's differential skip list with reasons. |
-| R7 | Backend v1 feature gaps (coroutines, debug, runtime `loadstring`). | Clean compile errors; corpus skips carry reasons; upgrade plan (5.2→5.5, `docs/Upgrade-from-5.2-to-5.5-of-Lua.md`) may eventually change this surface. |
+| R7 | Backend v1 feature gaps (coroutine behavior divergence — row 22, debug introspection — row 23, runtime `loadstring` — sandboxed nil). | Corpus/differential skips carry reasons; upgrade plan (5.2→5.5, `docs/Upgrade-from-5.2-to-5.5-of-Lua.md`) may eventually change this surface. |
 | R8 | Blob freshness: Ultima embeds a copy; upstream rebuilds drift. | SHA-256 pin + a host-package self-check that fails loudly on mismatch; version the artifact when the API freezes. |
 | R9 | Lazy-pause parallel scripts (pure scripts skip PauseAll) — tempting superset. | Deferred past M8 (needs a sound "no observation before first call" argument + tests); noted for M9 with the §2 sketch. |
 
@@ -825,36 +909,37 @@ this plus options/caching/errors-as-values (sketch, not paste-ready):
 
 ```go
 func (vm *VM) run(ctx context.Context, s *Script, opt RunOptions) (Result, error) {
+    // sketch — the as-built code lives in host/vm.go; note the budget
+    // moved to Engine construction (WithMemoryBudgetBytes: rt_set_memlimit
+    // must precede lnewstate, i.e. it is per-image, not per-run)
     vm.mu.Lock(); defer vm.mu.Unlock()                       // A9
 
-    rtInst, _ := vm.rt, vm.scriptInst                        // fresh per VM (S4)
-    mem := rtInst.Memory()
+    rtInst, mem := vm.rtInst, vm.mem
     call := func(m api.Module, fn string, a ...uint64) ([]uint64, error)
 
-    if opt.MaxPages > 0 { call(rtInst, "rt_set_memlimit", u32(memBudget)) }
-    L, _ := call(rtInst, "lnewstate")
+    L, _ := call(rtInst, "lnewstate")       // (budget set at NewVM)
     call(rtInst, "rt_set_state", L)
     call(rtInst, "rt_sandbox", 1)
     ldostring("collectgarbage('stop')")                      // v1 GC law
     ldostring("KEYS=" + luaTableLit(opt.Keys) + ";ARGV=" + luaTableLit(opt.Argv))
     call(rtInst, "rt_set_dialect", 1)
     if v, _ := call(rtInst, "rt_abi_version"); int32(v[0]) != 3 { /* refuse */ }
-    registerHostFuncs(rtInst, vm.hostFuncs)                  // §4.2a
+    // hostfns registered at NewVM (§4.2a, rt_hostfn per name)
     call(vm.scriptInst, "luawasm_init", 2)
     frame := frameAlloc(scriptInst.Global("gFrameCells") * 16)
 
     var done atomic.Bool
-    if !opt.Deadline.IsZero() {
-        flagAddr := call(rtInst, "rt_ctrl_addr")
-        time.AfterFunc(time.Until(opt.Deadline), func() {
+    if opt.Deadline > 0 {
+        flagAddr := vm.ctrlAddr
+        time.AfterFunc(opt.Deadline, func() {
             if !done.Load() { mem.Write(flagAddr, []byte{1, 0, 0, 0}) }
         })
     }
-    st, err := call(vm.scriptInst, "lua_main", frame)
+    st, err := call(vm.scriptInst, "lua_main", frame)        // nret or <0 (§4.2c)
     done.Store(true)
     if err != nil { /* trap = backend bug: log SHA+meta */ }
     if int32(st[0]) < 0 { return Result{}, readStagedError(rtInst, mem) }
-    return readResults(rtInst, mem, frame, int32(st[0]))     // Appendix B + §4.2b
+    return readResults(rtInst, mem, frame, int32(st[0]))     // §4.2b rt_encode_value
 }
 ```
 
@@ -862,7 +947,7 @@ func (vm *VM) run(ctx context.Context, s *Script, opt RunOptions) (Result, error
 
 - Cell = 16 bytes at `frame+16*k`; value at offset 0, tag byte at offset 8.
 - Tags: `0` nil, `1` boolean (byte at 0), `3` number (LE f64 at 0),
-  `4` string (ref at 0 — read bytes via `rt_value_tostring`), `5` table,
+  `4` string (ref at 0 — read bytes via `rt_encode_value`), `5` table,
   `6` function.
 - `lua_main` return: `n ≥ 0` results staged at `frame+0..16n`;
   `-1` error (TValue staged in runtime → `rt_err_stage_copy` /
@@ -909,7 +994,7 @@ piece; texts below are reminders, **not** authoritative:
 | File | Work |
 |---|---|
 | `host/host.go`, `host/vm.go`, `host/protocol.go`, `host/convert.go`, `host/hostfn.go`, `host/blob.go` | §4.1 package |
-| `runtime/rt_abi.c`, `runtime/build.sh` | `rt_hostfn` + `host.host_call` import; `rt_value_tostring`; export list; rebuild both flavors |
+| `runtime/rt_abi.c`, `runtime/build.sh` | `rt_hostfn` + `host.host_call` import; `rt_encode_value`; export list; rebuild both flavors (built in `runtime/luawasm.c`) |
 | `testdiff/lua51_prod.wasm`, `host/lua51_prod.wasm` | rebuilt blob copies + SHA pin bumps (`testdiff/m6c_test.go:26`, new pin in `host/blob.go`) |
 | `host/host_test.go`, `examples/{eval,evalserver,sharedvm,bench}` | §4.7 gates |
 

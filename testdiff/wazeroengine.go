@@ -207,6 +207,14 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	}).Export("randomint").
 		NewFunctionBuilder().WithFunc(func(seed int64) { rng = rand.New(rand.NewSource(seed)) }).Export("randomseed").
 		NewFunctionBuilder().WithFunc(dispatch).Export("wasm_dispatch").
+		NewFunctionBuilder().WithFunc(func(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 {
+		// M7a: the hostfn seam is a host-package feature; this engine
+		// refuses (the guest raises the staged error value).
+		if m := r.Module("rt"); m != nil {
+			_ = m.Memory().Write(uint32(retPtr), wireErrHostFns)
+		}
+		return -1
+	}).Export("host_call").
 		Instantiate(ctx)
 	if err != nil {
 		return []string{"ENGINE-ERROR\thost module: " + err.Error()}
@@ -338,7 +346,9 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	if err != nil {
 		return append(log, "ENGINE-ERROR\ttrap: "+err.Error())
 	}
-	if int32(status[0]) != 0 {
+	// M7a: lua_main returns the dispatch status verbatim — nret ≥ 0 or a
+	// negative error code (want=-1 multret; the count survives the entry)
+	if int32(status[0]) < 0 {
 		// staged error: message bytes, or — for non-string error values —
 		// the exact TValue rendered (matches the wasmtime engine's path)
 		emitted := false

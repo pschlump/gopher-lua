@@ -176,7 +176,9 @@ func (b *backend) emitInit() {
 	f := m.NewFunction([]wasm.ValueType{wasm.I32}, nil)
 	// local 0 is the step PARAM; declared locals follow it
 	const lStep uint32 = 0
-	const (lS, lK, lC uint32 = 1, 2, 3)
+	const (
+		lS, lK, lC uint32 = 1, 2, 3
+	)
 	f.Local(wasm.I32).Local(wasm.I32).Local(wasm.I32)
 
 	strBytes := len(b.chunkName)
@@ -215,7 +217,7 @@ func (b *backend) emitInit() {
 		// advances the cursor past s, so the pointer is cursor-len(s)
 		for i, s := range pi.proto.StringConstants() {
 			writeStrBytes(f, lS, lC, s)
-			f.LocalGet(lK).I32Const(int32(cellSize*(pi.koff+pi.nc+i))).I32Add()
+			f.LocalGet(lK).I32Const(int32(cellSize * (pi.koff + pi.nc + i))).I32Add()
 			f.LocalGet(lS).LocalGet(lC).I32Const(int32(len(s))).I32Sub().I32Add()
 			f.I32Const(int32(len(s))).Call(b.imp("rt_intern")).Drop()
 		}
@@ -223,11 +225,11 @@ func (b *backend) emitInit() {
 		for i, cv := range pi.proto.Constants {
 			switch v := cv.(type) {
 			case lua.LNumber:
-				f.LocalGet(lK).I32Const(int32(cellSize*(pi.koff+i))).I32Add().F64Const(float64(v)).
+				f.LocalGet(lK).I32Const(int32(cellSize * (pi.koff + i))).I32Add().F64Const(float64(v)).
 					Call(b.imp("rt_mknumber"))
 			case lua.LString:
 				writeStrBytes(f, lS, lC, string(v))
-				f.LocalGet(lK).I32Const(int32(cellSize*(pi.koff+i))).I32Add()
+				f.LocalGet(lK).I32Const(int32(cellSize * (pi.koff + i))).I32Add()
 				f.LocalGet(lS).LocalGet(lC).I32Const(int32(len(v))).I32Sub().I32Add()
 				f.I32Const(int32(len(v))).Call(b.imp("rt_intern")).Drop()
 			default:
@@ -338,16 +340,15 @@ func (b *backend) emitDispatch() {
 }
 
 // emitMain writes the thin engine entry: lua_main(frame) runs proto 0
-// through the dispatcher and maps nret to the engine's status contract
-// (0 ok, 1 error).
+// through the dispatcher with want=-1 (multret) and returns the dispatch
+// status verbatim — nret ≥ 0 (nret results staged at frame+0..16n) or a
+// negative error code with the error TValue staged in the runtime
+// (design §4.5; M7a: the host package reads script results off the frame
+// cells, so the count must survive the entry).
 func (b *backend) emitMain() {
 	f := b.m.NewFunction([]wasm.ValueType{wasm.I32}, []wasm.ValueType{wasm.I32})
-	f.I32Const(0).LocalGet(0).I32Const(0).I32Const(0).I32Const(0).
-		Call(b.dispatchFn).LocalTee(0)
-	f.I32Const(0).I32GeS().If(wasm.Void)
-	f.I32Const(0).Return()
-	f.End()
-	f.I32Const(1).Return()
+	f.I32Const(0).LocalGet(0).I32Const(0).I32Const(0).I32Const(-1).
+		Call(b.dispatchFn)
 	f.End()
 	f.Export("lua_main")
 }

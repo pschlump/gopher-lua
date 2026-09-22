@@ -279,6 +279,17 @@ func (e *CLua) Run(c Case) []string {
 		func(idx, frame, cl, nargs, want int32) int32 { return -3 }); err != nil {
 		return []string{"ENGINE-ERROR\thost wasm_dispatch: " + err.Error()}
 	}
+	// M7a: the hostfn seam is a host-package feature — refuse with the
+	// staged error value (the oracle never registers host functions).
+	if err := linker.DefineFunc(store, "host", "host_call",
+		func(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 {
+			if dst := memRead(retPtr, int32(len(wireErrHostFns))); dst != nil {
+				copy(dst, wireErrHostFns)
+			}
+			return -1
+		}); err != nil {
+		return []string{"ENGINE-ERROR\thost host_call: " + err.Error()}
+	}
 
 	wasi := wt.NewWasiConfig()
 	if err := wasi.PreopenDir(c.Dir, "/", true); err != nil {

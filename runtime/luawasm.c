@@ -64,6 +64,17 @@ int32_t host_randomint(int32_t lo, int32_t hi);
 __attribute__((import_module("host"), import_name("randomseed")))
 void host_randomseed(int64_t seed);
 
+/* M7a: the Lua→Go function seam (the redis.call mechanism). The trampoline
+   below marshals call arguments through the wire protocol and invokes this;
+   the Go host runs the function and answers with result values (or one
+   error value + a negative return). Staging rides hf_retbuf — one hostfn
+   call is in flight per VM image (the host's per-image lock serializes
+   runs, and the Go callback cannot re-enter the guest), so static buffers
+   are safe. */
+__attribute__((import_module("host"), import_name("host_call")))
+int32_t host_host_call(int32_t fnidx, int32_t args_ptr, int32_t args_len,
+                       int32_t ret_ptr, int32_t ret_cap);
+
 /* ---- event kinds and value tags ---- */
 
 enum { EVT_PRINT = 1, EVT_GLOBALS = 2 };
@@ -254,6 +265,155 @@ static int g_randomseed(lua_State *L) {
   host_randomseed((int64_t)luaL_checknumber(L, 1));
   return 0;
 }
+
+/* ---- M7a: host-backed Lua functions (the redis.call seam) ---------------
+**
+** A Lua-visible function whose body lives in the Go host. Arguments cross
+** guest→host in the same tag-first wire protocol g_print uses (tables
+** expanded one argument deep, cycle/deep sentinels for pathological
+** graphs); results cross host→guest in the mirror format and are pushed
+** as ordinary Lua values. Errors are one wire value + a negative return:
+** the value is pushed and lua_error'd — plain lua_error adds no position
+** prefix, so command error texts propagate verbatim (Redis semantics).
+**
+** Wire formats (little-endian, PT_* tags above):
+**   args   = u32 count, count × value          (written into evbuf)
+**   result = u32 count, count × value          (host-written, hf_retbuf)
+**   error  = 1 value                           (host-written, hf_retbuf)
+*/
+
+#define HF_RET_CAP (256 * 1024)
+#define HF_DEC_MAX_DEPTH 64
+
+static char hf_retbuf[HF_RET_CAP];
+
+/* hf_error / hf_error_value: raise with the position already decided
+   (rt_where_mark) so the adapter's re-raise adds no "chunk:line:" prefix
+   — host-function messages are complete as written (command error texts
+   propagate verbatim, Redis semantics). */
+static int hf_error(lua_State *L, const char *msg) {
+  lua_pushstring(L, msg);
+  rt_where_mark();
+  return lua_error(L);
+}
+
+/* the decoded error value is already on top of the stack */
+static int hf_error_value(lua_State *L) {
+  rt_where_mark();
+  return lua_error(L);
+}
+
+/* push one wire value at buf[off] onto the Lua stack; returns the new
+   offset or -1 on malformed input (a host bug: surfaced as a Lua error,
+   never a trap). Every level checks stack space BEFORE pushing — an
+   unchecked run past the stack block corrupts adjacent memory (found by
+   the 65-deep chaos case: shallow pushes never grew the stack, deep ones
+   overran it and the guest spun). */
+static int dec_push_value(lua_State *L, const char *buf, int len, int off,
+                          int depth) {
+  uint32_t u;
+  if (off < 0 || off + 1 > len || depth > HF_DEC_MAX_DEPTH) return -1;
+  uint8_t tag = (uint8_t)buf[off++];
+  switch (tag) {
+  case PT_NIL:
+    luaD_checkstack(L, 1);
+    lua_pushnil(L);
+    return off;
+  case PT_FALSE:
+    luaD_checkstack(L, 1);
+    lua_pushboolean(L, 0);
+    return off;
+  case PT_TRUE:
+    luaD_checkstack(L, 1);
+    lua_pushboolean(L, 1);
+    return off;
+  case PT_NUMBER: {
+    double v;
+    if (off + 8 > len) return -1;
+    memcpy(&v, buf + off, 8);
+    luaD_checkstack(L, 1);
+    lua_pushnumber(L, v);
+    return off + 8;
+  }
+  case PT_STRING: {
+    if (off + 4 > len) return -1;
+    memcpy(&u, buf + off, 4);
+    off += 4;
+    if (u > (uint32_t)(len - off)) return -1;
+    luaD_checkstack(L, 1);
+    lua_pushlstring(L, buf + off, (size_t)u);
+    return off + (int)u;
+  }
+  case PT_TABLE: {
+    if (off + 4 > len) return -1;
+    memcpy(&u, buf + off, 4);
+    off += 4;
+    luaD_checkstack(L, 1);
+    lua_createtable(L, 0, (int)(u < 4096 ? u : 4096));
+    for (uint32_t i = 0; i < u; i++) {
+      luaD_checkstack(L, 2); /* key + value live simultaneously */
+      off = dec_push_value(L, buf, len, off, depth + 1); /* key */
+      if (off < 0) return -1;
+      off = dec_push_value(L, buf, len, off, depth + 1); /* value */
+      if (off < 0) return -1;
+      lua_settable(L, -3);
+    }
+    return off;
+  }
+  default: return -1; /* functions/userdata/cycles never cross this way */
+  }
+}
+
+static int g_hostfn(lua_State *L) {
+  int fnidx = (int)lua_tointeger(L, lua_upvalueindex(1));
+  int n = lua_gettop(L);
+
+  /* encode arguments into evbuf (safe: mutually exclusive with g_print /
+     emit_globals — the host callback cannot trigger guest re-entry) */
+  const void *anc[ENC_MAX_DEPTH + 1];
+  int off = enc_u32(0, (uint32_t)n);
+  for (int i = 1; i <= n && off > 0; i++)
+    off = enc_value(L, i, off, 1, 0, anc, 0);
+  if (off < 0) {
+    return hf_error(L, "host function call: argument encoding overflow");
+  }
+
+  int32_t r = host_host_call(fnidx, (int32_t)(size_t)evbuf, off,
+                             (int32_t)(size_t)hf_retbuf, HF_RET_CAP);
+  if (r < 0) {
+    /* one error value in hf_retbuf; a malformed buffer falls back to a
+       generic message rather than trusting host bytes */
+    int mark = lua_gettop(L);
+    int o = dec_push_value(L, hf_retbuf, HF_RET_CAP, 0, 0);
+    if (o < 0) {
+      lua_settop(L, mark); /* a partial table decode leaves junk below */
+      return hf_error(L, "host function call failed");
+    }
+    return hf_error_value(L);
+  }
+  if (r < 4 || r > HF_RET_CAP) {
+    return hf_error(L, "host function call: malformed result framing");
+  }
+  {
+    uint32_t count;
+    int o = 0;
+    memcpy(&count, hf_retbuf, 4);
+    o = 4;
+    if (count > 4096) {
+      return hf_error(L, "host function call: too many results");
+    }
+    for (uint32_t i = 0; i < count; i++) {
+      o = dec_push_value(L, hf_retbuf, r, o, 0);
+      if (o < 0) {
+        return hf_error(L, "host function call: malformed result value");
+      }
+    }
+    return (int)count;
+  }
+}
+
+/* rt_hostfn and rt_encode_value live with g_state in the exported-driver
+   section below (they operate on the state lnewstate built). */
 
 /* ---- constant os.* stubs ---- */
 #ifndef LUAWASM_PROD /* dev engines only (prod: os lib never opened) */
@@ -544,6 +704,68 @@ int32_t lnewstate(void) {
 
 void lglobals(void) {
   if (g_state != NULL) emit_globals(g_state);
+}
+
+/* rt_hostfn (M7a): install <table>.<name> = host function #fnidx. Names
+   are NUL-terminated bytes in the host staging buffers (the host writes
+   "redis\0call\0" style pairs into namebuf). Runs protected (registration
+   allocates; an OOM must longjmp into the pcall, not out of the export —
+   the posture install_shims leaves to chance is held to a higher bar on
+   this production-facing surface). */
+struct hf_reg_args {
+  const char *table, *name;
+  int fnidx;
+};
+static struct hf_reg_args hf_reg;
+
+static int hf_reg_body(lua_State *L) {
+  lua_getglobal(L, hf_reg.table);
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushvalue(L, -1);
+    lua_setglobal(L, hf_reg.table);
+    lua_getglobal(L, hf_reg.table);
+  }
+  lua_pushinteger(L, (lua_Integer)hf_reg.fnidx);
+  lua_pushcclosure(L, g_hostfn, 1);
+  lua_setfield(L, -2, hf_reg.name);
+  lua_pop(L, 1);
+  return 0;
+}
+
+int32_t rt_hostfn(int32_t table_ptr, int32_t name_ptr, int32_t fnidx) {
+  if (g_state == NULL) return -1;
+  hf_reg.table = (const char *)(size_t)table_ptr;
+  hf_reg.name = (const char *)(size_t)name_ptr;
+  hf_reg.fnidx = (int)fnidx;
+  if (lua_cpcall(g_state, hf_reg_body, NULL) != 0) {
+    lua_pop(g_state, 1); /* error object */
+    return -1;
+  }
+  return 0;
+}
+
+/* rt_encode_value (M7a): encode the TValue cell at `cell` in the host
+   wire protocol (tables expanded, strings inline) so the host can read
+   script results without layout knowledge of TString/Table. Returns the
+   full encoded length (the host detects truncation when the return
+   exceeds cap); -1 on overflow or a missing state. Called between runs
+   with the state quiescent — the evbuf pass-through is exclusive with
+   g_print/emit_globals by the same host-driven sequencing. */
+int32_t rt_encode_value(int32_t cell, int32_t dst, int32_t cap) {
+  lua_State *L = g_state;
+  if (L == NULL) return -1;
+  int base = lua_gettop(L);
+  lua_pushnil(L); /* slot to fill from the cell */
+  setobj2s(L, L->top - 1, (const TValue *)(size_t)cell);
+  const void *anc[ENC_MAX_DEPTH + 1];
+  int off = enc_value(L, -1, 0, 1, 0, anc, 0);
+  lua_settop(L, base);
+  if (off < 0) return -1;
+  int32_t n = (int32_t)off < cap ? (int32_t)off : cap;
+  if (n > 0) memcpy((void *)(size_t)dst, evbuf, (size_t)n);
+  return (int32_t)off;
 }
 
 /* diagnostics: bisect lnewstate (must also run inside the driver —

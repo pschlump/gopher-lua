@@ -48,6 +48,11 @@ func trapEnvNamedBin(t *testing.T, wasi, script bool, chunkName string, binOverr
 		func(idx, frame, cl, nargs, want int32) int32 { return -3 }); err != nil {
 		t.Fatal(err)
 	}
+	// M7a: hostfn seam — refusing stub (no host functions registered)
+	if err := linker.DefineFunc(store, "host", "host_call",
+		func(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 { return -1 }); err != nil {
+		t.Fatal(err)
+	}
 	if wasi {
 		w := wt.NewWasiConfig()
 		if err := w.PreopenDir(t.TempDir(), "/", true); err != nil {

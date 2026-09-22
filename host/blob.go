@@ -1,0 +1,78 @@
+// Package host is the public Go API a pure-Go daemon (the Ultima Redis
+// clone) imports to run untrusted Lua scripts: compile to wasm, execute
+// on wazero against the embedded production runtime blob, exchange values
+// with in-script host functions (the redis.call seam). It is pure Go —
+// no cgo, no C sources, no C toolchain (design doc A8; the C under
+// runtime/ is this repo's build-time concern only).
+//
+// The run protocol here is the gate-green embedding from
+// testdiff/wazeroengine.go (M6a–M6e), productized: options instead of
+// struct fields, a compile cache, typed results, and the A9 per-VM
+// memory-image lock.
+package host
+
+import (
+	"crypto/sha256"
+	_ "embed"
+	"encoding/hex"
+	"errors"
+	"fmt"
+
+	"github.com/pschlump/gopher-lua/wasm"
+)
+
+// The production runtime blob: -DLUAWASM_PROD flavor — base/table/string/
+// math libraries only, imports exactly the six host.* functions, zero
+// WASI imports (no fs/env/clock ever enters the guest). Rebuilt by
+// runtime/build.sh, which copies it here; the SHA pin below is the lock
+// that forces a conscious bump on every rebuild.
+//
+//go:embed lua51_prod.wasm
+var prodBlob []byte
+
+const prodBlobSHA256 = "265892c0e3931205e563acf5c7dc4d364fedbc0c8f6045c4cb9514595aa03656"
+
+// hostImports is the frozen import surface the blob expects this package
+// to provide (mirrored by testdiff/m6c_test.go's artifact gate).
+var hostImports = []string{
+	"event",         // print/library event stream out of the guest
+	"random01",      // math.random()
+	"randomint",     // math.random(lo,hi)
+	"randomseed",    // math.randomseed(n)
+	"wasm_dispatch", // C adapter → compiled-proto dispatch (same goroutine)
+	"host_call",     // M7a: Lua→Go host functions (redis.call)
+}
+
+// verifyBlob enforces the artifact contract on engine construction: the
+// exact pinned bytes, imports confined to the host.* set above, and no
+// WASI imports. A drifted or tampered blob fails loudly at NewEngine,
+// never at first guest call.
+func verifyBlob(bin []byte) error {
+	sum := sha256.Sum256(bin)
+	if hex.EncodeToString(sum[:]) != prodBlobSHA256 {
+		return fmt.Errorf("host: runtime blob SHA-256 %s does not match pin %s",
+			hex.EncodeToString(sum[:]), prodBlobSHA256)
+	}
+	imps, err := wasm.Imports(bin)
+	if err != nil {
+		return fmt.Errorf("host: parse runtime blob imports: %w", err)
+	}
+	want := map[string]bool{}
+	for _, n := range hostImports {
+		want[n] = true
+	}
+	for _, im := range imps {
+		if im.Module != "host" || !want[im.Name] {
+			return errors.New("host: runtime blob has an import outside the frozen host.* set: " +
+				im.Module + "." + im.Name)
+		}
+		delete(want, im.Name)
+	}
+	if len(want) > 0 {
+		return fmt.Errorf("host: runtime blob is missing host imports %v", want)
+	}
+	if wasi, err := wasm.HasWASIImports(bin); err != nil || wasi {
+		return errors.New("host: runtime blob imports WASI (fs/env/clock) — not a production blob")
+	}
+	return nil
+}

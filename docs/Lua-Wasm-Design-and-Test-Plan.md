@@ -453,6 +453,35 @@ The differential harness logs an opcode histogram per script (interpreter side).
 | **M5** | Backend v1 complete: all 41 opcodes, closures/upvalues/varargs/metamethods/pcall/tailcall trampoline, line immediates | Full `_glua-tests` + curated Redis corpus: 0 unledgered DIVERGE; error-message suite byte-exact | 3–4 wk |
 | **M6** | Hardening: arena/GC watermark, stack limits, deadline, determinism, isolation | All 8.6 tests green; 7-night fuzz soak zero new classes; TRAP count = 0 over corpus ×10⁷ executions | 2 wk |
 | **M7** | **Go Redis clone** integration: `host/` API freeze (§6), `redis.*` host module, script cache, EVAL/EVALSHA/SCRIPT FLUSH flows, caps, typed-table reply conversion, locked-VM examples | Integration suite (incl. deadline kill, OOM, flush-isolation) green **in the Go Redis clone repo**; `host/` + `examples/` green under `go test -race` | 2–3 wk |
+
+> **Status (2026-09-22): M7a (the host-package core) complete.** `host/`
+> is built on the wazero production engine per §6/A8/A9:
+> `Engine` (SHA-pinned embedded prod blob, compile cache,
+> `RegisterGlobal` host-function registry), `VM` (private wazero runtime +
+> rt/script instances + the image mutex; `Run` holds it end-to-end),
+> `RunOptions{Keys,Argv,Deadline,Seed}`, `Result`/`Value` (wire-protocol
+> values), `ScriptError`/`TrapError` (script errors vs backend-bug traps).
+> Runtime additions (additive to ABI v3): the `host.host_call` import +
+> `rt_hostfn` (Lua→Go functions — the `redis.call` seam; args/results
+> marshal through the tag-first wire protocol with expanded tables,
+> errors raise via `rt_where_mark` so command texts stay verbatim) and
+> `rt_encode_value` (any TValue cell → wire bytes; result/error readback
+> with zero TString/Table layout knowledge). Backend contract fix:
+> `lua_main` now returns the dispatch status verbatim with `want=-1`
+> (multret) — the count survived the entry, so script return values are
+> host-readable; engines' status checks moved `!=0`→`<0`. Hardened by the
+> gates: the chaos-host suite found an unchecked-stack overrun in the
+> guest decoder (65-deep table returns corrupted memory — every push now
+> `luaD_checkstack`s) and a late-watchdog flag race (flagMu). Measured on
+> darwin/arm64 (interpreter engine): fresh VM ≈ 44 ms vs ≈ 60 µs re-run
+> on a bound image → hot paths pool VMs per script (`examples/evalserver`);
+> v1 law: one script per image (per-script proto indices). Gates: `go
+> test ./host/ -race` ×2 green, `CGO_ENABLED=0 go build ./host/` green,
+> examples run, and every pre-existing suite re-ran green on the rebuilt
+> blob (root, testdiff incl. M6c matrix + D5 determinism, `_cli-tests`
+> wasmtime + WAZERO=1 legs). Ultima-side integration (M8b–M8e of
+> `docs/How-To-Integrate-Gopher-Lua-with-Redis-Clone-Called-Ultima.md`)
+> is the remaining M7 work.
 | **M8** | Performance: v2 structured control flow (differential-tested against v1 per-function), inline caches at hot sites, instantiate-vs-reset measurement, benchmark harness vs C Lua (`examples/bench`) | Perf gate: ≥2× fork on numeric corpus; v1↔v2 differential zero diffs; no >5% regressions on any column incl. the C-Lua ratio; head-to-head **vs C Lua 5.1 native** measured, reported, and trended (§8.10) | 3–4 wk |
 
 **Total: ~3.5–5.5 months** solo (consistent with the plan doc's estimate). M1 before M4 is deliberate: the differential harness existing *before* the backend is what makes every later milestone measurable. M2 before M3 is deliberate too: a whole-C-Lua-in-wasm oracle de-risks the runtime port with zero new compiler code.

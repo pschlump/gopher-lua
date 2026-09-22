@@ -77,6 +77,15 @@ func luaQuote(s string) string {
 	return b.String()
 }
 
+// wireErrHostFns is the host_call refusal as one wire-protocol value
+// (PT_STRING: tag 4, u32 LE length, bytes) — engines without the hostfn
+// surface stage it so the guest raises a clean Lua error.
+var wireErrHostFns = func() []byte {
+	const msg = "host functions are not available in this engine"
+	b := []byte{4, byte(len(msg)), 0, 0, 0}
+	return append(b, msg...)
+}()
+
 // setArgGlobal exposes the CLI args in the runtime state as the global arg
 // table — arg[0] = chunkname (the C driver contract, luawasm.c's
 // dostring_body: raw name without the '@' prefix), arg[i] = c.Args[i-1] —
@@ -266,6 +275,11 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		}
 		return unsafe.Slice((*byte)(unsafe.Pointer(uintptr(base)+uintptr(ptr))), length)
 	}
+	memWrite := func(ptr int32, b []byte) {
+		if dst := memRead(ptr, int32(len(b))); dst != nil {
+			copy(dst, b)
+		}
+	}
 
 	rng := rand.New(rand.NewSource(42))
 	linker := wt.NewLinker(engine)
@@ -343,6 +357,16 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		return -3
 	}
 	if err := linker.DefineFunc(store, "host", "wasm_dispatch", dispatch); err != nil {
+		return []string{"ENGINE-ERROR\t" + err.Error()}
+	}
+	// M7a: host-backed Lua functions (the redis.call seam) are a
+	// host-package feature; the differential engines refuse them — the
+	// guest raises the staged error value as a clean Lua error.
+	if err := linker.DefineFunc(store, "host", "host_call",
+		func(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 {
+			memWrite(retPtr, wireErrHostFns)
+			return -1
+		}); err != nil {
 		return []string{"ENGINE-ERROR\t" + err.Error()}
 	}
 
@@ -517,7 +541,9 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		return append(log, "ENGINE-ERROR\ttrap: "+err.Error())
 	}
 	stv, _ := status.(int32)
-	if stv != 0 {
+	// M7a: lua_main returns the dispatch status verbatim — nret ≥ 0 or a
+	// negative error code (want=-1 multret; the count survives the entry)
+	if stv < 0 {
 		// staged error: message bytes, or — for non-string error values —
 		// the exact TValue rendered here (M5d: error(nil)/error(42) match
 		// the interp's deterministic renders; table/function values carry

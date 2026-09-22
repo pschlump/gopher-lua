@@ -46,6 +46,7 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -Wl,--export=rt_set_memlimit -Wl,--export=rt_mem_used_bytes \
   -Wl,--export=rt_ctrl_addr -Wl,--export=rt_set_deadline \
   -Wl,--export=rt_deadline_flag -Wl,--export=rt_deadline \
+  -Wl,--export=rt_hostfn -Wl,--export=rt_encode_value \
   -Wl,--export=lglobals"
 
 # M6d: declare a memory MAX on both flavors. (i) A static (max-bounded)
@@ -120,6 +121,11 @@ fi
 
 cp lua51_sjlj.wasm ../testdiff/lua51_sjlj.wasm
 cp lua51_prod.wasm ../testdiff/lua51_prod.wasm
+# M7a: the host package embeds its own copy of the prod blob (go:embed
+# cannot cross package dirs). cmp keeps the two from drifting; the SHA pin
+# in host/blob.go is the second lock.
+mkdir -p ../host
+cp lua51_prod.wasm ../host/lua51_prod.wasm
 
 ls -la lua51_sjlj.wasm lua51_prod.wasm
 [ "$1" = "--with-asyncify" ] && ls -la selftest.wasm lua51.wasm

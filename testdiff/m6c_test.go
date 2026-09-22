@@ -22,8 +22,9 @@ import (
 
 // lua51ProdSHA256 pins the embedded prod blob. Rebuild runtime/build.sh →
 // update this constant (the artifact test is the self-check that forces
-// the bump). Brittle by design (A8: checksummed artifact).
-const lua51ProdSHA256 = "6dd4a8451655c810913a82b14ba439f9b4de4cb9c61d848224d0b0d09ebe513f"
+// the bump). Brittle by design (A8: checksummed artifact). M7a bump: the
+// hostfn seam (host.host_call import + rt_hostfn/rt_encode_value exports).
+const lua51ProdSHA256 = "265892c0e3931205e563acf5c7dc4d364fedbc0c8f6045c4cb9514595aa03656"
 
 func TestM6cProdBlobArtifact(t *testing.T) {
 	imps, err := wasm.Imports(lua51ProdWasm)
@@ -38,7 +39,8 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 		}
 		got[im.Name] = true
 	}
-	want := []string{"event", "random01", "randomint", "randomseed", "wasm_dispatch"}
+	want := []string{"event", "random01", "randomint", "randomseed", "wasm_dispatch",
+		"host_call"} // M7a: the Lua→Go function seam (redis.call)
 	for _, w := range want {
 		if !got[w] {
 			t.Errorf("host.%s missing from prod blob (have %v)", w, got)
@@ -60,6 +62,8 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 		"rt_set_state", "rt_set_dialect", "rt_abi_version", "rt_frame_alloc", "linbuf", "lnamebuf",
 		// M6d: the cap + deadline surface (ledger rows 36-37)
 		"rt_set_memlimit", "rt_mem_used_bytes", "rt_ctrl_addr", "rt_set_deadline",
+		// M7a: the hostfn seam + wire result readback
+		"rt_hostfn", "rt_encode_value",
 		"rt_deadline_flag", "rt_deadline"} {
 		if !exp[name] {
 			t.Errorf("prod blob export %s missing", name)

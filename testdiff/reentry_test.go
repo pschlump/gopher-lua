@@ -213,6 +213,11 @@ func TestWasmReentrySpike(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// M7a: hostfn seam — refusing stub (no host functions registered)
+	if err := linker.DefineFunc(store, "host", "host_call",
+		func(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 { return -1 }); err != nil {
+		t.Fatal(err)
+	}
 
 	rtBin := lua51SjljWasm
 	if p := os.Getenv("RTDBG"); p != "" {

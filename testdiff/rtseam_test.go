@@ -60,6 +60,12 @@ func rtSetup(t *testing.T, scriptBin []byte) (*wt.Store, *wt.Instance, func(stri
 		func(idx, frame, cl, nargs, want int32) int32 { return -3 }); err != nil {
 		t.Fatal(err)
 	}
+	// M7a: hostfn seam — never invoked here (no host functions are
+	// registered); the import must resolve.
+	if err := linker.DefineFunc(store, "host", "host_call",
+		func(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 { return -1 }); err != nil {
+		t.Fatal(err)
+	}
 	store.SetWasi(wt.NewWasiConfig())
 	inst, err := linker.Instantiate(store, module)
 	if err != nil {

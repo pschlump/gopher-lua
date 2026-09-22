@@ -256,6 +256,14 @@ func (e *Engine) NewVM() (*VM, error) {
 			return nil, fmt.Errorf("host: staging value constants: %w", err)
 		}
 	}
+	// globals lockdown (Redis-classic): after ALL host staging, before any
+	// script runs — Run stages KEYS/ARGV inside a readonly-off window
+	if e.opts.globalsProtection {
+		if _, err := vm.call0(ctx, "rt_protect_globals", 1); err != nil {
+			r.Close(ctx)
+			return nil, fmt.Errorf("host: rt_protect_globals: %w", err)
+		}
+	}
 	// cache the deadline flag address once (valid for the instance's
 	// lifetime — the memory never moves)
 	if a, err := vm.call0(ctx, "rt_ctrl_addr"); err == nil {
@@ -397,8 +405,21 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 		sb.WriteString(luaQuote(a))
 	}
 	sb.WriteString("}")
+	if vm.e.opts.globalsProtection {
+		// KEYS/ARGV write globals: open the readonly window for the
+		// staging chunk, close it right after (Redis sets KEYS/ARGV with
+		// the globals protection temporarily lifted the same way)
+		if _, err := vm.call0(ctx, "rt_globals_readonly", 0); err != nil {
+			return Result{}, err
+		}
+	}
 	if err := vm.ldostring(ctx, sb.String(), "=args"); err != nil {
 		return Result{}, &ScriptError{ErrValue: String(err.Error())}
+	}
+	if vm.e.opts.globalsProtection {
+		if _, err := vm.call0(ctx, "rt_globals_readonly", 1); err != nil {
+			return Result{}, err
+		}
 	}
 
 	if opt.Seed != 0 {

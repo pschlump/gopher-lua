@@ -44,6 +44,7 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -Wl,--export=rt_tail_stage -Wl,--export=rt_tail_clidx -Wl,--export=rt_tail_nargs \
   -Wl,--export=rt_tail_funcell -Wl,--export=rt_tail_restage \
   -Wl,--export=rt_set_dialect -Wl,--export=rt_sandbox \
+  -Wl,--export=rt_protect_globals -Wl,--export=rt_globals_readonly \
   -Wl,--export=rt_set_memlimit -Wl,--export=rt_mem_used_bytes \
   -Wl,--export=rt_ctrl_addr -Wl,--export=rt_set_deadline \
   -Wl,--export=rt_deadline_flag -Wl,--export=rt_deadline \

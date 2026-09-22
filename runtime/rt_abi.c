@@ -283,7 +283,71 @@ int32_t rt_sandbox(int32_t on) {
   return n;
 }
 
+/* ---- M8d: script globals lockdown (Redis deps/lua + script_lua.c parity) ----
+**
+** rt_protect_globals(1) installs Redis 7.2.7's script-environment
+** protection on the state set by rt_set_state:
+**   1. an error metatable on _G whose __index raises
+**      "Script attempted to access nonexistent global variable '<k>'"
+**      (script_lua.c's luaProtectedTableError), and
+**   2. the readonly flag on _G and every table reachable from it —
+**      luaSetTableProtectionRecursively — so ANY write (assignment,
+**      rawset, rawseti) raises "Attempt to modify a readonly table"
+**      (the lvm.c/lapi.c deps/lua patch).
+** KEYS/ARGV stage AFTER this under rt_globals_readonly(0..1), so they
+** stay writable (Redis: KEYS[1]='x' is legal). Host order per VM:
+** sandbox → hostfn/value staging → rt_protect_globals → per-run KEYS/
+** ARGV window.
+*/
+static int rt_protected_index(lua_State *L) {
+  int argc = lua_gettop(L);
+  if (argc != 2)
+    luaL_error(L, "Wrong number of arguments to luaProtectedTableError");
+  if (!lua_isstring(L, -1) && !lua_isnumber(L, -1))
+    luaL_error(L, "Second argument to luaProtectedTableError must be a string or number");
+  luaL_error(L, "Script attempted to access nonexistent global variable '%s'",
+             lua_tostring(L, -1));
+  return 0;
+}
+
+/* table at top of stack; recursion guard = the flag itself (_G._G loops) */
+static void rt_protect_rec(lua_State *L) {
+  if (lua_isreadonlytable(L, -1)) return;
+  lua_enablereadonlytable(L, -1, 1);
+  lua_checkstack(L, 2);
+  lua_pushnil(L);
+  while (lua_next(L, -2)) {
+    if (lua_istable(L, -1)) rt_protect_rec(L);
+    lua_pop(L, 1);
+  }
+  if (lua_getmetatable(L, -1)) {
+    rt_protect_rec(L);
+    lua_pop(L, 1);
+  }
+}
+
+int32_t rt_protect_globals(int32_t on) {
+  lua_State *L = curL;
+  if (!on || L == NULL) return -1;
+  lua_newtable(L);
+  lua_pushcfunction(L, rt_protected_index);
+  lua_setfield(L, -2, "__index");
+  lua_setmetatable(L, LUA_GLOBALSINDEX);
+  lua_getglobal(L, "_G"); /* LUA_GLOBALSINDEX value, real index for the walk */
+  rt_protect_rec(L);
+  lua_pop(L, 1);
+  return 0;
+}
+
+/* the KEYS/ARGV staging window (host Run): toggle _G's own readonly flag */
+int32_t rt_globals_readonly(int32_t on) {
+  if (curL == NULL) return -1;
+  lua_enablereadonlytable(curL, LUA_GLOBALSINDEX, on ? 1 : 0);
+  return 0;
+}
+
 int32_t rt_err_pending(void) { return err_pending; }
+
 
 /* ---- M6d (D3): the per-VM allocation cap ----
 **

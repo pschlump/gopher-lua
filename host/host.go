@@ -30,9 +30,10 @@ type HostFunc func(vm *VM, args []Value) ([]Value, error)
 type Option func(*options)
 
 type options struct {
-	blob      []byte                     // runtime blob override (still SHA-pinned)
-	maxMem    int64                      // per-VM allocation budget bytes (0 = unlimited; the blob's 256 MiB linear-memory max is the hard backstop either way)
-	eventSink func(vm *VM, args []Value) // EVT_PRINT observer (already wire-decoded)
+	blob              []byte                     // runtime blob override (still SHA-pinned)
+	maxMem            int64                      // per-VM allocation budget bytes (0 = unlimited; the blob's 256 MiB linear-memory max is the hard backstop either way)
+	eventSink         func(vm *VM, args []Value) // EVT_PRINT observer (already wire-decoded)
+	globalsProtection bool                       // Redis-classic globals lockdown per VM (rt_protect_globals)
 }
 
 // WithRuntimeBlob replaces the embedded production blob (a staged/test
@@ -54,6 +55,18 @@ func WithMemoryBudgetBytes(n int64) Option {
 // wire protocol). Called on the lock-holding goroutine.
 func WithEventSink(fn func(vm *VM, args []Value)) Option {
 	return func(o *options) { o.eventSink = fn }
+}
+
+// WithGlobalsProtection installs the Redis-classic script environment
+// lockdown on every VM (rt_protect_globals): reading an undefined global
+// raises "Script attempted to access nonexistent global variable '<k>'",
+// and globals plus every table reachable from them are readonly — any
+// write (assignment, rawset, rawseti) raises "Attempt to modify a
+// readonly table". KEYS/ARGV stage per run inside a readonly-off window,
+// so they stay writable. Enable after all RegisterGlobal/RegisterValue
+// calls (VM creation order: sandbox → host staging → protection).
+func WithGlobalsProtection(on bool) Option {
+	return func(o *options) { o.globalsProtection = on }
 }
 
 // Engine is the shared, process-wide scripting engine.

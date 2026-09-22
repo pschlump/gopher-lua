@@ -103,6 +103,7 @@ ones the host package uses):
 lnewstate () -> L          ldostring (L, inAddr, len, nameAddr, nres)
 rt_set_state (L)           rt_abi_version () -> 3
 rt_sandbox (1)             rt_set_dialect (1)
+rt_protect_globals (1)     rt_globals_readonly (on)   # M8d: Redis-classic globals lockdown + KEYS/ARGV staging window
 rt_set_memlimit (bytes)    rt_mem_used_bytes () -> i64
 rt_ctrl_addr () -> addr    rt_set_deadline / rt_deadline_flag / rt_deadline
 rt_frame_alloc (nbytes) -> addr

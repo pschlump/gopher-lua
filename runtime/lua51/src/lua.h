@@ -337,6 +337,11 @@ LUA_API const char *lua_setlocal (lua_State *L, const lua_Debug *ar, int n);
 LUA_API const char *lua_getupvalue (lua_State *L, int funcindex, int n);
 LUA_API const char *lua_setupvalue (lua_State *L, int funcindex, int n);
 
+/* Redis parity (deps/lua patch): readonly tables for the script globals
+** lockdown (see rt_protect_globals in rt_abi.c). */
+LUA_API void lua_enablereadonlytable (lua_State *L, int index, int enabled);
+LUA_API int lua_isreadonlytable (lua_State *L, int index);
+
 LUA_API int lua_sethook (lua_State *L, lua_Hook func, int mask, int count);
 LUA_API lua_Hook lua_gethook (lua_State *L);
 LUA_API int lua_gethookmask (lua_State *L);

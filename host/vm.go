@@ -55,9 +55,11 @@ type Result struct {
 // ScriptError is a Lua-level error (raised by the script, a library, a
 // host function, or the deadline/OOM machinery). ErrValue is the exact
 // error value; for string errors Redis semantics pass the text through
-// verbatim.
+// verbatim. Line is the raise line inside the script (0 = unknown) — the
+// position Redis reports as "on @user_script:N" in error replies.
 type ScriptError struct {
 	ErrValue Value
+	Line     int
 }
 
 func (e *ScriptError) Error() string { return e.ErrValue.String() }
@@ -97,7 +99,8 @@ type VM struct {
 	L         int32 // the lua_State handle from lnewstate
 	ctrlAddr  uint32
 	rng       *rand.Rand
-	hostFns   []registeredFn // snapshot of the engine registry
+	hostFns   []registeredFn  // snapshot of the engine registry
+	hostVals  []registeredVal // snapshot of the engine value registry
 	eventSink func(vm *VM, args []Value)
 
 	script     *Script         // bound at first Run (one-script law)
@@ -132,7 +135,7 @@ func (e *Engine) NewVM() (*VM, error) {
 		e.mu.Unlock()
 		return nil, errors.New("host: engine closed")
 	}
-	vm := &VM{e: e, rng: rand.New(rand.NewSource(42)), hostFns: e.hostFns, eventSink: e.opts.eventSink}
+	vm := &VM{e: e, rng: rand.New(rand.NewSource(42)), hostFns: e.hostFns, hostVals: e.hostVals, eventSink: e.opts.eventSink}
 	e.vms++
 	e.mu.Unlock()
 
@@ -236,6 +239,21 @@ func (e *Engine) NewVM() (*VM, error) {
 			u32v(int32(nameAddr[0])+int32(len(hf.table))+1), u32v(int32(i))); err != nil {
 			r.Close(ctx)
 			return nil, fmt.Errorf("host: rt_hostfn(%s.%s): %w", hf.table, hf.name, err)
+		}
+	}
+	// value constants (redis.LOG_WARNING and friends): staged as source
+	// after the hostfn tables exist, still before any script runs
+	if len(vm.hostVals) > 0 {
+		var sb strings.Builder
+		for _, rv := range vm.hostVals {
+			fmt.Fprintf(&sb, "%s=%s or {};", rv.table, rv.table)
+		}
+		for _, rv := range vm.hostVals {
+			fmt.Fprintf(&sb, "%s.%s=%s;", rv.table, rv.name, luaValueLit(rv.v))
+		}
+		if err := vm.ldostring(ctx, sb.String(), "=hostvals"); err != nil {
+			r.Close(ctx)
+			return nil, fmt.Errorf("host: staging value constants: %w", err)
 		}
 	}
 	// cache the deadline flag address once (valid for the instance's
@@ -451,7 +469,7 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 
 	n := int32(status[0])
 	if n < 0 {
-		return Result{}, &ScriptError{ErrValue: vm.readErrorValue(ctx)}
+		return Result{}, &ScriptError{ErrValue: vm.readErrorValue(ctx), Line: vm.readErrLine(ctx)}
 	}
 	vals := make([]Value, 0, max(int(n), 1))
 	for i := int32(0); i < n; i++ {
@@ -563,6 +581,29 @@ func (vm *VM) readCellValue(ctx context.Context, cellAddr uint32) (Value, error)
 		return Value{}, derr
 	}
 	return v, nil
+}
+
+// readErrLine returns the staged error's raise line (rt_err_line, M8) —
+// 0 when the blob predates the export or the line is unknown.
+func (vm *VM) readErrLine(ctx context.Context) int {
+	v, err := vm.call0(ctx, "rt_err_line")
+	if err != nil || len(v) == 0 {
+		return 0
+	}
+	return int(int32(v[0]))
+}
+
+// Kill trips the in-flight run's deadline flag: the next guest loop
+// back-edge raises the ordinary (pcall-catchable) deadline error, exactly
+// as if the watchdog had fired. No-op between runs. This is the SCRIPT
+// KILL mechanism: the daemon's scripting manager calls it on the VM a
+// killable script is running on.
+func (vm *VM) Kill() {
+	vm.flagMu.Lock()
+	defer vm.flagMu.Unlock()
+	if vm.ctrlAddr != 0 && vm.inRun.Load() {
+		_ = vm.mem.Write(vm.ctrlAddr, deadlineFlagLE)
+	}
 }
 
 // Close tears the image down: the Lua state, both module instances, and

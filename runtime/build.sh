@@ -32,6 +32,7 @@ EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -Wl,--export=rt_mkbool -Wl,--export=rt_mknil -Wl,--export=rt_intern \
   -Wl,--export=rt_newtable -Wl,--export=rt_gettable -Wl,--export=rt_settable \
   -Wl,--export=rt_err_pending -Wl,--export=rt_err_clear -Wl,--export=rt_err_stage_copy \
+  -Wl,--export=rt_err_line \
   -Wl,--export=rt_arith -Wl,--export=rt_len -Wl,--export=rt_eq -Wl,--export=rt_lt \
   -Wl,--export=rt_le -Wl,--export=rt_concat -Wl,--export=rt_call -Wl,--export=rt_call_count \
   -Wl,--export=rt_forprep -Wl,--export=rt_error -Wl,--export=rt_frame_alloc \

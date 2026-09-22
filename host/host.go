@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 
@@ -59,16 +60,87 @@ func WithEventSink(fn func(vm *VM, args []Value)) Option {
 type Engine struct {
 	opts options
 
-	mu      sync.Mutex
-	cache   map[string]*Script
-	hostFns []registeredFn
-	vms     int // live VMs (RegisterGlobal freezes once the first exists)
-	closed  bool
+	mu       sync.Mutex
+	cache    map[string]*Script
+	hostFns  []registeredFn
+	hostVals []registeredVal
+	vms      int // live VMs (RegisterGlobal freezes once the first exists)
+	closed   bool
 }
 
 type registeredFn struct {
 	table, name string
 	fn          HostFunc
+}
+
+type registeredVal struct {
+	table, name string
+	v           Value
+}
+
+// luaIdent reports whether s is a plain Lua identifier — required for
+// names that are staged into generated Lua source (RegisterValue).
+func luaIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		ok := c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(i > 0 && c >= '0' && c <= '9')
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// RegisterValue installs <table>.<name> as a constant Lua value (nil,
+// booleans, numbers, strings) in every VM — the redis.LOG_WARNING /
+// redis.REDIS_VERSION mechanism. Names must be Lua identifiers (they are
+// staged as source). Same freeze rule as RegisterGlobal.
+func (e *Engine) RegisterValue(table, name string, v Value) error {
+	if !luaIdent(table) || !luaIdent(name) {
+		return errors.New("host: RegisterValue requires Lua-identifier table and name")
+	}
+	switch v.Kind {
+	case KindNil, KindFalse, KindTrue, KindNumber, KindString:
+	default:
+		return errors.New("host: RegisterValue supports only nil/bool/number/string values")
+	}
+	if v.Kind == KindNumber && (math.IsInf(v.Num, 0) || math.IsNaN(v.Num)) {
+		return errors.New("host: RegisterValue number must be finite")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.vms > 0 {
+		return errors.New("host: RegisterValue after NewVM (the registry is frozen once VMs exist)")
+	}
+	for _, r := range e.hostVals {
+		if r.table == table && r.name == name {
+			return fmt.Errorf("host: RegisterValue duplicate %s.%s", table, name)
+		}
+	}
+	e.hostVals = append(e.hostVals, registeredVal{table, name, v})
+	return nil
+}
+
+// luaValueLit renders a scalar value as a Lua literal (RegisterValue
+// staging; binary-safe string quoting).
+func luaValueLit(v Value) string {
+	switch v.Kind {
+	case KindNil:
+		return "nil"
+	case KindFalse:
+		return "false"
+	case KindTrue:
+		return "true"
+	case KindNumber:
+		return numRepr(v.Num)
+	case KindString:
+		return luaQuote(v.Str)
+	}
+	return "nil"
 }
 
 // NewEngine verifies the runtime blob and returns a ready engine.

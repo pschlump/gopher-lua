@@ -24,7 +24,7 @@ import (
 // update this constant (the artifact test is the self-check that forces
 // the bump). Brittle by design (A8: checksummed artifact). M7a bump: the
 // hostfn seam (host.host_call import + rt_hostfn/rt_encode_value exports).
-const lua51ProdSHA256 = "265892c0e3931205e563acf5c7dc4d364fedbc0c8f6045c4cb9514595aa03656"
+const lua51ProdSHA256 = "27d9802af8e76c7e4d4feccc294877fad6f86f192fc4c6418b920be4b518470f"
 
 func TestM6cProdBlobArtifact(t *testing.T) {
 	imps, err := wasm.Imports(lua51ProdWasm)
@@ -63,7 +63,7 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 		// M6d: the cap + deadline surface (ledger rows 36-37)
 		"rt_set_memlimit", "rt_mem_used_bytes", "rt_ctrl_addr", "rt_set_deadline",
 		// M7a: the hostfn seam + wire result readback
-		"rt_hostfn", "rt_encode_value",
+		"rt_hostfn", "rt_encode_value", "rt_err_line",
 		"rt_deadline_flag", "rt_deadline"} {
 		if !exp[name] {
 			t.Errorf("prod blob export %s missing", name)

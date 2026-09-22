@@ -7,8 +7,17 @@ package host
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
+
+// ValueError lets a HostFunc raise a non-string Lua error value — e.g. a
+// table {err="..."}, the error class redis.call raises in Redis (the
+// script's pcall then sees a table and the daemon renders the text
+// verbatim, instead of the error gaining an engine-added prefix).
+type ValueError struct{ V Value }
+
+func (e *ValueError) Error() string { return "host function error: " + e.V.String() }
 
 // EVT_PRINT is the event kind g_print emits (runtime/luawasm.c).
 const EVT_PRINT = 1
@@ -100,6 +109,14 @@ func (vm *VM) hostCall(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 {
 		vals, err = hf.fn(vm, args)
 	}()
 	if err != nil {
+		var ve *ValueError
+		if errors.As(err, &ve) {
+			if frame, e2 := encodeValue(nil, ve.V); e2 == nil &&
+				int64(len(frame)) <= int64(uint32(retCap)) &&
+				vm.mem.Write(uint32(retPtr), frame) {
+				return -1
+			}
+		}
 		return fail(err.Error())
 	}
 	frame, err := encodeResults(vals)

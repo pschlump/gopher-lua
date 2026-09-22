@@ -191,6 +191,20 @@ static TValue err_value;
 static char err_buf[1024];
 static int err_buf_len, err_pending, err_prefixed;
 
+/* M8: the raise line, for the host's error-position rendering (Redis's
+   "on @user_script:N" suffix). The FIRST staging of an in-flight error
+   wins — outer re-stagings (the adapter's re-raise) keep the origin
+   line. The catching rt_run pops its own line-stack entry just before
+   staging, so rt_lines[rt_line_sp] is that run's call-site line. */
+static int err_line, err_line_set;
+
+static void stage_err_line(void) {
+  if (!err_line_set) {
+    err_line = (rt_line_sp < RT_LINE_MAX) ? rt_lines[rt_line_sp] : 0;
+    err_line_set = 1;
+  }
+}
+
 static void stage_error(void) {
   const TValue *ev = curL->top - 1;
   err_value = *ev;
@@ -213,6 +227,7 @@ static void stage_error(void) {
     err_prefixed = 1; /* non-string: the engine renders the value */
   }
   err_pending = 1;
+  stage_err_line();
 }
 
 /* ---- ABI surface ---- */
@@ -224,6 +239,8 @@ void rt_set_state(rt_addr p) {
   err_pending = 0;
   err_buf_len = 0;
   err_prefixed = 0;
+  err_line = 0;
+  err_line_set = 0;
   setnilvalue(&err_value);
   rt_wasm_depth = 0;
   rt_oom_inflight = 0; /* M6d: fresh activation re-arms the cap refusal */
@@ -396,6 +413,8 @@ int32_t rt_deadline(void) {
 void rt_err_clear(void) {
   err_pending = 0;
   err_buf_len = 0;
+  err_line = 0;
+  err_line_set = 0;
   err_prefixed = 0; /* the staging contract: sticky until CLEARED — a
                        cleared error must not suppress the prefix of the
                        next one (native ABI tests check staged bytes) */
@@ -413,6 +432,8 @@ void rt_pcall_caught(void) {
   err_pending = 0;
   err_buf_len = 0;
   err_prefixed = 0;
+  err_line = 0;
+  err_line_set = 0;
   setnilvalue(&err_value);
   rt_oom_inflight = 0; /* M6d: a caught OOM re-arms the refusal */
 }
@@ -422,6 +443,11 @@ int32_t rt_err_stage_copy(rt_addr dst, int32_t cap) {
   if (n > 0) memcpy((void *)(size_t)dst, err_buf, (size_t)n);
   return n;
 }
+
+/* M8: the raise line of the staged error (0 = unknown), for the host's
+   error-position rendering — Redis's "on @user_script:N" reply suffix.
+   First staging of an in-flight error wins; cleared with the error. */
+int32_t rt_err_line(void) { return err_line; }
 
 /* ---- value construction (backend inlines these; kept for tests) ---- */
 
@@ -483,6 +509,7 @@ static void stage_c_error(int status) {
   err_prefixed = 1;
   err_pending = 1;
   rt_where_set = 0;
+  stage_err_line();
 }
 
 /* returns RT_OK, or RT_ERR with the error staged (message gets the

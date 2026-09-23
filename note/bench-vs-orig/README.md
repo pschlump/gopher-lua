@@ -37,6 +37,9 @@ GLUA_WASM_ENGINE=wazero ./luabench scripts/s0_nop.lua scripts/s1_hello.lua scrip
 
 ./luabench scripts/l1_fib.lua scripts/l2_nsieve.lua scripts/l3_stringwork.lua | tee out-long-wasmtime.txt
 GLUA_WASM_ENGINE=wazero ./luabench scripts/l1_fib.lua scripts/l2_nsieve.lua scripts/l3_stringwork.lua | tee out-long-wazero.txt
+
+# cold vs pooled-warm through the production host/ package (wazero prod blob)
+(cd hostbench && go build -o hostbench .) && ./hostbench/hostbench | tee out-hostbench.txt
 ```
 
 Notes on reading the wasm numbers:

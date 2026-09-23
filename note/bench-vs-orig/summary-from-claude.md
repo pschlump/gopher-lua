@@ -45,3 +45,55 @@
 
   For the Ultima/Redis use-case this says: short EVAL-style scripts are startup-bound (~100ms on the production engine — matching the ~44ms/cold-start shape already in your notes), compute-in-loops is
   competitive, and call-heavy Lua is the backend's current weak spot.
+
+
+
+
+
+
+
+
+
+⏺ Did you misinterpret? You read the tables correctly, but the benchmark answered a narrower question than the one you're asking. Here's the honest breakdown:
+
+  Where you're right
+
+  - As measured — and as host/ actually runs today (Engine.Run = fresh VM per run, by v1 design) — a short string-heavy script costs 77–94ms per invocation. At high frequency that's ~12 EVALs/sec/core. For
+    Redis-shape traffic, yes, fatal.
+  - The string tax is real and per-op, not just startup: even ignoring startup, wasm string work runs 3–5x slower than the interpreter on wasmtime, ~10x on wazero/mac. gopher-lua's Go string library is
+    genuinely fast; every string op from compiled wasm is an rt_* C call.
+
+  What the picture was missing
+
+  My benchmark deliberately measured cold VM per run — it never measured the warm/pooled posture, which is what "high frequency" actually implies. Your own M8a notes already knew this (fresh 44ms vs rerun
+  60µs), and host/vm.go:16 defers the pool "until benchmarks justify it (guide R3)". So I just built that benchmark through the production host/ package (saved as hostbench/, results in RESULTS.md):
+
+  ┌───────────────────────────┬───────────────┬──────────────────────┬───────────────────────┐
+  │    EVAL-shaped script     │ interp (fork) │ wasm cold (v1 today) │ wasm warm (pooled VM) │
+  ├───────────────────────────┼───────────────┼──────────────────────┼───────────────────────┤
+  │ tiny (KEYS/ARGV + format) │ 71µs          │ 77ms                 │ 31µs — parity         │
+  ├───────────────────────────┼───────────────┼──────────────────────┼───────────────────────┤
+  │ short string-heavy        │ 298µs         │ 94ms                 │ 3.2ms — ~10x          │
+  ├───────────────────────────┼───────────────┼──────────────────────┼───────────────────────┤
+  │ significant string work   │ 3.1ms         │ 171ms                │ 63ms — ~20x           │
+  └───────────────────────────┴───────────────┴──────────────────────┴───────────────────────┘
+
+  Three consequences:
+
+  1. The fixed cost vanishes when pooled. The per-run floor is ~16–31µs (rt_err_clear + KEYS/ARGV staging + lua_main), at interpreter parity. And pooling maps perfectly onto Redis: the one-script-per-VM law
+     (ErrScriptBound) is the EVALSHA script-cache shape, and the M8d globals lockdown is precisely what makes VM reuse safe.
+  2. What remains is the string tax: ~10x short, ~20x heavy — on darwin/arm64 wazero, which we established is the worst-case host (nsieve ran 25x worse than wasmtime there). Your production target is Linux,
+     where wazero's memory handling is a different code path. This must be re-measured on Linux before any "failure" verdict.
+  3. Pooling has an unpriced catch I'd flag before anyone implements R3: Lua GC is stopped per run (v1 ABI), so a pooled VM running allocation-heavy string scripts grows linear memory unboundedly. Pools
+     need VM recycling every N runs, or the M6 arena lifecycle to land first.
+
+  So is it a failure?
+
+  Not by the evidence — but it's not vindicated either. The data says: short + high-frequency + pooled = viable (3ms vs 0.3ms per invocation, both far under network latency); heavy string processing =
+  10–20x interp, which is the measured price of running untrusted code in a memory-capped, deadline-enforced, no-cgo sandbox rather than in-process. The only way to get interp-class string throughput is to
+  run client scripts in the interpreter inside the daemon — which re-opens decisions A1–A9, not a benchmark finding.
+
+  What I'd do before deciding anything: (a) implement the R3 pool (it's small — a map keyed by script SHA) and bench realistic EVAL mixes through it, (b) run hostbench on a Linux box, and (c) only if Linux
+  still shows 10x+ on strings, consider a host-side fast path for the hot string ops through the M7a hostfn seam. All the new code and results are saved in note/bench-vs-orig/ (updated RESULTS.md,
+  hostbench, out-hostbench.txt) — say the word and I'll commit it.
+

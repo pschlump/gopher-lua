@@ -82,6 +82,42 @@ nsieve ≈ 0.34s, stringwork ≈ 49ms.
 - The wasm engine stops Lua GC per run (v1 posture); interp legs run under the
   normal Go GC — alloc-heavy nsieve therefore does GC work only on interp legs.
 
+## Warm (pooled-VM) posture — hostbench, through the production host/ pkg
+
+`hostbench/` measures the two deployment postures for high-frequency
+EVAL-shaped scripts on the wazero prod blob (`host/`, the daemon's actual
+path): **cold** = `e.Run` (fresh VM per run — the v1 default) vs **warm** =
+one pooled VM bound to the script (`vm.Run` reruns — guide R3, "deferred
+until benchmarks justify it"). Interp leg stages KEYS/ARGV identically.
+
+| script | interp TOTAL (fork) | wasm cold fresh-VM/run | wasm warm pooled rerun |
+|---|---|---|---|
+| h_tiny (minimal EVAL) | 70.6µs | 77.3ms | **31.5µs (min 16µs)** |
+| h_str (short string-heavy) | 298µs | 93.6ms | **3.18ms (min 1.46ms)** |
+| h_strlong (significant string work) | 3.07ms | 170.6ms | **62.7ms (min 32.6ms)** |
+
+Reading:
+
+- **Warm pooling removes the fixed cost entirely** — the per-run floor
+  (rt_err_clear + KEYS/ARGV staging + lua_main) is ~16-31µs, at parity with
+  the interpreter. High frequency is a solved *architecturally* (R3 pool;
+  the one-script-per-VM law maps directly onto Redis's EVALSHA script
+  cache, and the M8d globals lockdown is what makes reuse safe).
+- **The per-op string tax remains**: ~10x interp for short string-heavy
+  scripts, ~20x for significant string processing (every string op is an
+  rt_* C call from wasm; gopher-lua's native Go string library is fast).
+  On darwin/arm64 wazero — the worst-case host (see nsieve note above);
+  Linux numbers may be materially better and must be measured before any
+  verdict.
+- **Pooling has an unpriced cost: GC is stopped per run** (v1 ABI), so a
+  pooled VM running allocation-heavy string scripts grows its linear
+  memory without bound — pools need VM recycling every N runs or the M6
+  arena lifecycle to be production-safe.
+- Verdict shape: short + high-frequency + pooled = competitive (3ms vs
+  0.3ms per invocation, both far below network latency). Heavy string
+  *processing* = 10-20x interp, which is the real price of the sandbox on
+  this platform.
+
 ## Incidental finding
 
 `table.concat` of 3000 entries overflows gopher-lua's value registry

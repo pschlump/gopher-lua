@@ -1,0 +1,13 @@
+# luabench — go1.27.0 | wazero (production) | GOMAXPROCS=14 | 2026-09-23 09:04
+
+=== l2_nsieve.lua  (515 bytes src, 6003 bytes wasm)  outputs: OK
+measurement                  n        min     median       mean  vs orig TOTAL
+orig parse+compile         400    29.0µs    54.0µs    70.4µs    0.00x
+new  parse+compile         400    27.7µs    51.0µs    57.2µs    0.00x
+orig run (interp)            3  490.27ms  536.15ms  531.79ms    1.13x
+new  run (interp)            3  512.28ms  531.44ms  538.15ms    1.12x
+orig TOTAL (CLI)             3  471.12ms  475.26ms  476.48ms    1.00x
+new  TOTAL (CLI)             3  484.54ms  519.96ms  527.47ms    1.09x
+wasm compile               200    46.8µs    99.8µs   103.1µs    0.00x
+wasm run (VM start+run)      3    9.09s     9.10s     9.11s    19.14x
+

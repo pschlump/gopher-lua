@@ -1,0 +1,46 @@
+# luabench — go1.27.0 | wazero (production) | GOMAXPROCS=14 | 2026-09-23 08:57
+
+=== s0_nop.lua  (75 bytes src, 1111 bytes wasm)  outputs: OK
+measurement                  n        min     median       mean  vs orig TOTAL
+orig parse+compile         400     4.7µs     6.0µs     6.4µs    0.09x
+new  parse+compile         400     4.7µs     5.6µs     6.0µs    0.08x
+orig run (interp)          300    52.2µs    58.3µs    59.9µs    0.87x
+new  run (interp)          300    41.9µs    59.3µs    60.7µs    0.88x
+orig TOTAL (CLI)           300    39.7µs    67.2µs    73.0µs    1.00x
+new  TOTAL (CLI)           300    38.8µs    76.3µs    84.9µs    1.14x
+wasm compile               200    18.8µs    32.3µs    39.2µs    0.48x
+wasm run (VM start+run)     15   85.38ms  101.57ms  102.97ms  1511.27x
+
+=== s1_hello.lua  (204 bytes src, 3658 bytes wasm)  outputs: OK
+measurement                  n        min     median       mean  vs orig TOTAL
+orig parse+compile         400    14.3µs    29.2µs    32.9µs    0.28x
+new  parse+compile         400    17.2µs    27.2µs    32.1µs    0.26x
+orig run (interp)          300    43.4µs    80.9µs    93.2µs    0.77x
+new  run (interp)          300    45.3µs    76.1µs    82.5µs    0.72x
+orig TOTAL (CLI)           300    48.9µs   105.2µs   111.6µs    1.00x
+new  TOTAL (CLI)           300    51.3µs   105.1µs   111.8µs    1.00x
+wasm compile               200    36.7µs    54.4µs    61.1µs    0.52x
+wasm run (VM start+run)     11   88.94ms   99.69ms  100.48ms  947.18x
+
+=== s2_string.lua  (412 bytes src, 7093 bytes wasm)  outputs: OK
+measurement                  n        min     median       mean  vs orig TOTAL
+orig parse+compile         400    26.8µs    45.1µs    49.4µs    0.16x
+new  parse+compile         400    26.2µs    48.4µs    52.0µs    0.17x
+orig run (interp)          300   124.1µs   234.5µs   221.4µs    0.83x
+new  run (interp)          300   129.5µs   233.9µs   221.9µs    0.83x
+orig TOTAL (CLI)           300   149.6µs   281.6µs   268.5µs    1.00x
+new  TOTAL (CLI)           300   151.9µs   278.4µs   275.8µs    0.99x
+wasm compile               200    55.7µs   114.3µs   138.1µs    0.41x
+wasm run (VM start+run)     11  106.68ms  118.17ms  118.21ms  419.61x
+
+=== s3_table.lua  (305 bytes src, 4285 bytes wasm)  outputs: OK
+measurement                  n        min     median       mean  vs orig TOTAL
+orig parse+compile         400    22.5µs    40.5µs    47.6µs    0.19x
+new  parse+compile         400    24.0µs    41.3µs    46.6µs    0.20x
+orig run (interp)          300    87.0µs   160.1µs   159.9µs    0.77x
+new  run (interp)          300    94.7µs   164.0µs   163.8µs    0.79x
+orig TOTAL (CLI)           300   106.1µs   207.8µs   215.5µs    1.00x
+new  TOTAL (CLI)           300   113.3µs   225.4µs   225.0µs    1.09x
+wasm compile               200    43.5µs    76.2µs    84.4µs    0.37x
+wasm run (VM start+run)     10   94.30ms  107.37ms  108.41ms  516.83x
+

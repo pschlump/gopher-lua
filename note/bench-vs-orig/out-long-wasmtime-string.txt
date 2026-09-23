@@ -1,0 +1,13 @@
+# luabench — go1.27.0 | wasmtime (oracle) | GOMAXPROCS=14 | 2026-09-23 09:02
+
+=== l3_stringwork.lua  (1684 bytes src, 21950 bytes wasm)  outputs: OK
+measurement                  n        min     median       mean  vs orig TOTAL
+orig parse+compile         400    98.4µs   142.3µs   144.4µs    0.01x
+new  parse+compile         400    75.3µs   156.5µs   154.3µs    0.01x
+orig run (interp)           91    9.60ms   16.48ms   16.66ms    1.00x
+new  run (interp)           72    9.75ms   17.60ms   17.07ms    1.07x
+orig TOTAL (CLI)            54   10.07ms   16.46ms   16.34ms    1.00x
+new  TOTAL (CLI)            57    9.27ms   15.42ms   15.46ms    0.94x
+wasm compile               200   145.1µs   258.4µs   248.3µs    0.02x
+wasm run (VM start+run)     25   46.34ms   67.14ms   71.22ms    4.08x
+

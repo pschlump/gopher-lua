@@ -319,18 +319,18 @@ and is scheduled after the encoding and TBC work so it can move in isolation.
 Rough, assuming the M0–M8 cadence (one developer, milestone-gated, heavy differential
 testing). Uncertainty is dominated by U2 (value-model blast radius) and U5 (vararg model).
 
-| Milestone | Est. (person-weeks) |
-|---|---|
-| U0 | 1–2 |
-| U1 | 2–4 |
-| U2 | 4–8 |
-| U3 | 2–5 (`string.pack` is the long pole) |
-| U4 | 2–4 |
-| U5 | 3–5 |
-| U6 | 3–6 |
-| U7 | 2–3 |
-| U8 | 1–2 |
-| **Total** | **20–39 person-weeks** |
+| Milestone | Est. (person-weeks)                  |
+|-----------|--------------------------------------|
+| U0        | 1–2                                  |
+| U1        | 2–4                                  |
+| U2        | 4–8                                  |
+| U3        | 2–5 (`string.pack` is the long pole) |
+| U4        | 2–4                                  |
+| U5        | 3–5                                  |
+| U6        | 3–6                                  |
+| U7        | 2–3                                  |
+| U8        | 1–2                                  |
+| **Total** | **20–39 person-weeks**               |
 
 For calibration: this is the same order of magnitude as the entire M0–M8 wasm program, and
 larger than any single past milestone, because it re-bases the executable spec itself rather

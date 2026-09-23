@@ -239,6 +239,14 @@ func (e *Engine) Compile(source []byte, name string) (*Script, error) {
 	}
 	s := &Script{SHA1: sha, Wasm: bin, name: name}
 	e.mu.Lock()
+	// A concurrent Compile of the same source may have won the race:
+	// pointer identity per (SHA-1, name) is the invariant the VM
+	// one-script law (ErrScriptBound) and consumer-side per-script pools
+	// rely on — never hand out two pointers for one source.
+	if prev, ok := e.cache[key]; ok {
+		e.mu.Unlock()
+		return prev, nil
+	}
 	e.cache[key] = s
 	e.mu.Unlock()
 	return s, nil

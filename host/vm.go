@@ -627,6 +627,24 @@ func (vm *VM) Kill() {
 	}
 }
 
+// UsedBytes reports the image's Lua allocation total (rt_mem_used_bytes):
+// the same counter the WithMemoryBudgetBytes budget is enforced against.
+// Guest GC is stopped (v1 law), so on a reused VM the figure grows
+// monotonically — pooled-VM deployments use it as the recycling watermark.
+// Serialized against Run; 0 when the blob predates the export.
+func (vm *VM) UsedBytes(ctx context.Context) int64 {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	if vm.closed {
+		return 0
+	}
+	v, err := vm.call0(ctx, "rt_mem_used_bytes")
+	if err != nil || len(v) == 0 {
+		return 0
+	}
+	return int64(int32(v[0]))
+}
+
 // Close tears the image down: the Lua state, both module instances, and
 // the private runtime. The VM is unusable afterwards.
 func (vm *VM) Close() error {

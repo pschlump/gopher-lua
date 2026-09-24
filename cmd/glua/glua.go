@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/chzyer/readline"
+	"github.com/ergochat/readline"
 	"github.com/pschlump/gopher-lua"
 	"github.com/pschlump/gopher-lua/parse"
 	"github.com/pschlump/gopher-lua/testdiff"

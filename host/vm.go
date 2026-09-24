@@ -26,9 +26,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/api"
-	"github.com/tetratelabs/wazero/experimental"
+	"github.com/pschlump/wazero"
+	"github.com/pschlump/wazero/api"
+	"github.com/pschlump/wazero/experimental"
 )
 
 // RunOptions is one execution of a script against a VM image.

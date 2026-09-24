@@ -32,10 +32,10 @@ import (
 	"time"
 
 	"github.com/pschlump/gopher-lua/wasm"
-	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/api"
-	"github.com/tetratelabs/wazero/experimental"
-	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+	"github.com/pschlump/wazero"
+	"github.com/pschlump/wazero/api"
+	"github.com/pschlump/wazero/experimental"
+	"github.com/pschlump/wazero/imports/wasi_snapshot_preview1"
 )
 
 // deadlineFlagLE is the watchdog's single store: 1 as 4 little-endian

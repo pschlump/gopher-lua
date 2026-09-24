@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/api"
+	"github.com/pschlump/wazero"
+	"github.com/pschlump/wazero/api"
 
 	w "github.com/pschlump/gopher-lua/wasm"
 )

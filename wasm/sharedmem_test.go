@@ -11,7 +11,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/tetratelabs/wazero"
+	"github.com/pschlump/wazero"
 
 	w "github.com/pschlump/gopher-lua/wasm"
 )

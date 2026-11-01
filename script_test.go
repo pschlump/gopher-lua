@@ -11,8 +11,6 @@ import (
 	"github.com/pschlump/gopher-lua/parse"
 )
 
-const maxMemory = 40
-
 var gluaTests []string = []string{
 	"base.lua",
 	"coroutine.lua",
@@ -65,7 +63,6 @@ func testScriptDir(t *testing.T, tests []string, directory string) {
 			CallStackSize:       1024,
 			IncludeGoStackTrace: true,
 		})
-		L.SetMx(maxMemory)
 		if err := L.DoFile(script); err != nil {
 			t.Error(err)
 		}

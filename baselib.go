@@ -630,7 +630,14 @@ func baseRawGet(L *LState) int {
 }
 
 func baseRawSet(L *LState) int {
-	L.RawSet(L.CheckTable(1), L.CheckAny(2), L.CheckAny(3))
+	tb := L.CheckTable(1)
+	if tb.readonly {
+		// N2: rawset is the one stdlib writer that bypasses setField (it
+		// IS the raw path) — the readonly guard lives here explicitly,
+		// matching the C engine's interposed luaH_* setters.
+		L.RaiseError("Attempt to modify a readonly table")
+	}
+	L.RawSet(tb, L.CheckAny(2), L.CheckAny(3))
 	return 0
 }
 

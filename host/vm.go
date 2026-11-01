@@ -104,9 +104,14 @@ func (vm *VM) runsServed() int {
 	return vm.runs
 }
 
-// NewVM builds a fresh LState with the engine's host functions and
-// value constants staged. µs-scale (a state build plus stdlib open).
-// The engine's registry is frozen from this moment.
+// NewVM builds a fresh LState with the engine's sandbox posture,
+// host functions, and value constants staged. µs-scale (a state build
+// plus stdlib open). The engine's registry is frozen from this moment.
+//
+// Order (the glasm law): budget → libraries → dangerous-global nils →
+// host staging → protection. The budget arms before the libraries open
+// so lib-open allocations count; protection installs after all staging
+// so nothing staged needs the raw seam.
 func (e *Engine) NewVM() (*VM, error) {
 	e.mu.Lock()
 	if e.closed {
@@ -117,12 +122,34 @@ func (e *Engine) NewVM() (*VM, error) {
 	e.vms++
 	e.mu.Unlock()
 
-	vm.L = lua.NewState(lua.Options{IncludeGoStackTrace: false})
+	vm.L = lua.NewState(lua.Options{
+		IncludeGoStackTrace: false,
+		SkipOpenLibs:        true,
+		MaxCoroutines:       e.opts.maxCoroutines,
+	})
+	if e.opts.memoryBudget > 0 {
+		vm.L.SetMemoryBudgetBytes(e.opts.memoryBudget)
+	}
+
+	// the library posture (default: the SafeStdLibs prod set)
+	libs := e.opts.stdlibs
+	if libs == nil {
+		libs = SafeStdLibs
+	}
+	for _, lib := range libs {
+		vm.L.Push(vm.L.NewFunction(lib.Open))
+		vm.L.Push(lua.LString(lib.Name))
+		vm.L.Call(1, 0)
+	}
+	// the base library's own ambient loaders — the glasm sandbox nils
+	// these even when Base opens (require/loadfile/dofile reach the
+	// filesystem, load compiles arbitrary sources, warn writes stderr);
+	// with SafeStdLibs package/io/os/debug never opened at all.
+	for _, name := range []string{"require", "loadfile", "dofile", "load", "warn"} {
+		vm.L.SetGlobal(name, lua.LNil)
+	}
 
 	// host functions (redis.call and friends): direct Go closures.
-	// Staging order matches glasm's (sandbox → host staging →
-	// protection) so N2's WithGlobalsProtection slots in at the same
-	// place: after all host staging, before any script runs.
 	for _, hf := range vm.hostFns {
 		tbl := vm.globalTable(hf.table)
 		vm.L.SetField(tbl, hf.name, vm.L.NewFunction(vm.trampoline(hf.fn)))
@@ -140,6 +167,12 @@ func (e *Engine) NewVM() (*VM, error) {
 	// print override (the event sink): after host staging, before runs.
 	if vm.eventSink != nil {
 		vm.L.SetGlobal("print", vm.L.NewFunction(vm.printTrampoline))
+	}
+	// globals protection: last — everything staged above is inside the
+	// readonly set; only the raw staging seam (Run's KEYS/ARGV) writes
+	// after this point.
+	if e.opts.globalsProtection {
+		installProtection(vm.L)
 	}
 	return vm, nil
 }
@@ -201,9 +234,13 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 	L.SetContext(rctx)
 
 	// stage KEYS/ARGV as fresh tables (copies — binary-safe by
-	// construction, no quoting seam exists)
-	L.SetGlobal("KEYS", stringTable(L, opt.Keys))
-	L.SetGlobal("ARGV", stringTable(L, opt.Argv))
+	// construction, no quoting seam exists). The raw seam, not
+	// SetGlobal: under globals protection _G is readonly, and KEYS/ARGV
+	// are staged after the protect walk by design (guest-writable —
+	// the glasm contract).
+	globals, _ := L.GetGlobal("_G").(*lua.LTable)
+	L.RawSet(globals, lua.LString("KEYS"), lua.LValue(stringTable(L, opt.Keys)))
+	L.RawSet(globals, lua.LString("ARGV"), lua.LValue(stringTable(L, opt.Argv)))
 
 	if opt.Seed != 0 {
 		// determinism (D5 shape): math.randomseed(n) on the
@@ -300,6 +337,20 @@ func raiseLine(obj lua.LValue, name string) int {
 		}
 	}
 	return 0
+}
+
+// UsedBytes reports this VM's accounted allocation total (the same
+// counter WithMemoryBudgetBytes enforces against): monotone — never
+// refunded, the high-water gauge — and 0 once the VM is closed. A
+// fresh VM's counter starts at its build allocations, so a recycled
+// VM visibly drops below the watermark it crossed.
+func (vm *VM) UsedBytes() int64 {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	if vm.closed || vm.L == nil {
+		return 0
+	}
+	return vm.L.MemoryUsedBytes()
 }
 
 // Kill cancels the in-flight run's context: the next instruction check

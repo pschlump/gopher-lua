@@ -183,6 +183,19 @@ func (nm LNumber) Format(f fmt.State, c rune) {
 type LTable struct {
 	Metatable LValue
 
+	// readonly is the N2 sandbox's one-way write guard (the embed's
+	// WithGlobalsProtection; the analog of the C engine interposing
+	// luaH_* setters). Lua-side writes — the bytecode set paths, the
+	// host-API SetTable/SetField, rawset, and the table library via
+	// lua_seti — raise "Attempt to modify a readonly table". Raw Go
+	// writes (the LTable methods, LState.RawSet*) bypass it: that is the
+	// host staging seam. See SetReadonly.
+	readonly bool
+	// acct, when non-nil, is the per-VM memory accountant this table's
+	// creation and growth charge (N2; nil = unaccounted — the registry
+	// seed tables, which are built before their Global exists).
+	acct *Global
+
 	array   []LValue
 	dict    map[LValue]LValue
 	strdict map[string]LValue
@@ -273,6 +286,32 @@ type Global struct {
 	builtinMts map[int]LValue
 	tempFiles  []*os.File
 	gccount    int32
+
+	// N2 per-VM memory budget (SetMemoryBudgetBytes): the accounted
+	// allocation counter charged at the big allocation seams — table
+	// creation/growth (the same per-slot estimates collectgarbage
+	// "count" uses) and the string builders (concat, string.rep,
+	// table.concat). Never refunded: the counter is monotone, the
+	// stopped-GC watermark posture the wasm engine bought by
+	// construction (Go's collector frees underneath; the figure is a
+	// high-water budget gauge, not a live-heap readout). memLimit 0 =
+	// unlimited. memOver is sticky once crossed; the raise points (the
+	// seam sites and the per-instruction boundary check) surface it as a
+	// pcall-catchable "not enough memory" — stock luaM_error's text.
+	// Fields are written at setup time only (before the first run), on
+	// the goroutine that then runs the loop; reads afterwards are
+	// race-free by the happens-before of thread creation.
+	memLimit int64
+	memUsed  atomic.Int64
+	memOver  atomic.Bool
+
+	// N2 coroutine spawn cap (Options.MaxCoroutines): coroutines are
+	// goroutines here, so unbounded coroutine.create needs a ceiling.
+	// liveThreads counts threads created by coroutine.create/wrap and
+	// not yet killed (every terminal path funnels through kill());
+	// maxCoroutines 0 = unlimited.
+	maxCoroutines int
+	liveThreads   atomic.Int32
 }
 
 // luaMaxCCalls mirrors stock LUAI_MAXCCALLS (ldo.h): the nested C-call
@@ -298,6 +337,11 @@ type LState struct {
 	mainLoop     func(*LState, *callFrame)
 	ctx          context.Context
 	ctxCancelFn  context.CancelFunc
+	// N2 coroutine cap: coCounted marks a thread created through
+	// coroutine.create/wrap (counted in G.liveThreads); kill() releases
+	// it exactly once, via coReleased.
+	coCounted  bool
+	coReleased atomic.Bool
 	// deadErr records the error object a coroutine died with (U3h:
 	// coroutine.close returns it as false+err for an error-dead
 	// coroutine, stock lua_closethread's status).

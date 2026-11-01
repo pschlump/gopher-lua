@@ -240,6 +240,15 @@ func tableConcat(L *LState) int {
 	if i == last { // interval not empty
 		addfield(i)
 	}
+	// N2 memory budget: charge the built result (the concat fold's
+	// seam; membudget.go). Post-charged like the string.concat fold —
+	// a pre-scan would walk ranges stock never walks (tconcat aborts
+	// at the first invalid element) and would run __index metamethods
+	// a second time per element.
+	L.G.memCharge(int64(len(buf)) + 24)
+	if L.memBudgetExceeded() {
+		L.memRaise()
+	}
 	L.Push(LString(buf))
 	return 1
 }

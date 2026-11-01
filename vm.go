@@ -72,6 +72,14 @@ func mainLoop(L *LState, baseframe *callFrame) {
 		if L.hookMask&(hookMaskLine|hookMaskCount) != 0 {
 			L.traceHook(cf)
 		}
+		// N2 memory budget: the boundary check mirrors the deadline's —
+		// a crossed budget raises at the first instruction boundary (the
+		// seam sites charge; this surfaces the flag). Unbudgeted VMs pay
+		// one field load.
+		if L.G.memLimit > 0 && L.memBudgetExceeded() {
+			L.memRaise()
+			return
+		}
 		if jumpTable[int(inst&0x7f)](L, inst, baseframe) == 1 {
 			return
 		}
@@ -132,6 +140,12 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 			L.RaiseError("%s", L.ctx.Err().Error())
 			return
 		default:
+			// N2 memory budget: the boundary check beside the deadline's
+			// (see mainLoop).
+			if L.G.memLimit > 0 && L.memBudgetExceeded() {
+				L.memRaise()
+				return
+			}
 			if jumpTable[int(inst&0x7f)](L, inst, baseframe) == 1 {
 				return
 			}
@@ -1077,7 +1091,7 @@ func init() {
 			if vB > 0 {
 				hsize = 1 << uint(vB-1)
 			}
-			v := newLTable(asize, hsize)
+			v := newLTableG(L.G, asize, hsize)
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -2798,7 +2812,7 @@ func init() {
 			if proto.IsVarArg&VarArgTable != 0 {
 				// createvarargtab: raw {1..n, n=n}; 'n' is an INTEGER
 				// (stock setivalue — math.type(t.n) == "integer")
-				tb := newLTable(nextra, 1)
+				tb := newLTableG(L.G, nextra, 1)
 				for i := 0; i < nextra; i++ {
 					tb.RawSetInt(i+1, reg.Get(lbase+np+i))
 				}
@@ -4335,7 +4349,16 @@ func stringConcat(L *LState, total, last int, cf *callFrame) (LValue, uint8) {
 				i--
 				total--
 			}
-			rhs = LString(strings.Join(buf, ""))
+			joined := strings.Join(buf, "")
+			// N2: the concat fold's result is charged (one string object,
+			// len bytes + header); a crossed budget raises here rather
+			// than at the next boundary, so a doubling spin stops at the
+			// budget itself.
+			L.G.memCharge(int64(len(joined)) + 24)
+			if L.memBudgetExceeded() {
+				L.memRaise()
+			}
+			rhs = LString(joined)
 		}
 	}
 	return rhs, mmSync

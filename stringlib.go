@@ -518,6 +518,13 @@ func strRep(L *LState) int {
 	if slen > maxSize-lsep || slen+lsep > maxSize/n {
 		L.RaiseError("resulting string too large")
 	}
+	// N2 memory budget: pre-flight the whole result — rep is a single
+	// builder call, so a crossed budget must decline BEFORE the
+	// allocation (the seam rule; membudget.go).
+	L.G.memCharge(n*(slen+lsep) + 24)
+	if L.memBudgetExceeded() {
+		L.memRaise()
+	}
 	buf := make([]byte, 0, int(n*(slen+lsep))-int(lsep))
 	for i := int64(0); i < n; i++ {
 		if i > 0 {

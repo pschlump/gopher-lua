@@ -143,6 +143,32 @@ mechanism-free)
   `lua55_prod.wasm` posture, as an engine option; coroutine spawn cap
   (coroutines are goroutines here — unbounded `coroutine.create` needs a
   ceiling); **memory budget** — decision below.
+  **DONE (2026-11-01):** all four surfaces, opt-in and off by default.
+  Root package: `WithGlobalsProtection` = a one-way readonly walk
+  (`LTable.SetReadonly`, guarded in `setField`/`setFieldString` +
+  `baseRawSet`; `LState.RawSet`/`LTable.RawSet*` stay raw = the host
+  staging seam) + the missing-global `__index` guard (glasm-blob texts);
+  per-VM accounted budget (`membudget.go`: charges at table
+  creation/growth + string-builder seams, monotone never-refunded,
+  sticky-over + per-instruction boundary check beside the deadline
+  check, pcall-catchable "not enough memory"; approximation = ledger
+  row 107); `Options.MaxCoroutines` (live-thread counter, cap raises
+  pcall-catchable "too many coroutines"); **`SetMx` deleted** (ledger
+  row 106) with `cmd/glua`'s `-mx`. Host package: `host/protection.go`,
+  `WithStdLibs`/`SafeStdLibs`/`AllStdLibs` (safe set = the prod posture,
+  base's require/loadfile/dofile/load/warn additionally nil'd),
+  `WithMemoryBudgetBytes` (armed before lib-open), `WithMaxCoroutines`,
+  `VM.UsedBytes`; NewVM order = budget → libs → nils → staging →
+  protection; Run stages KEYS/ARGV through the raw seam
+  (guest-writable, pooled-VM-safe). Text deltas vs glasm's host tests:
+  stock `luaO_chunkid` strips the chunkname's `=` (`test:1:`, not
+  `=test:1:`) and rawset-under-protection raises prefixed in both
+  shapes (ledger row 108). Gates: `host/sandbox_test.go` +
+  `host/usedbytes_test.go` (protection battery, budget spins —
+  concat/gmatch/tconcat, stdlib selection, cap+release), `-race
+  -count=2` green, full golden corpus byte-stable (26s official leg).
+  Founding `docs/Divergence-Ledger.md` (rows 106–109; continues glasm's
+  numbering; 109 KEEP-OPEN: `LuaLDir`'s 5.1-era root in package.path).
 - **N3 — gates:** (a) **golden-corpus gate — DONE (2026-11-01):**
   `golden_test.go` + `golden_runner_test.go` + `_goldens/` (58 goldens:
   26 official-suite, 11 glua, 21 u1). Every corpus case runs through this
@@ -167,17 +193,13 @@ mechanism-free)
   (`../ultima`); glasm's How-To §5 remains the shape of the plan, rewritten
   for the native package.
 
-**Memory budget decision (open, N2):** the wasm posture shipped a hard
-per-VM budget (`rt_set_memlimit`) raising a pcall-catchable "not enough
-memory" — the native target should match those semantics. Recommended:
-**per-VM accounted budget** — an allocation counter on the LState
-incremented at the allocation seams (`alloc.go` arena, table growth, string
-concat buffers, upvalue/closure creation), crossing raises the same
-catchable error. Alternative (cheaper, approximate): count-hook polling of
-`runtime.ReadMemStats`. **Note:** the existing `SetMx` is neither — it is a
-process-wide polling goroutine that `os.Exit(3)`s the whole daemon
-(`_state.go` GopherLua-original APIs). It must never run in the embed path;
-retire or replace it in N2 (ledger row).
+**Memory budget decision — TAKEN (N2, 2026-11-01):** the wasm posture's
+semantics (per-VM budget, pcall-catchable "not enough memory") shipped as
+the **per-VM accounted budget** — seam-charged, monotone, sticky-over
+(`membudget.go`; the count-hook alternative was not taken — polling
+`ReadMemStats` is process-global and approximate in the wrong direction).
+`SetMx` is **deleted** (it armed a process-wide poller that `os.Exit(3)`'d
+the host — never acceptable from an embed library); ledger rows 106/107.
 
 ## 5. Track P — the performance program
 
@@ -228,7 +250,7 @@ text, numerals — is a bug, not a trade).
 | done | N1 embed core (`host/`, race-gated) | — |
 | 2 | P0 measurement rig + baseline | ~1 day |
 | 3 | P1 register windows | 1–2 weeks |
-| 4 | N2 sandbox (budget, protection, stdlib) | ~3–5 days |
+| 4 | done N2 sandbox (budget, protection, stdlib) | ~3–5 days |
 | 5 | P2 table engine | 2–4 weeks |
 | 6 | P3 interning | ~1 week |
 | 7 | N3b embedcmp legs, N5 Ultima cutover | ~2–3 days |

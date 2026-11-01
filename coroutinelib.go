@@ -20,7 +20,16 @@ var coFuncs = map[string]LGFunction{
 
 func coCreate(L *LState) int {
 	fn := L.CheckFunction(1)
+	// N2 spawn cap: coroutines are goroutines here — Options.MaxCoroutines
+	// (>0) bounds the live ones (every terminal path funnels through
+	// kill(), which releases the slot). Stock has no analog; the text is
+	// ours, pcall-catchable like every engine limit.
+	if mc := L.G.maxCoroutines; mc > 0 && int(L.G.liveThreads.Load()) >= mc {
+		L.RaiseError("too many coroutines")
+	}
 	newthread, _ := L.NewThread()
+	newthread.coCounted = true
+	L.G.liveThreads.Add(1)
 	base := 0
 	newthread.stack.Push(callFrame{
 		Fn:         fn,

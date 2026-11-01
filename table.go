@@ -60,8 +60,42 @@ func newLTable(acap int, hcap int) *LTable {
 	}
 	// stock charges an LValue cell per array slot (sizeof(TValue)=16)
 	// and a Node per hash slot (~48 with key+value+next)
-	gcCharge(int64(acap)*16 + int64(hcap)*48 + 64)
+	gcCharge(tableCharge(acap, hcap))
 	return tb
+}
+
+// newLTableG is the accounted constructor: the table's later growth
+// charges (the RawSet*/Insert/Append seams below) go to g's per-VM
+// memory budget, and its creation estimate is charged up front. The
+// registry seed tables use newLTable (nil accountant — they predate
+// their Global).
+func newLTableG(g *Global, acap int, hcap int) *LTable {
+	tb := newLTable(acap, hcap)
+	tb.acct = g
+	g.memCharge(tableCharge(acap, hcap))
+	return tb
+}
+
+// SetReadonly marks this table readonly — the N2 sandbox's one-way
+// guard (the embed's WithGlobalsProtection; the analog of the C
+// engine's interposed luaH_* setters). Lua-visible writes raise
+// "Attempt to modify a readonly table" (the bytecode set paths and
+// everything that funnels into them — LState.SetTable/SetField,
+// rawset, the table library's lua_seti writes; see setField /
+// setFieldString / baseRawSet). Raw Go writes (the LTable methods
+// below, LState.RawSet*) are exempt: that is the host staging seam.
+// One-way by design — there is no unmark.
+func (tb *LTable) SetReadonly() { tb.readonly = true }
+
+// Readonly reports the one-way write guard (SetReadonly).
+func (tb *LTable) Readonly() bool { return tb.readonly }
+
+// tbCharge accounts table growth at the write seams (the same
+// per-slot estimates as creation; see membudget.go).
+func (tb *LTable) tbCharge(n int64) {
+	if tb.acct != nil {
+		tb.acct.memCharge(n)
+	}
 }
 
 // arrayLen reports the size of the array part (0 when absent) — the
@@ -93,9 +127,11 @@ func (tb *LTable) Append(value LValue) {
 	}
 	if tb.array == nil {
 		tb.array = make([]LValue, 0, defaultArrayCap)
+		tb.tbCharge(defaultArrayCap * 16)
 	}
 	if len(tb.array) == 0 || tb.array[len(tb.array)-1] != LNil {
 		tb.array = append(tb.array, value)
+		tb.tbCharge(16)
 	} else {
 		i := len(tb.array) - 2
 		for ; i >= 0; i-- {
@@ -111,6 +147,7 @@ func (tb *LTable) Append(value LValue) {
 func (tb *LTable) Insert(i int, value LValue) {
 	if tb.array == nil {
 		tb.array = make([]LValue, 0, defaultArrayCap)
+		tb.tbCharge(defaultArrayCap * 16)
 	}
 	if i > len(tb.array) {
 		tb.RawSetInt(i, value)
@@ -122,6 +159,7 @@ func (tb *LTable) Insert(i int, value LValue) {
 	}
 	i -= 1
 	tb.array = append(tb.array, LNil)
+	tb.tbCharge(16)
 	copy(tb.array[i+1:], tb.array[i:])
 	tb.array[i] = value
 }
@@ -193,17 +231,20 @@ func (tb *LTable) RawSet(key LValue, value LValue) {
 		if v > 0 && v < LInteger(MaxArrayIndex) {
 			if tb.array == nil {
 				tb.array = make([]LValue, 0, defaultArrayCap)
+				tb.tbCharge(defaultArrayCap * 16)
 			}
 			index := int(v) - 1
 			alen := len(tb.array)
 			switch {
 			case index == alen:
 				tb.array = append(tb.array, value)
+				tb.tbCharge(16)
 			case index > alen:
 				for i := 0; i < (index - alen); i++ {
 					tb.array = append(tb.array, LNil)
 				}
 				tb.array = append(tb.array, value)
+				tb.tbCharge(int64(index-alen+1) * 16)
 			case index < alen:
 				tb.array[index] = value
 			}
@@ -225,17 +266,20 @@ func (tb *LTable) RawSetInt(key int, value LValue) {
 	}
 	if tb.array == nil {
 		tb.array = make([]LValue, 0, 32)
+		tb.tbCharge(32 * 16)
 	}
 	index := key - 1
 	alen := len(tb.array)
 	switch {
 	case index == alen:
 		tb.array = append(tb.array, value)
+		tb.tbCharge(16)
 	case index > alen:
 		for i := 0; i < (index - alen); i++ {
 			tb.array = append(tb.array, LNil)
 		}
 		tb.array = append(tb.array, value)
+		tb.tbCharge(int64(index-alen+1) * 16)
 	case index < alen:
 		tb.array[index] = value
 	}
@@ -245,6 +289,7 @@ func (tb *LTable) RawSetInt(key int, value LValue) {
 func (tb *LTable) RawSetString(key string, value LValue) {
 	if tb.strdict == nil {
 		tb.strdict = make(map[string]LValue, defaultHashCap)
+		tb.tbCharge(defaultHashCap * 48)
 	}
 	if tb.keys == nil {
 		tb.keys = []LValue{}
@@ -260,6 +305,7 @@ func (tb *LTable) RawSetString(key string, value LValue) {
 		if _, ok := tb.k2i[lkey]; !ok {
 			tb.k2i[lkey] = len(tb.keys)
 			tb.keys = append(tb.keys, lkey)
+			tb.tbCharge(48)
 		}
 	}
 }
@@ -273,6 +319,7 @@ func (tb *LTable) RawSetH(key LValue, value LValue) {
 	key = normalizeNumberKey(key)
 	if tb.dict == nil {
 		tb.dict = make(map[LValue]LValue, len(tb.strdict))
+		tb.tbCharge(int64(len(tb.strdict))*48 + 64)
 	}
 	if tb.keys == nil {
 		tb.keys = []LValue{}
@@ -287,6 +334,7 @@ func (tb *LTable) RawSetH(key LValue, value LValue) {
 		if _, ok := tb.k2i[key]; !ok {
 			tb.k2i[key] = len(tb.keys)
 			tb.keys = append(tb.keys, key)
+			tb.tbCharge(48)
 		}
 	}
 }

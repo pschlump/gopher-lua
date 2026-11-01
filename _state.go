@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/pschlump/gopher-lua/parse"
 )
@@ -113,6 +112,12 @@ type Options struct {
 	// If `MinimizeStackMemory` is set, the call stack will be automatically grown or shrank up to a limit of
 	// `CallStackSize` in order to minimize memory usage. This does incur a slight performance penalty.
 	MinimizeStackMemory bool
+	// MaxCoroutines caps the number of live coroutines (threads created
+	// by coroutine.create/wrap and not yet closed/killed — coroutines
+	// are goroutines here, so unbounded creation needs a ceiling).
+	// Creating past the cap raises a pcall-catchable "too many
+	// coroutines". Zero = unlimited (stock behavior).
+	MaxCoroutines int
 }
 
 /* }}} */
@@ -671,6 +676,7 @@ func newLState(options Options) *LState {
 	}
 	ls.reg = newRegistry(ls, options.RegistrySize, options.RegistryGrowStep, options.RegistryMaxSize, al)
 	ls.Env = ls.G.Global
+	ls.G.maxCoroutines = options.MaxCoroutines
 	return ls
 }
 
@@ -1071,6 +1077,9 @@ func (ls *LState) isStarted() bool {
 
 func (ls *LState) kill() {
 	ls.Dead = true
+	if ls.coCounted && ls.coReleased.CompareAndSwap(false, true) {
+		ls.G.liveThreads.Add(-1)
+	}
 	if ls.ctxCancelFn != nil {
 		ls.ctxCancelFn()
 	}
@@ -2425,6 +2434,9 @@ func (ls *LState) setField(obj LValue, key LValue, value LValue, hint varinfoHin
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
+			if tb.readonly {
+				ls.RaiseError("Attempt to modify a readonly table")
+			}
 			if tb.RawGet(key) != LNil {
 				ls.RawSet(tb, key, value)
 				return mmSync
@@ -2462,6 +2474,9 @@ func (ls *LState) setFieldString(obj LValue, key string, value LValue, hint vari
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
+			if tb.readonly {
+				ls.RaiseError("Attempt to modify a readonly table")
+			}
 			if tb.RawGetString(key) != LNil {
 				tb.RawSetString(key, value)
 				return mmSync
@@ -2721,11 +2736,11 @@ func (ls *LState) Remove(index int) {
 /* object allocation {{{ */
 
 func (ls *LState) NewTable() *LTable {
-	return newLTable(defaultArrayCap, defaultHashCap)
+	return newLTableG(ls.G, defaultArrayCap, defaultHashCap)
 }
 
 func (ls *LState) CreateTable(acap, hcap int) *LTable {
-	return newLTable(acap, hcap)
+	return newLTableG(ls.G, acap, hcap)
 }
 
 // NewThread returns a new LState that shares with the original state all global objects.
@@ -3702,25 +3717,6 @@ func (ls *LState) XMoveTo(other *LState, n int) {
 /* }}} */
 
 /* GopherLua original APIs {{{ */
-
-// Set maximum memory size. This function can only be called from the main thread.
-func (ls *LState) SetMx(mx int) {
-	if ls.Parent != nil {
-		ls.RaiseError("sub threads are not allowed to set a memory limit")
-	}
-	go func() {
-		limit := uint64(mx * 1024 * 1024) //MB
-		var s runtime.MemStats
-		for atomic.LoadInt32(&ls.stop) == 0 {
-			runtime.ReadMemStats(&s)
-			if s.Alloc >= limit {
-				fmt.Println("out of memory")
-				os.Exit(3)
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
-}
 
 // SetContext set a context ctx to this LState. The provided ctx must be non-nil.
 func (ls *LState) SetContext(ctx context.Context) {

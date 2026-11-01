@@ -18,7 +18,6 @@ func main() {
 func mainAux() int {
 	var opt_e, opt_l, opt_p string
 	var opt_i, opt_v, opt_dt, opt_dc bool
-	var opt_m int
 	// Every option takes its single-letter and a full-word spelling (-v,
 	// -version); both names bind the same variable, and Go's flag package
 	// already accepts -name and --name alike.
@@ -28,8 +27,6 @@ func mainAux() int {
 	flag.StringVar(&opt_l, "require", "", "")
 	flag.StringVar(&opt_p, "p", "", "")
 	flag.StringVar(&opt_p, "cpuprofile", "", "")
-	flag.IntVar(&opt_m, "mx", 0, "")
-	flag.IntVar(&opt_m, "memlimit", 0, "")
 	flag.BoolVar(&opt_i, "i", false, "")
 	flag.BoolVar(&opt_i, "interactive", false, "")
 	flag.BoolVar(&opt_v, "v", false, "")
@@ -43,7 +40,6 @@ func mainAux() int {
 Available options are:
   -e stat,  -execute stat      execute string 'stat'
   -l name,  -require name      require library 'name'
-  -mx MB,   -memlimit MB       memory limit(default: unlimited)
   -dt,      -dumpast           dump AST trees
   -dc,      -dumpcode          dump VM codes
   -i,       -interactive       enter interactive mode after executing 'script'
@@ -68,10 +64,6 @@ Available options are:
 
 	L := lua.NewState()
 	defer L.Close()
-	if opt_m > 0 {
-		L.SetMx(opt_m)
-	}
-
 	// -v: version banner (release line + link-time git tag/commit/date);
 	// -i prints the same banner before entering the REPL.
 	if opt_v || opt_i {

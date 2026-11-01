@@ -63,6 +63,87 @@ type options struct {
 	eventSink   func(vm *VM, args []Value) // print observer
 	vmCacheSize int                        // warm-VM pool capacity (0 = fresh-VM-per-run)
 	scriptCache int                        // script cache bound (<=0 = unbounded, the default)
+
+	// N2 sandbox posture (the With* options below)
+	stdlibs           []StdLib // nil = SafeStdLibs
+	globalsProtection bool
+	memoryBudget      int64
+	maxCoroutines     int
+}
+
+// StdLib names one standard library: its global-table name ("" for the
+// base library) and its opener.
+type StdLib struct {
+	Name string
+	Open lua.LGFunction
+}
+
+// SafeStdLibs is the default library posture: the lua55_prod.wasm set —
+// everything a Redis-class script needs, none of the ambient-surface
+// libraries (io/os/package/debug/channel). Base's own loaders that
+// reach the filesystem or the package system (require/loadfile/
+// dofile/load/warn) are additionally nil'd at NewVM (see vm.go).
+var SafeStdLibs = []StdLib{
+	{"", lua.OpenBase},
+	{lua.TabLibName, lua.OpenTable},
+	{lua.StringLibName, lua.OpenString},
+	{lua.MathLibName, lua.OpenMath},
+	{lua.CoroutineLibName, lua.OpenCoroutine},
+	{lua.UTF8LibName, lua.OpenUTF8},
+}
+
+// AllStdLibs is the full interpreter surface (linit.go's order): the
+// engine for embedders that trust their scripts (the N1 posture).
+var AllStdLibs = []StdLib{
+	{lua.LoadLibName, lua.OpenPackage},
+	{"", lua.OpenBase},
+	{lua.TabLibName, lua.OpenTable},
+	{lua.IoLibName, lua.OpenIo},
+	{lua.OsLibName, lua.OpenOs},
+	{lua.StringLibName, lua.OpenString},
+	{lua.MathLibName, lua.OpenMath},
+	{lua.DebugLibName, lua.OpenDebug},
+	{lua.ChannelLibName, lua.OpenChannel},
+	{lua.CoroutineLibName, lua.OpenCoroutine},
+	{lua.UTF8LibName, lua.OpenUTF8},
+}
+
+// WithStdLibs selects the standard libraries every VM opens (default:
+// SafeStdLibs). Pass AllStdLibs... for the full surface, or an explicit
+// list for a minimal embed.
+func WithStdLibs(libs ...StdLib) Option {
+	return func(o *options) { o.stdlibs = libs }
+}
+
+// WithGlobalsProtection turns on the Redis-classic script environment
+// lockdown: reads of nonexistent globals raise "Script attempted to
+// access nonexistent global variable '<name>'", and the globals table
+// plus every table reachable from it (library tables, metatables, the
+// string metatable) are readonly — writes raise "Attempt to modify a
+// readonly table" (protection.go; both pcall-catchable, position-
+// prefixed). Off by default: without it scripts read and write globals
+// freely (the N1 posture).
+func WithGlobalsProtection(on bool) Option {
+	return func(o *options) { o.globalsProtection = on }
+}
+
+// WithMemoryBudgetBytes arms the per-VM accounted memory budget on
+// every VM: allocation seams (table creation/growth, the string
+// builders) charge a monotone counter, and the first seam past the
+// budget raises a pcall-catchable "not enough memory". Zero (default)
+// disables the cap; UsedBytes still reports the charge total. The
+// accounting is an estimate of stock's allocator-exact budget (ledger
+// row), and the counter is armed before the libraries open so lib-open
+// allocations count against it.
+func WithMemoryBudgetBytes(n int64) Option {
+	return func(o *options) { o.memoryBudget = n }
+}
+
+// WithMaxCoroutines caps live coroutines per VM (coroutines are
+// goroutines here): creating past the cap raises a pcall-catchable
+// "too many coroutines". Zero (default) is unlimited (stock behavior).
+func WithMaxCoroutines(n int) Option {
+	return func(o *options) { o.maxCoroutines = n }
 }
 
 // WithEventSink observes every guest print() (arguments as seam Values).

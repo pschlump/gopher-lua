@@ -184,11 +184,19 @@ mechanism-free)
   the `_GOPHER_LUA_VERSION` global is normalized to `<version>` in
   GLOBALS lines so version bumps don't churn the corpus; the official leg
   skips in `-short` mode (26s full / 6.4s short), byte-stable across
-  repeated runs; (b) **embedcmp interp legs:** port glasm's
-  `runtime/embedbench55.c` + `cmd/embedcmp` pattern — C-API
-  `{clua-reuse, clua-fresh}` vs `{glua-cold, glua-fresh, glua-pool}` for
-  the Redis-EVAL shape (short scripts × thousands of staged KEYS/ARGV
-  runs).
+  repeated runs; (b) **embedcmp interp legs — DONE (2026-11-01):**
+  `cmd/embedcmp` (ported from glasm at N3b) races the C embedding API
+  (`cmd/embedcmp/c/embedbench55.c` over the vendored `c/lua55` tree —
+  C sources live under `c/` because a Go package dir may not hold
+  `.c` without cgo) `{clua-reuse, clua-fresh}` against `host/`
+  `{glua-cold, glua-fresh, glua-pool}` for the Redis-EVAL shape;
+  mechanism deltas (memory-only cache → real cold parse; µs NewVM;
+  `USED` = the N2 accounted gauge) are recorded with the run in
+  `docs/Embedded-EVAL-Perf.md`. Headline vs glasm's same-day wasm run:
+  **pool posture 3.4–16.5× C (wasm was 13–62×), hostfn ~0.30 µs (was
+  ~0.85), no-pool 24–28 µs ≈ 1.6× C's own fresh (was ~2.6 ms — the
+  pool is now an optimization, not feasibility), warm RSS 8.1–8.6 MB
+  (was 50–70)**; RET cross-check zero mismatches, 7 scripts × 5 legs.
 - **N5 — Ultima cutover:** EVAL/SCRIPT over `host/` per Ultima M8
   (`../ultima`); glasm's How-To §5 remains the shape of the plan, rewritten
   for the native package.
@@ -253,7 +261,8 @@ text, numerals — is a bug, not a trade).
 | 4 | done N2 sandbox (budget, protection, stdlib) | ~3–5 days |
 | 5 | P2 table engine | 2–4 weeks |
 | 6 | P3 interning | ~1 week |
-| 7 | N3b embedcmp legs, N5 Ultima cutover | ~2–3 days |
+| done | N3b embedcmp legs (Embedded-EVAL-Perf.md) | — |
+| 7 | N5 Ultima cutover | ~2–3 days |
 | 8 | P4/P5 | by data |
 
 A usable Ultima engine exists after step 4 (~3 weeks in); the full program

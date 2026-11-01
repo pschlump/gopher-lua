@@ -18,13 +18,15 @@ The roadmap is `docs/Option-A-Plan.md` (tracks N = embed package + gates, P = pe
 make build          # go-inline *.go && go fmt . && go build -o cmd/glua/glua ./cmd/glua
 make test           # go-inline + go fmt + go test ./...
 go test ./...       # everything (root package = the interpreter + libs)
+go test -short ./...  # skips the official-suite golden leg (26s full / 6.4s short)
 ./cmd/glua/glua script.lua   # standalone interpreter (no args: REPL)
+GOLDEN_UPDATE=1 go test . -run TestGolden   # regenerate goldens — deliberate; every diff line is a behavior delta
 ```
 
 ## Laws
 
 - **Byte-exactness with stock C Lua 5.5.1 is the contract** — error messages, `luaV_*` semantics, observable table-iteration order, numeral formatting. The interpreter is the product; stock C Lua is the spec. Any divergence requires a row in the divergence ledger (glasm's ledger is `docs/glasm-history/Lua-Wasm-Divergence-Ledger.md`; new rows go in `docs/Divergence-Ledger.md` once created) and a covering test.
-- **No behavior change without its gate** — the golden-corpus gate (plan §4 N3a) is the safety net for all perf work; it lands before Track P starts.
+- **No behavior change without its gate** — the golden-corpus gate (`golden_test.go` over `_goldens/`, 58 cases across `_lua5.5-tests`/`_glua-tests`/`_u1`) is the safety net for all perf work. Goldens regenerate only deliberately (`GOLDEN_UPDATE=1`), and every changed line in `git diff _goldens/` is a behavior delta that cites its ledger row.
 - Corpora are `_`-prefixed so the Go tooling ignores them: `_lua5.5-tests` (official suite), `_glua-tests`, `_u1`.
 
 ## Conventions

@@ -117,15 +117,26 @@ mechanism-free)
   `lua55_prod.wasm` posture, as an engine option; coroutine spawn cap
   (coroutines are goroutines here — unbounded `coroutine.create` needs a
   ceiling); **memory budget** — decision below.
-- **N3 — gates:** (a) **golden-corpus gate (~1 day, lands FIRST):** run
-  `_lua5.5-tests/` + `_glua-tests/` + `_u1/` through this interpreter
-  (the verified artifact), capture normalized outputs as checked-in
-  goldens, and make `go test ./...` assert byte-exactness on every case —
-  the standing regression law, no C or wasm dependency; (b) **embedcmp
-  interp legs:** port glasm's `runtime/embedbench55.c` +
-  `cmd/embedcmp` pattern — C-API `{clua-reuse, clua-fresh}` vs
-  `{glua-cold, glua-fresh, glua-pool}` for the Redis-EVAL shape (short
-  scripts × thousands of staged KEYS/ARGV runs).
+- **N3 — gates:** (a) **golden-corpus gate — DONE (2026-11-01):**
+  `golden_test.go` + `golden_runner_test.go` + `_goldens/` (58 goldens:
+  26 official-suite, 11 glua, 21 u1). Every corpus case runs through this
+  interpreter and must reproduce its golden event log byte-for-byte
+  (PRINT/ERROR/RESULTS/GLOBALS; the runner is glasm's Interp engine
+  conventions verbatim — deterministic os shims, SuiteFlags posture,
+  sorted-table serialization). Regenerate deliberately:
+  `GOLDEN_UPDATE=1 go test . -run TestGolden`. Findings at landing: the
+  official suite contains blocks **stock C Lua 5.5.1 itself fails** under
+  the user-tests posture (coroutine.lua:184's close-while-closing assert —
+  glasm's U5 gate proved the interp byte-exact with stock *including*
+  that failure), so pinned errors are stock-faithful, not divergences;
+  the `_GOPHER_LUA_VERSION` global is normalized to `<version>` in
+  GLOBALS lines so version bumps don't churn the corpus; the official leg
+  skips in `-short` mode (26s full / 6.4s short), byte-stable across
+  repeated runs; (b) **embedcmp interp legs:** port glasm's
+  `runtime/embedbench55.c` + `cmd/embedcmp` pattern — C-API
+  `{clua-reuse, clua-fresh}` vs `{glua-cold, glua-fresh, glua-pool}` for
+  the Redis-EVAL shape (short scripts × thousands of staged KEYS/ARGV
+  runs).
 - **N5 — Ultima cutover:** EVAL/SCRIPT over `host/` per Ultima M8
   (`../ultima`); glasm's How-To §5 remains the shape of the plan, rewritten
   for the native package.
@@ -187,7 +198,7 @@ text, numerals — is a bug, not a trade).
 | Order | Milestone | Estimate |
 |---|---|---|
 | done | N0 carve + this plan | — |
-| 1 | N3a golden-corpus gate | ~1 day |
+| done | N3a golden-corpus gate (58 goldens, byte-stable) | — |
 | 2 | N1 embed core | ~2–3 days |
 | 3 | P0 measurement rig + baseline | ~1 day |
 | 4 | P1 register windows | 1–2 weeks |

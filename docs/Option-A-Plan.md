@@ -258,12 +258,21 @@ text, numerals — is a bug, not a trade).
   −39% by lane (numloop 22.2×C → 14.6×C, tco 10.7×C → 6.5×C, concat
   1.25×C → 1.03×C); the warm/interp gap closed to ≈2% everywhere. P1
   register windows is now the top measured cost center.
-- **P1 — register-window slicing (1–2 weeks, est 10–25%):** frame setup
-  knows `NumUsedRegisters`; slice the register window once per frame and
-  make handlers store without `checkSize`/top bookkeeping (explicit top
-  maintenance only at vararg calls, multret returns, SETLIST). Touches
-  every handler in `_vm.go` — the go-inline pipeline is set up for exactly
-  this.
+- **P1 — register-window slicing — CLOSED BY MEASUREMENT (2026-11-01,
+  `docs/Perf-P1-Findings.md`):** the est 10–25% is refuted at the
+  mechanism level on this hardware. A complete implementation of the
+  bookkeeping layer (cf threading through `instFunc`, `checkSize`-free
+  windowed stores over `initCallFrame`'s frame-entry capacity
+  guarantee, block nil-fills) measured **geomean −0.15%** — reverted.
+  The full slicing design's remaining ceiling (bounds checks, the only
+  per-access cost left) measured **~0%** via `-gcflags=all=-B` on the
+  most register-intensive lane. Out-of-order execution hides the
+  compare-and-branch costs the 2026-09 estimate was formed on; the
+  window/BCE workstream is dead and will not be built. Successors by
+  measurement: **LValue boxing** (numloop 14.6×C — the worst lane; a
+  representation change, biggest open lever, needs its own milestone),
+  **P4 call path** (fib's ~35% cum return-path + push costs — promoted),
+  P2 tables (unchanged).
 - **P2 — table engine rewrite (2–4 weeks, est 1.5–3× on hash-heavy):**
   (i) replace `keys`/`k2i` double-map with intrusive insertion-order links;
   (ii) precomputed string-key hashes + own open-addressing table (kills
@@ -273,9 +282,19 @@ text, numerals — is a bug, not a trade).
   is test-pinned — it is part of the byte-exact contract.
 - **P3 — string interning (~1 week, est 5–15%):** intern at compile time
   (constants) and table-key store; per-VM pool; pointer-equality compares.
-- **P4 — call path (data-scoped):** frame setup cost (push, capacity
-  check, nil-fill, vararg shuffle). Glasm's U9/U10 lessons on call-path
-  costs apply in shape even where the wasm mechanisms don't transfer.
+- **P4 — call path (promoted by P1's refutation; data-scoped ~5–10% on
+  call lanes):** fib's measured costs are the per-call generality —
+  `doReturn`/`doReturnTail` cum ~35% (marker/tbc/yield guard sequence +
+  generic result staging), frame `Push` ~5% (13-word `callFrame`
+  by-value copy), `resolveCall`/`markerKind` ~2.5%. Fast paths for the
+  plain Lua→Lua call/return (no marker, no tbc, fixed arity) are the
+  vehicle; glasm's U9/U10 lessons apply in shape.
+- **P6 — LValue representation (new, biggest open lever):** numloop
+  14.6×C is boxed arithmetic — every result outside the [0,128) preload
+  arena-allocates (`arithCompute`+`LInteger2I`/`LNumber2I` ≈ 57% of
+  engine time on that lane). NaN-boxing or a tagged union touches
+  everything; needs a decision + its own milestone before P2-level
+  effort is spent elsewhere. Flagged in `docs/Perf-P1-Findings.md`.
 - **P5 — misc (data-scoped):** ~~`mainLoopWithContext`'s per-instruction
   `select`~~ (done by P1a); `LNumber.String` `fmt.Sprint` path;
   `stringConcat`'s `[]string`+join.
@@ -289,13 +308,14 @@ text, numerals — is a bug, not a trade).
 | done  | N1 embed core (`host/`, race-gated)              | —         |
 | done  | P0 measurement rig (Perf-P0-Baseline.md)         | —         |
 | done  | P1a amortized deadline check (Perf-P1a-Deadline-Check.md) | days |
-| 3     | P1 register windows                              | 1–2 weeks |
+| closed | P1 register windows — measured refutation (Perf-P1-Findings.md) | — |
 | 4     | done N2 sandbox (budget, protection, stdlib)     | ~3–5 days |
 | 5     | P2 table engine                                  | 2–4 weeks |
-| 6     | P3 interning                                     | ~1 week   |
+| 6     | P4 call path (promoted by P1 findings)           | by data   |
+| 7     | P3 interning                                     | ~1 week   |
 | done  | N3b embedcmp legs (Embedded-EVAL-Perf.md)        | —         |
 | done  | N5 Ultima cutover (differential 332/0 vs live Redis) | —     |
-| 8     | P4/P5                                            | by data   |
+| 8     | P5 misc / P6 LValue representation (decision pending) | by data |
 
 A usable Ultima engine exists after step 4 (~3 weeks in); the full program
 is ~6–9 weeks.

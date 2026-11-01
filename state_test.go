@@ -70,7 +70,7 @@ func TestSkipOpenLibs(t *testing.T) {
 	L := NewState(Options{SkipOpenLibs: true})
 	defer L.Close()
 	errorIfScriptNotFail(t, L, `print("")`,
-		"attempt to call a non-function object")
+		"attempt to call a nil value")
 	L2 := NewState()
 	defer L2.Close()
 	errorIfScriptFail(t, L2, `print("")`)
@@ -201,7 +201,7 @@ func TestToString(t *testing.T) {
 	L.Push(LNumber(10))
 	L.Push(LString("99.9"))
 	L.Push(L.NewTable())
-	errorIfNotEqual(t, "10", L.ToString(1))
+	errorIfNotEqual(t, "10.0", L.ToString(1))
 	errorIfNotEqual(t, "99.9", L.ToString(2))
 	errorIfNotEqual(t, "", L.ToString(3))
 }
@@ -273,7 +273,7 @@ func TestObjLen(t *testing.T) {
 func TestConcat(t *testing.T) {
 	L := NewState()
 	defer L.Close()
-	errorIfNotEqual(t, "a1c", L.Concat(LString("a"), LNumber(1), LString("c")))
+	errorIfNotEqual(t, "a1.0c", L.Concat(LString("a"), LNumber(1), LString("c")))
 }
 
 func TestPCall(t *testing.T) {
@@ -296,14 +296,16 @@ func TestPCall(t *testing.T) {
 		L.RaiseError("error!")
 		return 1
 	}))
-	errorIfFalse(t, strings.Contains(err.Error(), "error!"), "")
+	// U5c (stock luaD_errerr, row 78e): a FAILING message handler — any
+	// raise or panic — collapses to exactly "error in error handling"
+	errorIfFalse(t, strings.Contains(err.Error(), "error in error handling"), "")
 
 	L.Push(L.GetGlobal("f1"))
 	err = L.PCall(0, 0, L.NewFunction(func(L *LState) int {
 		panic("panicc!")
 		return 1
 	}))
-	errorIfFalse(t, strings.Contains(err.Error(), "panicc!"), "")
+	errorIfFalse(t, strings.Contains(err.Error(), "error in error handling"), "")
 
 	// Issue #452, expected to be revert back to previous call stack after any error.
 	currentFrame, currentTop, currentSp := L.currentFrame, L.GetTop(), L.stack.Sp()
@@ -345,21 +347,21 @@ func TestCoroutineApi1(t *testing.T) {
 	errorIfNotEqual(t, ResumeYield, st)
 	errorIfNotNil(t, err)
 	errorIfNotEqual(t, 3, len(values))
-	errorIfNotEqual(t, LNumber(1), values[0].(LNumber))
-	errorIfNotEqual(t, LNumber(2), values[1].(LNumber))
-	errorIfNotEqual(t, LNumber(3), values[2].(LNumber))
+	errorIfNotEqual(t, LInteger(1), values[0].(LInteger))
+	errorIfNotEqual(t, LInteger(2), values[1].(LInteger))
+	errorIfNotEqual(t, LInteger(3), values[2].(LInteger))
 
 	st, err, values = L.Resume(co, fn, LNumber(11), LNumber(12))
 	errorIfNotEqual(t, ResumeYield, st)
 	errorIfNotNil(t, err)
 	errorIfNotEqual(t, 1, len(values))
-	errorIfNotEqual(t, LNumber(4), values[0].(LNumber))
+	errorIfNotEqual(t, LInteger(4), values[0].(LInteger))
 
 	st, err, values = L.Resume(co, fn)
 	errorIfNotEqual(t, ResumeOK, st)
 	errorIfNotNil(t, err)
 	errorIfNotEqual(t, 1, len(values))
-	errorIfNotEqual(t, LNumber(5), values[0].(LNumber))
+	errorIfNotEqual(t, LInteger(5), values[0].(LInteger))
 
 	L.Register("myyield", func(L *LState) int {
 		return L.Yield(L.ToNumber(1))
@@ -377,14 +379,16 @@ func TestCoroutineApi1(t *testing.T) {
 	errorIfNotEqual(t, ResumeYield, st)
 	errorIfNotNil(t, err)
 	errorIfNotEqual(t, 3, len(values))
-	errorIfNotEqual(t, LNumber(1), values[0].(LNumber))
-	errorIfNotEqual(t, LNumber(2), values[1].(LNumber))
-	errorIfNotEqual(t, LNumber(3), values[2].(LNumber))
+	errorIfNotEqual(t, LInteger(1), values[0].(LInteger))
+	errorIfNotEqual(t, LInteger(2), values[1].(LInteger))
+	errorIfNotEqual(t, LInteger(3), values[2].(LInteger))
 
 	st, err, values = L.Resume(co, fn)
 	errorIfNotEqual(t, ResumeYield, st)
 	errorIfNotNil(t, err)
 	errorIfNotEqual(t, 1, len(values))
+	// myyield goes through the Go API (L.ToNumber → LNumber), so this
+	// yield keeps the float subtype
 	errorIfNotEqual(t, LNumber(4), values[0].(LNumber))
 
 	st, err, values = L.Resume(co, fn)
@@ -394,8 +398,76 @@ func TestCoroutineApi1(t *testing.T) {
 	st, err, values = L.Resume(co, fn)
 	errorIfNotEqual(t, ResumeError, st)
 	errorIfNil(t, err)
-	errorIfFalse(t, strings.Contains(err.Error(), "can not resume a dead thread"), "can not resume a dead thread")
+	// U4d re-pin: stock lua_resume texts ("cannot resume dead coroutine");
+	// the old fork text was gopherlua's
+	errorIfFalse(t, strings.Contains(err.Error(), "cannot resume dead coroutine"), "cannot resume dead coroutine")
 
+}
+
+// TestYieldPastBaseFrame (U5d closes row 22's seam): a yield crossing a
+// pcall/xpcall frame inside a coroutine now has stock continuation
+// semantics — pcall is a marker frame, not a live Go frame, so the yield
+// SUSPENDS the thread; the resume re-enters the payload with the resume
+// values as the yield's returns; the marker completes [true, ...] when
+// the payload finishes. The U4g surgical behavior (thread killed at the
+// yield, next resume "cannot resume dead coroutine") is gone — only the
+// genuinely-dead thread reports it. These are Go tests, not corpus
+// cases, because they pin thread-state transitions (asserts carry the
+// expectations; every shape verified against the clua55 oracle).
+func TestYieldPastBaseFrame(t *testing.T) {
+	shapes := []string{
+		// statement call: yield as a direct pcall payload — a G body
+		`local co = coroutine.create(function()
+		   local ok, v = pcall(coroutine.yield, "y1")
+		   assert(ok == true and v == "r1", "resume continues the payload")
+		   return "done"
+		 end)
+		 assert(select(2, coroutine.resume(co)) == "y1")
+		 assert(coroutine.status(co) == "suspended", "suspended at the yield")
+		 assert(coroutine.resume(co, "r1") == true)
+		 assert(coroutine.resume(co) == false) -- now genuinely dead`,
+		// local-assignment call with a Lua payload
+		`local co = coroutine.create(function()
+		   local ok, v = pcall(function() coroutine.yield("y1") end)
+		   assert(ok == true and v == nil, "resume continues the Lua payload")
+		   return ok, v
+		 end)
+		 assert(select(2, coroutine.resume(co)) == "y1")
+		 local ok2, a, b = coroutine.resume(co)
+		 assert(ok2 == true and a == true and b == nil)
+		 assert(coroutine.resume(co) == false)`,
+		// tailcall shape (return pcall(...)): the marker replaces the frame
+		`local co = coroutine.create(function() return pcall(coroutine.yield, "y1") end)
+		 assert(select(2, coroutine.resume(co)) == "y1")
+		 local ok2, a = coroutine.resume(co)
+		 assert(ok2 == true and a == true, "tailcall marker completes")
+		 assert(coroutine.resume(co) == false)`,
+		// a G function as the thread entry itself (pcall is the base
+		// marker) — suspended after the yield, then completes
+		`local co = coroutine.create(pcall)
+		 assert(select(2, coroutine.resume(co, function() coroutine.yield("y1") end)) == "y1")
+		 assert(coroutine.status(co) == "suspended", "entry marker suspends")
+		 local ok2, a = coroutine.resume(co)
+		 assert(ok2 == true and a == true, "entry marker completes")`,
+		// coroutine.wrap flavor: the second call returns pcall's results
+		`local f = coroutine.wrap(function() return pcall(coroutine.yield, "w") end)
+		 assert(f() == "w")
+		 assert(f() == true, "wrap resumes into the marker completion")`,
+	}
+	for i, src := range shapes {
+		L := NewState()
+		func() {
+			defer L.Close()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("shape %d panicked: %v", i, r)
+				}
+			}()
+			if err := L.DoString(src); err != nil {
+				t.Errorf("shape %d: %v", i, err)
+			}
+		}()
+	}
 }
 
 func TestContextTimeout(t *testing.T) {
@@ -465,7 +537,7 @@ func TestContextWithCroutine(t *testing.T) {
 	fn := L.GetGlobal("coro").(*LFunction)
 	_, err, values := L.Resume(co, fn)
 	errorIfNotNil(t, err)
-	errorIfNotEqual(t, LNumber(0), values[0])
+	errorIfNotEqual(t, LInteger(0), values[0])
 	// cancel the parent context
 	cancel()
 	_, err, values = L.Resume(co, fn)

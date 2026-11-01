@@ -6,11 +6,26 @@ import (
 	"reflect"
 
 	"github.com/pschlump/gopher-lua/ast"
+	"github.com/pschlump/gopher-lua/parse"
 )
 
 /* internal constants & structs  {{{ */
 
+// maxRegisters is stock MAXVARS (lparser.c:35): the register level of a
+// function's DECLARED variables — locals and parameters alike, checked as
+// adjustlocalvars assigns each ridx ("too many local variables").
 const maxRegisters = 200
+
+// maxFuncRegisters is stock MAX_FSTACK (lopcodes.h:210 = MAXARG_A, the A
+// field width): the register WINDOW — declared variables plus expression
+// temporaries (luaK_checkstack's maxstacksize). 200 locals plus return-
+// expression temps legitimately need 200 < window <= 255 (goto.lua:411's
+// 200-declaration mixing battery).
+const maxFuncRegisters = opMaxArgsA
+
+// maxUpvalues is stock MAXUPVAL (llimits.h): 255 captures per function
+// (singlevaraux's luaY_checklimit "upvalues").
+const maxUpvalues = 255
 
 type expContextType int
 
@@ -22,6 +37,9 @@ const (
 	ecVararg
 	ecMethod
 	ecNone
+	// ecConst (U5a): the name resolved to an RDKCTC entry — a
+	// register-less compile-time constant folded at its use sites.
+	ecConst
 )
 
 const regNotDefined = opMaxArgsA + 1
@@ -36,12 +54,24 @@ type expcontext struct {
 	varargopt int
 }
 
+// table-key addressing modes for assignment/constructor stores (the 5.5
+// encoding splits keyed stores into SETFIELD/SETI/SETTABLE).
+type keyModeType int
+
+const (
+	keyReg  keyModeType = iota // key lives in a register
+	keyKStr                    // key is a pooled string constant (K[B])
+	keyInt                     // key is an unsigned immediate (B)
+)
+
 type assigncontext struct {
-	ec       *expcontext
-	keyrk    int
-	valuerk  int
-	keyks    bool
-	needmove bool
+	ec          *expcontext
+	keyMode     keyModeType
+	keyReg      int
+	keyData     int // K index (keyKStr) or immediate (keyInt)
+	valuerk     int // register or kMark|kidx (RKC value operand)
+	needmove    bool
+	envLocalIdx int
 }
 
 type lblabels struct {
@@ -57,7 +87,7 @@ type constLValueExpr struct {
 	Value LValue
 }
 
-// }}}
+/* }}} */
 
 /* utilities {{{ */
 var _ecnone0 = &expcontext{ecNone, regNotDefined, 0}
@@ -114,6 +144,20 @@ func raiseCompileError(context *funcContext, line int, format string, args ...in
 	panic(&CompileError{context: context, Line: line, Message: msg})
 }
 
+// raiseErrorLimit is stock's errorlimit (lparser.c): "too many %s (limit
+// is %d) in %s", where %s is "main function" for the main chunk (line
+// defined 0) or "function at line %d" otherwise — errors.lua's limit
+// batteries pin both the what and the "line N" text (:768's upvalues,
+// :778's local variables). Reported at the function's definition line
+// (the fork's compile is post-parse; stock uses the current token).
+func raiseErrorLimit(context *funcContext, limit int, what string) {
+	where := "main function"
+	if line := context.Proto.LineDefined; line != 0 {
+		where = fmt.Sprintf("function at line %d", line)
+	}
+	raiseCompileError(context, context.Proto.LineDefined, "too many %s (limit is %d) in %s", what, limit, where)
+}
+
 func isVarArgReturnExpr(expr ast.Expr) bool {
 	switch ex := expr.(type) {
 	case *ast.FuncCallExpr:
@@ -124,19 +168,6 @@ func isVarArgReturnExpr(expr ast.Expr) bool {
 	return false
 }
 
-func lnumberValue(expr ast.Expr) (LNumber, bool) {
-	if ex, ok := expr.(*ast.NumberExpr); ok {
-		lv, err := parseNumber(ex.Value)
-		if err != nil {
-			lv = LNumber(math.NaN())
-		}
-		return lv, true
-	} else if ex, ok := expr.(*constLValueExpr); ok {
-		return ex.Value.(LNumber), true
-	}
-	return 0, false
-}
-
 /* utilities }}} */
 
 type gotoLabelDesc struct { // {{{
@@ -145,6 +176,10 @@ type gotoLabelDesc struct { // {{{
 	Pc                 int
 	Line               int
 	NumActiveLocalVars int
+	// NeedClose (stock Labeldesc.close): the goto was hoisted out of a
+	// block with upvalues/tbc while escaping some variable's scope — its
+	// CLOSE placeholder is required when the goto resolves.
+	NeedClose bool
 }
 
 func newLabelDesc(id int, name string, pc, line, n int) *gotoLabelDesc {
@@ -155,10 +190,6 @@ func newLabelDesc(id int, name string, pc, line, n int) *gotoLabelDesc {
 		Line:               line,
 		NumActiveLocalVars: n,
 	}
-}
-
-func (l *gotoLabelDesc) SetNumActiveLocalVars(n int) {
-	l.NumActiveLocalVars = n
 } // }}}
 
 type CompileError struct { // {{{
@@ -168,7 +199,7 @@ type CompileError struct { // {{{
 }
 
 func (e *CompileError) Error() string {
-	return fmt.Sprintf("compile error near line(%v) %v: %v", e.Line, e.context.Proto.SourceName, e.Message)
+	return fmt.Sprintf("%v:%d: %s", parse.ChunkID(e.context.Proto.SourceName), e.Line, e.Message)
 } // }}}
 
 type codeStore struct { // {{{
@@ -192,21 +223,45 @@ func (cd *codeStore) AddABC(op int, a int, b int, c int, line int) {
 	cd.Add(opCreateABC(op, a, b, c), line)
 }
 
+func (cd *codeStore) AddABCk(op int, a int, b int, c int, k int, line int) {
+	cd.Add(opCreateABCk(op, a, b, c, k), line)
+}
+
+func (cd *codeStore) AddvABCk(op int, a int, b int, c int, k int, line int) {
+	cd.Add(opCreatevABCk(op, a, b, c, k), line)
+}
+
 func (cd *codeStore) AddABx(op int, a int, bx int, line int) {
 	cd.Add(opCreateABx(op, a, bx), line)
 }
 
-func (cd *codeStore) AddASbx(op int, a int, sbx int, line int) {
-	cd.Add(opCreateASbx(op, a, sbx), line)
+// AddAsBx: the sBx (17-bit signed) form — LOADI/LOADF.
+func (cd *codeStore) AddAsBx(op int, a int, sbx int, line int) {
+	cd.Add(opCreateAsBx(op, a, sbx), line)
 }
 
+// AddAx: the Ax (25-bit) form — EXTRAARG.
+func (cd *codeStore) AddAx(op int, ax int, line int) {
+	cd.Add(opCreateAx(op, ax), line)
+}
+
+// AddSJ: the sJ (25-bit signed) form — OP_JMP. During compilation the
+// payload holds the label id; patchCode rewrites it to the pc-relative
+// offset (jump target - (pc + 1), stock fixjump's convention).
+func (cd *codeStore) AddSJ(op int, sj int, line int) {
+	cd.Add(opCreateSJ(op, sj), line)
+}
+
+// PropagateKMV pops a trailing scratch LOADK (K index within the 8-bit
+// RKC range) so the value folds into the consuming instruction's k-flag
+// operand; otherwise the value stays in a fresh register.
 func (cd *codeStore) PropagateKMV(top int, save *int, reg *int, inc int) {
 	lastinst := cd.Last()
 	if opGetArgA(lastinst) >= top {
 		switch opGetOpCode(lastinst) {
 		case OP_LOADK:
 			cindex := opGetArgBx(lastinst)
-			if cindex <= opMaxIndexRk {
+			if cindex <= opMaxIndexK {
 				cd.Pop()
 				*save = opRkAsk(cindex)
 				return
@@ -235,14 +290,22 @@ func (cd *codeStore) PropagateMV(top int, save *int, reg *int, inc int) {
 	*reg = *reg + inc
 }
 
-func (cd *codeStore) AddLoadNil(a, b, line int) {
-	// this method used to merge multiple consecutive LOADNIL instructions
-	// of consecutive registers into a single LOADNIL instruction, but it
-	// caused issues when the merged instructions were JMP targets, and so
-	// generated invalid code; so the merging functionality has been removed.
-	// It is safe to merge the LOADNIL instructions under certain conditions,
-	// but additional logic / complexity would be needed here.
-	cd.AddABC(OP_LOADNIL, a, b, 0, line)
+// PropagateK is PropagateKMV's constant-only form: it pops a trailing
+// scratch LOADK (K index within the 8-bit RKC range) so the constant
+// folds into the consuming instruction's k-flag operand, but never
+// propagates a register — the value stays materialized in the window
+// (stock luaK_exp2rk; see compileAssignStmtRight).
+func (cd *codeStore) PropagateK(top int, save *int) bool {
+	lastinst := cd.Last()
+	if opGetArgA(lastinst) >= top && opGetOpCode(lastinst) == OP_LOADK {
+		cindex := opGetArgBx(lastinst)
+		if cindex <= opMaxIndexK {
+			cd.Pop()
+			*save = opRkAsk(cindex)
+			return true
+		}
+	}
+	return false
 }
 
 func (cd *codeStore) SetOpCode(pc int, v int) {
@@ -261,12 +324,28 @@ func (cd *codeStore) SetC(pc int, v int) {
 	opSetArgC(&cd.codes[pc], v)
 }
 
+func (cd *codeStore) SetvB(pc int, v int) {
+	opSetArgvB(&cd.codes[pc], v)
+}
+
+func (cd *codeStore) SetvC(pc int, v int) {
+	opSetArgvC(&cd.codes[pc], v)
+}
+
+func (cd *codeStore) Setk(pc int, v int) {
+	opSetArgk(&cd.codes[pc], v)
+}
+
 func (cd *codeStore) SetBx(pc int, v int) {
 	opSetArgBx(&cd.codes[pc], v)
 }
 
-func (cd *codeStore) SetSbx(pc int, v int) {
-	opSetArgSbx(&cd.codes[pc], v)
+func (cd *codeStore) SetAx(pc int, v int) {
+	opSetArgAx(&cd.codes[pc], v)
+}
+
+func (cd *codeStore) SetSJ(pc int, v int) {
+	opSetArgsJ(&cd.codes[pc], v)
 }
 
 func (cd *codeStore) At(pc int) uint32 {
@@ -304,12 +383,31 @@ type varNamePoolValue struct {
 }
 
 type varNamePool struct {
-	names  []string
+	names []string
+	// kinds holds the variable kind per name (U4; stock lparser.h VDK*/
+	// Vardesc kinds — see the varKind* constants). Parallel to names;
+	// separate per block, so sibling-block locals sharing a register
+	// never share a kind.
+	kinds []int
+	// regs holds the register (stack slot) per entry, parallel to names
+	// (U5a — stock separates fs->nactvar, the scope count, from
+	// luaY_nvarstack, the register level: RDKCTC and global-declaration
+	// entries are active for scoping but never occupy a slot). -1 marks a
+	// register-less entry.
+	regs []int
+	// dbg holds the Proto.DbgLocals entry per name, parallel to names —
+	// nil for register-less kinds (U5a: stock records locvars only for
+	// stack-resident variables; RDKCTC/GDK entries never appear in
+	// debug.getlocal).
+	dbg []*DbgLocalInfo
+	// vals holds the folded constant of a varKindCTC entry (parallel to
+	// names; nil otherwise) — stock keeps the value on the Vardesc.
+	vals   []LValue
 	offset int
 }
 
 func newVarNamePool(offset int) *varNamePool {
-	return &varNamePool{make([]string, 0, 16), offset}
+	return &varNamePool{make([]string, 0, 16), make([]int, 0, 16), make([]int, 0, 16), make([]*DbgLocalInfo, 0, 16), make([]LValue, 0, 16), offset}
 }
 
 func (vp *varNamePool) Names() []string {
@@ -331,6 +429,12 @@ func (vp *varNamePool) LastIndex() int {
 
 func (vp *varNamePool) Find(name string) int {
 	for i := len(vp.names) - 1; i >= 0; i-- {
+		// global-declaration entries never match a program name (U5a —
+		// stock searchvar checks the kind before the name; collective
+		// entries carry a NULL name and match nothing)
+		if isGlobalKind(vp.kinds[i]) {
+			continue
+		}
 		if vp.names[i] == name {
 			return i + vp.offset
 		}
@@ -347,8 +451,122 @@ func (vp *varNamePool) RegisterUnique(name string) int {
 }
 
 func (vp *varNamePool) Register(name string) int {
+	return vp.RegisterKindReg(name, varKindReg, vp.offset+len(vp.names))
+}
+
+// RegisterKind is Register with an explicit variable kind (U4 attributes).
+func (vp *varNamePool) RegisterKind(name string, kind int) int {
+	return vp.RegisterKindReg(name, kind, vp.offset+len(vp.names))
+}
+
+// RegisterKindReg is Register with an explicit register: the next free
+// slot for register-holding kinds, -1 for register-less ones (U5a —
+// stock's adjustlocalvars assigns ridx only to stack-resident variables;
+// RDKCTC/GDK entries are active for scoping but never occupy a slot).
+func (vp *varNamePool) RegisterKindReg(name string, kind, reg int) int {
 	vp.names = append(vp.names, name)
+	vp.kinds = append(vp.kinds, kind)
+	if !kindHasRegister(kind) {
+		reg = -1
+	}
+	vp.regs = append(vp.regs, reg)
+	vp.dbg = append(vp.dbg, nil)
+	vp.vals = append(vp.vals, nil)
 	return len(vp.names) - 1 + vp.offset
+}
+
+// noteDbg attaches the Proto.DbgLocals entry for the entry at index
+// (register-holding entries only).
+func (vp *varNamePool) noteDbg(index int, info *DbgLocalInfo) {
+	vp.dbg[index-vp.offset] = info
+}
+
+// dbgAt is the DbgLocalInfo of the entry at index (nil for
+// register-less entries) — the localfunc/for-loop startpc re-pins.
+func (vp *varNamePool) dbgAt(index int) *DbgLocalInfo {
+	return vp.dbg[index-vp.offset]
+}
+
+// noteCTC records the folded constant of the varKindCTC entry at index.
+func (vp *varNamePool) noteCTC(index int, value LValue) {
+	vp.vals[index-vp.offset] = value
+}
+
+// ctcValAt is the folded constant of the entry at index (nil unless the
+// entry is varKindCTC).
+func (vp *varNamePool) ctcValAt(index int) LValue {
+	return vp.vals[index-vp.offset]
+}
+
+// isGlobalKind reports a global-declaration entry (stock varglobal):
+// invisible to local-name resolution, active for the preambular walk.
+func isGlobalKind(kind int) bool {
+	return kind == varKindGlobalReg || kind == varKindGlobalConst
+}
+
+// regAt is the register of the entry at global (function-wide) index
+// (-1 for a register-less entry).
+func (vp *varNamePool) regAt(index int) int {
+	return vp.regs[index-vp.offset]
+}
+
+// kindAt is the kind of the local at global (function-wide) index.
+func (vp *varNamePool) kindAt(index int) int {
+	return vp.kinds[index-vp.offset]
+}
+
+// countKind counts the locals of a kind declared in this block's pool.
+func (vp *varNamePool) countKind(kind int) int {
+	n := 0
+	for _, k := range vp.kinds {
+		if k == kind {
+			n++
+		}
+	}
+	return n
+}
+
+/*
+Local variable kinds (U4+U5; stock lparser.h's VDK* numbers).
+*/
+const (
+	varKindReg         = 0 // VDKREG — a regular local
+	varKindConst       = 1 // RDKCONST — <const>: assignment-locked
+	varKindVararg      = 2 // RDKVAVAR — the named vararg parameter (U5b): assignment-locked (check_readonly), indexed reads compile as OP_GETVARG, any whole-value use promotes the function to the table model
+	varKindTBC         = 3 // RDKTOCLOSE — <close>: assignment-locked + OP_TBC
+	varKindCTC         = 4 // RDKCTC — register-less compile-time constant (U5a)
+	varKindGlobalReg   = 5 // GDKREG — a declared global (U5a)
+	varKindGlobalConst = 6 // GDKCONST — a declared read-only global / collective
+)
+
+// varargTableName is the debug name of an unnamed vararg parameter
+// (stock's new_localvarliteral "(vararg table)").
+const varargTableName = "(vararg table)"
+
+// kindHasRegister reports whether an entry of this kind occupies a stack
+// slot (stock's adjustlocalvars vs. the register-less RDKCTC/GDK kinds).
+func kindHasRegister(kind int) bool {
+	switch kind {
+	case varKindCTC, varKindGlobalReg, varKindGlobalConst:
+		return false
+	}
+	return true
+}
+
+// globalStarName is the pool name of a collective `global *` entry
+// (stock uses a NULL name; "*" cannot collide with a program name — the
+// lexer never produces it as an identifier).
+const globalStarName = "*"
+
+// attribToKind maps an AST attribute string to a variable kind.
+func attribToKind(attrib string) int {
+	switch attrib {
+	case "const":
+		return varKindConst
+	case "close":
+		return varKindTBC
+	}
+	return varKindReg
 }
 
 /* }}} VarNamePool */
@@ -356,38 +574,32 @@ func (vp *varNamePool) Register(name string) int {
 /* FuncContext {{{ */
 
 type codeBlock struct {
-	LocalVars      *varNamePool
-	BreakLabel     int
-	Parent         *codeBlock
-	RefUpvalue     bool
-	LineStart      int
-	LastLine       int
-	labels         map[string]*gotoLabelDesc
-	firstGotoIndex int
+	LocalVars  *varNamePool
+	BreakLabel int
+	Parent     *codeBlock
+	RefUpvalue bool
+	LineStart  int
+	LastLine   int
+	// firstLabelIndex / firstGotoIndex (stock BlockCnt.firstlabel /
+	// firstgoto): indexes into the function-wide active-label and pending-
+	// goto lists captured at block entry. A block's solveGotos matches only
+	// its own labels (>= firstLabelIndex) and only its own gotos (>=
+	// firstGotoIndex); everything else hoists outward.
+	firstLabelIndex int
+	firstGotoIndex  int
+	// entryNactvar is the active-local count at block entry (stock
+	// bl->nactvar) — the level a hoisted goto drops to, and the level a
+	// last-statement label's scope is pinned to.
+	entryNactvar int
 }
 
-func newCodeBlock(localvars *varNamePool, blabel int, parent *codeBlock, pos ast.PositionHolder, firstGotoIndex int) *codeBlock {
-	bl := &codeBlock{localvars, blabel, parent, false, 0, 0, map[string]*gotoLabelDesc{}, firstGotoIndex}
+func newCodeBlock(localvars *varNamePool, blabel int, parent *codeBlock, pos ast.PositionHolder, firstLabelIndex, firstGotoIndex, entryNactvar int) *codeBlock {
+	bl := &codeBlock{localvars, blabel, parent, false, 0, 0, firstLabelIndex, firstGotoIndex, entryNactvar}
 	if pos != nil {
 		bl.LineStart = pos.Line()
 		bl.LastLine = pos.LastLine()
 	}
 	return bl
-}
-
-func (b *codeBlock) AddLabel(label *gotoLabelDesc) *gotoLabelDesc {
-	if old, ok := b.labels[label.Name]; ok {
-		return old
-	}
-	b.labels[label.Name] = label
-	return nil
-}
-
-func (b *codeBlock) GetLabel(label string) *gotoLabelDesc {
-	if v, ok := b.labels[label]; ok {
-		return v
-	}
-	return nil
 }
 
 func (b *codeBlock) LocalVarsCount() int {
@@ -399,109 +611,148 @@ func (b *codeBlock) LocalVarsCount() int {
 }
 
 type funcContext struct {
-	Proto           *FunctionProto
-	Code            *codeStore
-	Parent          *funcContext
-	Upvalues        *varNamePool
-	Block           *codeBlock
-	Blocks          []*codeBlock
-	regTop          int
-	labelId         int
-	labelPc         map[int]int
-	gotosCount      int
-	unresolvedGotos map[int]*gotoLabelDesc
+	Proto    *FunctionProto
+	Code     *codeStore
+	Parent   *funcContext
+	Upvalues *varNamePool
+	Block    *codeBlock
+	Blocks   []*codeBlock
+	regTop   int
+	labelId  int
+	labelPc  map[int]int
+	// labels (stock ls->dyd->label, per function): the ACTIVE labels,
+	// block-truncated at LeaveBlock — a label is visible only while its
+	// block is open. gotos (ls->dyd->gt): pending gotos, order-preserving,
+	// removed as they resolve; both lists share one desc type.
+	labels []*gotoLabelDesc
+	gotos  []*gotoLabelDesc
+	// NeedsClose (stock fs->needclose): this function's frames can hold
+	// open upvalues or to-be-closed variables at return — the RETURN
+	// k bit / RETURN0→RETURN rewrite in compileReturnStmt.
+	NeedsClose bool
+	// tbcActive is stock's insidetbc, time-ordered: it counts <close>
+	// declarations compiled but not yet closed (decremented when the
+	// owning block leaves). OP_TAILCALL promotion is suppressed while
+	// set — the frame's closes must not be skipped.
+	tbcActive int
+	// vatab (stock fs->needvatab): this vararg function needs the TABLE
+	// model — some whole-value use / index write / upvalue capture of the
+	// named vararg parameter promoted it (luaK_dischargevars/storevar/
+	// singlevaraux calls luaK_vapar2local; the fork records the need and
+	// finishes at function end). The finish pass flips IsVarArg to
+	// VarArgTable, rewrites GETVARG→GETTABLE and sets VARARG k=1; the
+	// interpreter's VARARGPREP then builds {1..n, n=n} into the param slot
+	// instead of hiding the extras below the frame base.
+	vatab bool
+}
+
+// promoteVatab marks a vararg function as needing the table model (stock
+// luaK_vapar2local's effect, deferred): the call sites are every whole-value
+// use of the named vararg parameter (compileExpr IdentExpr), its indexed
+// writes, and upvalue captures of it. Unnamed `...` functions stay hidden.
+func (fc *funcContext) promoteVatab() {
+	fc.vatab = true
 }
 
 func newFuncContext(sourcename string, parent *funcContext) *funcContext {
 	fc := &funcContext{
-		Proto:           newFunctionProto(sourcename),
-		Code:            &codeStore{make([]uint32, 0, 1024), make([]int, 0, 1024), 0},
-		Parent:          parent,
-		Upvalues:        newVarNamePool(0),
-		Block:           newCodeBlock(newVarNamePool(0), labelNoJump, nil, nil, 0),
-		regTop:          0,
-		labelId:         1,
-		labelPc:         map[int]int{},
-		gotosCount:      0,
-		unresolvedGotos: map[int]*gotoLabelDesc{},
+		Proto:    newFunctionProto(sourcename),
+		Code:     &codeStore{make([]uint32, 0, 1024), make([]int, 0, 1024), 0},
+		Parent:   parent,
+		Upvalues: newVarNamePool(0),
+		Block:    newCodeBlock(newVarNamePool(0), labelNoJump, nil, nil, 0, 0, 0),
+		regTop:   0,
+		labelId:  1,
+		labelPc:  map[int]int{},
 	}
 	fc.Blocks = []*codeBlock{fc.Block}
 	return fc
 }
 
-func (fc *funcContext) CheckUnresolvedGoto() {
-	for i := fc.Block.firstGotoIndex; i < fc.gotosCount; i++ {
-		gotoLabel, ok := fc.unresolvedGotos[i]
-		if !ok {
-			continue
+// findActiveLabel (stock findlabel): the first active label named name at
+// or after list index ilb.
+func (fc *funcContext) findActiveLabel(name string, ilb int) *gotoLabelDesc {
+	for i := ilb; i < len(fc.labels); i++ {
+		if fc.labels[i].Name == name {
+			return fc.labels[i]
 		}
-		raiseCompileError(fc, fc.Proto.LastLineDefined, "no visible label '%s' for <goto> at line %d", gotoLabel.Name, gotoLabel.Line)
 	}
+	return nil
 }
 
-func (fc *funcContext) AddUnresolvedGoto(label *gotoLabelDesc) {
-	fc.unresolvedGotos[fc.gotosCount] = label
-	fc.gotosCount++
-}
-
-func (fc *funcContext) AddNamedLabel(label *gotoLabelDesc) {
-	if old := fc.Block.AddLabel(label); old != nil {
-		raiseCompileError(fc, label.Line+1, "label '%s' already defined on line %d", label.Name, old.Line)
+// localNameAtCount is the name of the local at function-wide active count
+// (stock getlocalvardesc(fs, nactvar)) — the variable whose scope a goto
+// would have to enter.
+func (fc *funcContext) localNameAtCount(count int) string {
+	var chain []*codeBlock
+	for block := fc.Block; block != nil; block = block.Parent {
+		chain = append(chain, block)
 	}
-	fc.SetLabelPc(label.Id, label.Pc)
-}
-
-func (fc *funcContext) GetNamedLabel(name string) *gotoLabelDesc {
-	return fc.Block.GetLabel(name)
-}
-
-func (fc *funcContext) ResolveGoto(from, to *gotoLabelDesc, index int) {
-	if from.NumActiveLocalVars < to.NumActiveLocalVars {
-		varName := fc.Block.LocalVars.Names()[len(fc.Block.LocalVars.Names())-1]
-		raiseCompileError(fc, to.Line+1, "<goto %s> at line %d jumps into the scope of local '%s'", to.Name, from.Line, varName)
-	}
-	fc.Code.SetSbx(from.Pc, to.Id)
-	delete(fc.unresolvedGotos, index)
-}
-
-func (fc *funcContext) FindLabel(block *codeBlock, gotoLabel *gotoLabelDesc, i int) bool {
-	target := block.GetLabel(gotoLabel.Name)
-	if target != nil {
-		if gotoLabel.NumActiveLocalVars > target.NumActiveLocalVars && block.RefUpvalue {
-			fc.Code.SetA(gotoLabel.Pc-1, target.NumActiveLocalVars)
-		}
-		fc.ResolveGoto(gotoLabel, target, i)
-		return true
-	}
-	return false
-}
-
-func (fc *funcContext) ResolveCurrentBlockGotosWithParentBlock() {
-	blockActiveLocalVars := fc.Block.Parent.LocalVarsCount()
-	for i := fc.Block.firstGotoIndex; i < fc.gotosCount; i++ {
-		gotoLabel, ok := fc.unresolvedGotos[i]
-		if !ok {
-			continue
-		}
-		if gotoLabel.NumActiveLocalVars > blockActiveLocalVars {
-			if fc.Block.RefUpvalue {
-				fc.Code.SetA(gotoLabel.Pc-1, blockActiveLocalVars)
+	for i := len(chain) - 1; i >= 0; i-- {
+		for _, name := range chain[i].LocalVars.Names() {
+			if count == 0 {
+				return name
 			}
-			gotoLabel.SetNumActiveLocalVars(blockActiveLocalVars)
+			count--
 		}
-		fc.FindLabel(fc.Block.Parent, gotoLabel, i)
 	}
+	return "?"
 }
 
-func (fc *funcContext) ResolveForwardGoto(target *gotoLabelDesc) {
-	for i := fc.Block.firstGotoIndex; i <= fc.gotosCount; i++ {
-		gotoLabel, ok := fc.unresolvedGotos[i]
-		if !ok {
-			continue
+// closeGoto (stock closegoto): resolve gotos[g] against label; bup is the
+// finishing block's upvalue flag. A goto's code is [JMP][dead CLOSE]
+// (newgotoentry's placeholder); when the jump needs a close the pair
+// SWAPS so the CLOSE runs first, at the label's variable level.
+func (fc *funcContext) closeGoto(g int, label *gotoLabelDesc, bup bool) {
+	gt := fc.gotos[g]
+	if gt.NumActiveLocalVars < label.NumActiveLocalVars {
+		raiseCompileError(fc, label.Line+1, "<goto %s> at line %d jumps into the scope of '%s'",
+			gt.Name, gt.Line, fc.localNameAtCount(gt.NumActiveLocalVars))
+	}
+	if gt.NeedClose || (label.NumActiveLocalVars < gt.NumActiveLocalVars && bup) {
+		code := fc.Code
+		code.codes[gt.Pc+1] = code.codes[gt.Pc] // jump moves after the close
+		// U5a: register-less entries (RDKCTC/GDK) sit between the goto's
+		// level and the label's — CLOSE takes the REGISTER level (stock
+		// closegoto's reglevel), not the active-var count
+		code.codes[gt.Pc] = opCreateABC(OP_CLOSE, fc.regLevelOfCount(label.NumActiveLocalVars), 0, 0)
+		gt.Pc++
+	}
+	fc.Code.SetSJ(gt.Pc, label.Id)
+	fc.gotos = append(fc.gotos[:g], fc.gotos[g+1:]...)
+}
+
+// solveGotos (stock solvegotos at leaveblock): each pending goto of THIS
+// block matches a label of THIS block (>= firstLabelIndex); the rest hoist
+// to the block's entry level — dropping out of a variable's scope in a
+// block with upvalues marks them for a close. The block's labels retire.
+func (fc *funcContext) solveGotos() {
+	bl := fc.Block
+	for igt := bl.firstGotoIndex; igt < len(fc.gotos); {
+		gt := fc.gotos[igt]
+		if lb := fc.findActiveLabel(gt.Name, bl.firstLabelIndex); lb != nil {
+			fc.closeGoto(igt, lb, bl.RefUpvalue)
+		} else {
+			// U5a: stock solvegotos compares REGISTER levels (bl->upval &&
+			// reglevel(gt->nactvar) > outlevel) — a hoisted goto crossed
+			// variables in registers, not just scope entries
+			if bl.RefUpvalue && fc.regLevelOfCount(gt.NumActiveLocalVars) > fc.regLevelOfCount(bl.entryNactvar) {
+				gt.NeedClose = true
+			}
+			gt.NumActiveLocalVars = bl.entryNactvar
+			igt++
 		}
-		if gotoLabel.Name == target.Name {
-			fc.ResolveGoto(gotoLabel, target, i)
-		}
+	}
+	fc.labels = fc.labels[:bl.firstLabelIndex]
+}
+
+// finishFunctionGotos is the function-root arm of stock leaveblock: the
+// root block's gotos resolve, and any still pending is the error.
+func (fc *funcContext) finishFunctionGotos() {
+	fc.solveGotos()
+	if len(fc.gotos) > 0 {
+		gt := fc.gotos[0]
+		raiseCompileError(fc, fc.Proto.LastLineDefined, "no visible label '%s' for <goto> at line %d", gt.Name, gt.Line)
 	}
 }
 
@@ -548,11 +799,38 @@ func (fc *funcContext) ConstIndex(value LValue) int {
 	}
 	fc.Proto.Constants = append(fc.Proto.Constants, value)
 	v := len(fc.Proto.Constants) - 1
-	if v > opMaxArgBx {
+	if v > opMaxArgAx {
 		raiseCompileError(fc, fc.Proto.LineDefined, "too many constants")
 	}
 	return v
 }
+
+// kStringIndex interns a string constant for a K-operand slot (8-bit)
+// and reports whether the index fits the K range. The 5.5 encoding
+// addresses shortstring keys through B/C fields; an over-pooled key takes
+// stock's fallback (luaK_indexed/isKstr): the key (and, for upvalue
+// tables, the table itself) loads into a register and the access uses the
+// register-form opcode (GETTABLE/SETTABLE). U3a: the fork used to raise
+// "constant table overflow" here — stock never does; large main chunks
+// (official strings.lua/math.lua) need the fallback.
+func (fc *funcContext) kStringIndex(s string, line int) (int, bool) {
+	idx := fc.ConstIndex(LString(s))
+	return idx, idx <= opMaxIndexK
+}
+
+// loadStringK loads a string constant into a register (LOADK, or
+// LOADKX+EXTRAARG past the Bx range) — the K-overflow fallback's key
+// materializer.
+func loadStringK(fc *funcContext, reg int, s string, line int) {
+	cindex := fc.ConstIndex(LString(s))
+	if cindex <= opMaxArgBx {
+		fc.Code.AddABx(OP_LOADK, reg, cindex, line)
+	} else {
+		fc.Code.AddABx(OP_LOADKX, reg, 0, line)
+		fc.Code.AddAx(OP_EXTRAARG, cindex, line)
+	}
+}
+
 func (fc *funcContext) BlockLocalVarsCount() int {
 	count := 0
 	for block := fc.Block; block != nil; block = block.Parent {
@@ -562,10 +840,147 @@ func (fc *funcContext) BlockLocalVarsCount() int {
 }
 
 func (fc *funcContext) RegisterLocalVar(name string) int {
-	ret := fc.Block.LocalVars.Register(name)
-	fc.Proto.DbgLocals = append(fc.Proto.DbgLocals, &DbgLocalInfo{Name: name, StartPc: fc.Code.LastPC() + 1})
-	fc.SetRegTop(fc.RegTop() + 1)
+	return fc.RegisterLocalVarKind(name, varKindReg)
+}
+
+// RegisterLocalVarKind is RegisterLocalVar with a variable kind (U4
+// attributes: <const>/<close> locals; for-loop control variables declare
+// varKindConst like stock lparser.c). U5a: register-less kinds
+// (RDKCTC/GDK — stock's luaY_nvarstack discipline) do not move regTop;
+// they are active for scoping (block truncation, goto scope checks)
+// without occupying a stack slot.
+func (fc *funcContext) RegisterLocalVarKind(name string, kind int) int {
+	ret := fc.Block.LocalVars.RegisterKindReg(name, kind, fc.RegTop())
+	if kindHasRegister(kind) {
+		fc.SetRegTop(fc.RegTop() + 1)
+		info := &DbgLocalInfo{Name: name, StartPc: fc.Code.LastPC() + 1}
+		fc.Proto.DbgLocals = append(fc.Proto.DbgLocals, info)
+		fc.Block.LocalVars.noteDbg(ret, info)
+	}
 	return ret
+}
+
+// dbgInfoAt is the DbgLocalInfo of the function-wide local index (nil
+// for register-less entries) — the U5f startpc re-pins (stock's
+// adjustlocalvars-time startpc, deferred past code the fork's register
+// choreography needs the registration BEFORE).
+func (fc *funcContext) dbgInfoAt(idx int) *DbgLocalInfo {
+	_, block := fc.FindLocalVarAndBlockAt(idx)
+	if block == nil {
+		return nil
+	}
+	return block.LocalVars.dbgAt(idx)
+}
+
+// regOfVar is the register of the local at function-wide index idx —
+// the register sites (MOVE operands, capture descriptors, CLOSE levels)
+// go through here, never through the index itself (U5a: the index is a
+// scope identity; some kinds have no register).
+func (fc *funcContext) regOfVar(idx int) int {
+	_, block := fc.FindLocalVarAndBlockAt(idx)
+	return block.LocalVars.regAt(idx)
+}
+
+// kindOfVar is the variable kind of the local at function-wide index
+// idx (U5a — the RDKCTC test in stock searchvar's local arm).
+func (fc *funcContext) kindOfVar(idx int) int {
+	_, block := fc.FindLocalVarAndBlockAt(idx)
+	return block.LocalVars.kindAt(idx)
+}
+
+// regLevelOfCount converts an active-var count (a scope level —
+// register-less entries included) to its register level: 1 + the
+// register of the highest register-resident entry below the count, 0
+// when none (stock reglevel, lparser.c:236). CLOSE operands and goto
+// close decisions use this, never the count itself.
+func (fc *funcContext) regLevelOfCount(count int) int {
+	var chain []*codeBlock
+	for block := fc.Block; block != nil; block = block.Parent {
+		chain = append(chain, block)
+	}
+	// stock reglevel: the entries in scope at level count are the LOWEST
+	// count entries of the active stack (root-first flat indexing) — skip
+	// the (total-count) entries above the level, then walk down; the
+	// first register-resident entry met is the highest one below it
+	skip := fc.BlockLocalVarsCount() - count
+	for i := 0; i < len(chain) && count > 0; i++ { // innermost block first
+		pool := chain[i].LocalVars
+		for j := len(pool.names) - 1; j >= 0 && count > 0; j-- {
+			if skip > 0 {
+				skip--
+				continue
+			}
+			count--
+			if reg := pool.regAt(pool.offset + j); reg >= 0 {
+				return reg + 1
+			}
+		}
+	}
+	return 0
+}
+
+// FindLocalVarAndBlockAt locates the block owning a function-wide index.
+func (fc *funcContext) FindLocalVarAndBlockAt(idx int) (int, *codeBlock) {
+	for block := fc.Block; block != nil; block = block.Parent {
+		if idx >= block.LocalVars.offset && idx < block.LocalVars.LastIndex() {
+			return idx, block
+		}
+	}
+	return -1, nil
+}
+
+// nvarstack is the register level of the currently active variables
+// (stock luaY_nvarstack): 1 + the highest register among the active
+// chain's register-holding entries. CLOSE operands and block-exit
+// regTop restores use this, not the entry count (U5a).
+func (fc *funcContext) nvarstack() int {
+	return fc.nvarstackFrom(fc.Block)
+}
+
+// nvarstackFrom is nvarstack over the chain starting at block.
+func (fc *funcContext) nvarstackFrom(block *codeBlock) int {
+	n := 0
+	for b := block; b != nil; b = b.Parent {
+		for _, r := range b.LocalVars.regs {
+			if r >= n {
+				n = r + 1
+			}
+		}
+	}
+	return n
+}
+
+// checkReadOnlyLocal raises stock's const-assignment error (check_readonly,
+// lparser.c) when name resolves to a const or to-be-closed local of this
+// function, or to a const local of an enclosing function reached through
+// the upvalue chain. Line is the assignment's (the LHS name's).
+func checkReadOnlyLocal(context *funcContext, name string, line int) {
+	if idx, block := context.FindLocalVarAndBlock(name); idx > -1 {
+		if block.LocalVars.kindAt(idx) != varKindReg {
+			raiseCompileError(context, line, "attempt to assign to const variable '%s'", name)
+		}
+		return
+	}
+	if capturedUpvalueKind(context, name) != varKindReg {
+		raiseCompileError(context, line, "attempt to assign to const variable '%s'", name)
+	}
+}
+
+// capturedUpvalueKind resolves the variable kind behind a name this
+// function captures from an enclosing one (stock's Upvaldesc.kind,
+// computed by walking the chain — the capture descriptors are appended
+// after the child body compiles, so the descriptors themselves are not
+// readable yet; the walk always terminates at some ancestor's local).
+func capturedUpvalueKind(context *funcContext, name string) int {
+	for fn := context.Parent; fn != nil; fn = fn.Parent {
+		if idx, block := fn.FindLocalVarAndBlock(name); idx > -1 {
+			return block.LocalVars.kindAt(idx)
+		}
+		if fn.Upvalues.Find(name) > -1 {
+			continue // passthrough capture: keep walking
+		}
+	}
+	return varKindReg
 }
 
 func (fc *funcContext) FindLocalVarAndBlock(name string) (int, *codeBlock) {
@@ -591,14 +1006,21 @@ func (fc *funcContext) LocalVars() []varNamePoolValue {
 }
 
 func (fc *funcContext) EnterBlock(blabel int, pos ast.PositionHolder) {
-	fc.Block = newCodeBlock(newVarNamePool(fc.RegTop()), blabel, fc.Block, pos, fc.gotosCount)
+	// U5a: the pool offset is the count of active ENTRIES (stock nactvar),
+	// not the register level — register-less kinds (RDKCTC/GDK) occupy a
+	// flat index without a slot, and a RegTop-seeded offset made their
+	// flat indices collide with an inner block's (a `global <const> *`
+	// preamble + a repeat-body local resolved both `a` and the inner `b`
+	// to the same register; locals.lua:68).
+	entryNactvar := fc.BlockLocalVarsCount()
+	fc.Block = newCodeBlock(newVarNamePool(entryNactvar), blabel, fc.Block, pos, len(fc.labels), len(fc.gotos), entryNactvar)
 	fc.Blocks = append(fc.Blocks, fc.Block)
 }
 
 func (fc *funcContext) CloseUpvalues() int {
 	n := -1
 	if fc.Block.RefUpvalue {
-		n = fc.Block.Parent.LocalVars.LastIndex()
+		n = fc.nvarstackFrom(fc.Block.Parent)
 		fc.Code.AddABC(OP_CLOSE, n, 0, 0, fc.Block.LastLine)
 	}
 	return n
@@ -608,23 +1030,40 @@ func (fc *funcContext) LeaveBlock() int {
 	closed := fc.CloseUpvalues()
 	fc.EndScope()
 
-	if fc.Block.Parent != nil {
-		fc.ResolveCurrentBlockGotosWithParentBlock()
-	}
+	// U4: the block's <close> declarations are closed by its OP_CLOSE /
+	// the enclosing return — tailcall promotion is allowed again below
+	// them (stock leaveblock releasing bl->insidetbc).
+	fc.tbcActive -= fc.Block.LocalVars.countKind(varKindTBC)
+
+	// U4c (stock solvegotos at leaveblock): resolve this block's gotos
+	// against its labels, hoist the rest, retire the labels
+	fc.solveGotos()
+
 	fc.Block = fc.Block.Parent
-	fc.SetRegTop(fc.Block.LocalVars.LastIndex())
+	fc.SetRegTop(fc.nvarstack())
 	return closed
 }
 
+// EndScope closes the debug-info window of the block's locals (stock
+// removevars' endpc): EndPc = fs->pc at the leave — one PAST the block's
+// last emitted instruction, its exit OP_CLOSE included, giving stock's
+// half-open [StartPc, EndPc). A scope whose exit closes (LeaveBlock's
+// OP_CLOSE, the function's final RETURN closing tbc variables) needs no
+// extra room under this rule: the close/__close dispatch runs AT that
+// last instruction, which the window already covers (the repeat-until
+// battery, locals.lua:1198 — the old extendToClose flag compensated a
+// base that was one short).
 func (fc *funcContext) EndScope() {
-	for _, vr := range fc.Block.LocalVars.List() {
-		fc.Proto.DbgLocals[vr.Index].EndPc = fc.Code.LastPC()
+	for _, info := range fc.Block.LocalVars.dbg {
+		if info != nil {
+			info.EndPc = fc.Code.LastPC() + 1
+		}
 	}
 }
 
 func (fc *funcContext) SetRegTop(top int) {
 	if top > maxRegisters {
-		raiseCompileError(fc, fc.Proto.LineDefined, "too many local variables")
+		raiseErrorLimit(fc, maxRegisters, "local variables")
 	}
 	fc.regTop = top
 }
@@ -634,6 +1073,176 @@ func (fc *funcContext) RegTop() int {
 }
 
 /* FuncContext }}} */
+
+/* U2c: constant/immediate operand plumbing {{{ */
+
+// operand kinds for the constant-selection paths (stock lcode.c's
+// VKINT/VKFLT/VK "keep the numeral" discipline adapted to the fork's
+// compile-then-propagate flow).
+type opndKind int
+
+const (
+	opndReg   opndKind = iota // value lives in a register
+	opndInt                   // integer constant (LOADI pop or pooled)
+	opndFloat                 // float constant with an exact integer value
+	opndK                     // any other pooled constant (LOADK pop)
+)
+
+type opnd struct {
+	kind    opndKind
+	reg     int // register when kind == opndReg
+	kidx    int // pool index when pooled (-1 for LOADI/LOADF immediates)
+	ival    int64
+	fval    float64
+	isFloat bool // the source literal was a float (orderI's C flag)
+}
+
+// compileConstOperand compiles expr into register `reg`. When the emitted
+// code was a scratch constant load above the live registers, the load is
+// popped and the constant returned as the operand (numericOnly selects
+// between arith operands and comparison operands, which may keep strings
+// for EQK). single reports that the expression's ENTIRE code is the one
+// trailing instruction — the infix-discharge shape (see infixLine).
+func compileConstOperand(fc *funcContext, expr ast.Expr, reg int, numericOnly bool) (opnd, int, bool) {
+	startpc := fc.Code.LastPC()
+	compileExpr(fc, reg, expr, ecnone(0))
+	last := fc.Code.Last()
+	single := fc.Code.LastPC() == startpc+1
+	// The trailing load is attributable to the expression only when it is
+	// the expression's ENTIRE code (U4e): an and/or operand ends with the
+	// never-executed other arm's load behind a jump, and popping that
+	// steals the dead arm's value while the live arm stays in the
+	// register — `5 + (23 or 2)` compiled to `23 + 2` (events.lua's
+	// basic-type metatable battery). Multi-instruction code keeps the
+	// register form; the value is already where it belongs.
+	if single && opGetArgA(last) >= fc.RegTop() {
+		switch opGetOpCode(last) {
+		case OP_LOADI:
+			fc.Code.Pop()
+			return opnd{kind: opndInt, ival: int64(opGetArgSbx(last)), kidx: -1}, reg, single
+		case OP_LOADF:
+			fc.Code.Pop()
+			sb := int64(opGetArgSbx(last))
+			return opnd{kind: opndFloat, ival: sb, fval: float64(sb), isFloat: true, kidx: -1}, reg, single
+		case OP_LOADK:
+			idx := opGetArgBx(last)
+			if idx <= opMaxIndexK {
+				switch n := fc.Proto.Constants[idx].(type) {
+				case LInteger:
+					fc.Code.Pop()
+					return opnd{kind: opndInt, ival: int64(n), kidx: idx}, reg, single
+				case LNumber:
+					fc.Code.Pop()
+					o := opnd{kind: opndK, kidx: idx, fval: float64(n)}
+					if iv, ok := floatToIntExact(float64(n)); ok {
+						o = opnd{kind: opndFloat, ival: iv, fval: float64(n), isFloat: true, kidx: idx}
+					}
+					return o, reg, single
+				default:
+					if !numericOnly {
+						fc.Code.Pop()
+						return opnd{kind: opndK, kidx: idx}, reg, single
+					}
+				}
+			}
+		}
+	}
+	return opnd{kind: opndReg, reg: reg}, reg + 1, single
+}
+
+// infixLine re-lines the lhs load of a binary operation to the operator
+// token's line (stock luaK_infix, lcode.c: for OPR_ADD..OPR_SHR it calls
+// luaK_exp2anyreg on a non-numeral lhs IMMEDIATELY after the operator is
+// consumed — ls->lastline is the operator's line — and the order/equality
+// comparisons discharge the same way; OPR_EQ/NE via exp2RK, OPR_LT..GE via
+// exp2anyreg unless the operand is an sC numeral). A lhs whose entire code
+// is one load instruction IS that discharge (a multi-instruction lhs was
+// already register-resident — a call, a nested operation — and infix emits
+// nothing for it). db.lua's large-gaps trace: `b[1] \n+ \nb[1]` fires the
+// lhs GETI event at the OPERATOR's line, not the operand's.
+func infixLine(fc *funcContext, lhs opnd, single bool, line int) {
+	if single && lhs.kind == opndReg {
+		fc.Code.lines[fc.Code.LastPC()] = line
+	}
+}
+
+// materializeReg re-emits a constant operand into a register (the
+// selection fell back to a register form).
+func materializeReg(fc *funcContext, o opnd, reg int, line int) {
+	switch o.kind {
+	case opndInt:
+		if fitsBx(o.ival) {
+			fc.Code.AddAsBx(OP_LOADI, reg, int(o.ival), line)
+		} else {
+			fc.Code.AddABx(OP_LOADK, reg, materializeK(fc, o), line)
+		}
+	case opndFloat:
+		if o.kidx >= 0 {
+			fc.Code.AddABx(OP_LOADK, reg, o.kidx, line)
+		} else if fitsBx(o.ival) {
+			fc.Code.AddAsBx(OP_LOADF, reg, int(o.ival), line)
+		} else {
+			fc.Code.AddABx(OP_LOADK, reg, materializeK(fc, o), line)
+		}
+	default:
+		fc.Code.AddABx(OP_LOADK, reg, o.kidx, line)
+	}
+}
+
+// materializeK interns a constant operand into the pool (K-operand form),
+// returning the index.
+func materializeK(fc *funcContext, o opnd) int {
+	if o.kidx >= 0 {
+		return o.kidx
+	}
+	switch o.kind {
+	case opndInt:
+		return fc.ConstIndex(LInteger(o.ival))
+	default:
+		return fc.ConstIndex(LNumber(o.fval))
+	}
+}
+
+// loadNumber emits the stock luaK_int/luaK_float selection: integers and
+// floats with an exact integer value inside the sBx range load inline
+// (LOADI/LOADF), everything else goes through the constant pool (LOADK,
+// or LOADKX+EXTRAARG past the Bx range).
+func loadNumber(fc *funcContext, reg int, v LValue, line int) {
+	code := fc.Code
+	if iv, ok := v.(LInteger); ok {
+		if fitsBx(int64(iv)) {
+			code.AddAsBx(OP_LOADI, reg, int(iv), line)
+			return
+		}
+	} else if fv, ok := v.(LNumber); ok {
+		if fi, ok2 := floatToIntExact(float64(fv)); ok2 && fitsBx(fi) {
+			code.AddAsBx(OP_LOADF, reg, int(fi), line)
+			return
+		}
+	}
+	cindex := fc.ConstIndex(v)
+	if cindex <= opMaxArgBx {
+		code.AddABx(OP_LOADK, reg, cindex, line)
+	} else {
+		code.AddABx(OP_LOADKX, reg, 0, line)
+		code.AddAx(OP_EXTRAARG, cindex, line)
+	}
+}
+
+// intKeyLiteral reports the immediate table-key value of a literal
+// integer expression in 0..255 (stock isCint — the GETI/SETI range).
+func intKeyLiteral(expr ast.Expr) (int, bool) {
+	if ex, ok := expr.(*ast.NumberExpr); ok {
+		if lv, err := parseNumber(ex.Value); err == nil {
+			if iv, ok := lv.(LInteger); ok && int64(iv) >= 0 && int64(iv) <= opMaxArgsC {
+				return int(iv), true
+			}
+		}
+	}
+	return 0, false
+}
+
+/* }}} */
 
 func compileChunk(context *funcContext, chunk []ast.Stmt, untilFollows bool) { // {{{
 	for i, stmt := range chunk {
@@ -677,6 +1286,10 @@ func compileStmt(context *funcContext, stmt ast.Stmt, isLastStmt bool) { // {{{
 		compileAssignStmt(context, st)
 	case *ast.LocalAssignStmt:
 		compileLocalAssignStmt(context, st)
+	case *ast.GlobalDeclStmt:
+		compileGlobalDeclStmt(context, st)
+	case *ast.GlobalFuncStmt:
+		compileGlobalFuncStmt(context, st)
 	case *ast.FuncCallStmt:
 		compileFuncCallExpr(context, context.RegTop(), st.Expr.(*ast.FuncCallExpr), ecnone(-1))
 	case *ast.DoBlockStmt:
@@ -713,23 +1326,86 @@ func compileAssignStmtLeft(context *funcContext, stmt *ast.AssignStmt) (int, []*
 		switch st := lhs.(type) {
 		case *ast.IdentExpr:
 			identtype := getIdentRefType(context, context, st)
+			// U4: stock restassign's check_readonly — const/tbc locals
+			// and const upvalues are assignment targets no longer.
+			checkReadOnlyLocal(context, st.Value, sline(st))
 			ec := &expcontext{identtype, regNotDefined, 0}
+			ac := &assigncontext{ec: ec, envLocalIdx: -1}
 			switch identtype {
 			case ecGlobal:
+				// U5a: a `global x <const>` entry (or an active
+				// `global <const> *`) locks the assignment — stock
+				// check_readonly's VINDEXUP/ro arm
+				checkGlobalWrite(context, st.Value, sline(st))
 				context.ConstIndex(LString(st.Value))
+				if cv, ok := envConstAccess(context); ok {
+					// U5a: _ENV is an RDKCTC constant — materialize it as
+					// the store's table operand (stock discharges VCONST;
+					// the SETFIELD then fails at runtime with "attempt to
+					// index a number value", attrib.lua:461). Without this
+					// the register-less _ENV fell through to the upvalue
+					// arm and the store silently hit the real globals.
+					loadConstant(context, reg, cv, sline(st))
+					ac.envLocalIdx = reg
+					reg++
+				} else if envlocal, _ := envAccess(context); envlocal > -1 {
+					ac.envLocalIdx = envlocal
+				}
 			case ecUpvalue:
 				context.Upvalues.RegisterUnique(st.Value)
 			case ecLocal:
-				ec.reg = context.FindLocalVar(st.Value)
+				ec.reg = context.regOfVar(context.FindLocalVar(st.Value))
+				// U4g (attrib.lua:505): stock check_conflict, the table
+				// arm — a field target parsed BEFORE this one may have its
+				// table operand aliasing this local's register (KMV
+				// propagation pops the operand's MOVE and uses the local
+				// in place). Stores run right-to-left, so this target's
+				// MOVE executes before that SETTABLE and the store would
+				// index the clobbered value. Snapshot every conflicting
+				// table into one fresh temp here — before the RHS and the
+				// stores, stock's "assignment will use safe copy". (The
+				// index arm is moot: fork keys always land in fresh temps,
+				// and upvalue tables too — GETUPVAL is never propagated —
+				// so only this propagated-local-table case can alias.)
+				conflict := false
+				for _, prev := range acs {
+					if prev.ec.ctype == ecTable && prev.ec.reg == ec.reg {
+						conflict = true
+						prev.ec.reg = reg
+					} else if prev.ec.ctype == ecGlobal && prev.envLocalIdx == ec.reg {
+						// the shadowed-_ENV global write SETFIELDs this
+						// local's register (stock's VINDEXSTR table arm)
+						conflict = true
+						prev.envLocalIdx = reg
+					}
+				}
+				if conflict {
+					context.Code.AddABC(OP_MOVE, reg, ec.reg, 0, sline(st))
+					reg++
+				}
 			}
-			acs = append(acs, &assigncontext{ec, 0, 0, false, false})
+			acs = append(acs, ac)
 		case *ast.AttrGetExpr:
-			ac := &assigncontext{&expcontext{ecTable, regNotDefined, 0}, 0, 0, false, false}
+			ac := &assigncontext{ec: &expcontext{ecTable, regNotDefined, 0}, envLocalIdx: -1}
 			compileExprWithKMVPropagation(context, st.Object, &reg, &ac.ec.reg)
-			ac.keyrk = reg
-			reg += compileExpr(context, reg, st.Key, ecnone(0))
-			if _, ok := st.Key.(*ast.StringExpr); ok {
-				ac.keyks = true
+			if str, ok := st.Key.(*ast.StringExpr); ok {
+				if kidx, fits := context.kStringIndex(str.Value, sline(st)); fits {
+					ac.keyMode = keyKStr
+					ac.keyData = kidx
+				} else {
+					// K-overflow fallback: key into a register
+					ac.keyMode = keyReg
+					ac.keyReg = reg
+					loadStringK(context, reg, str.Value, sline(st))
+					reg++
+				}
+			} else if idx, ok := intKeyLiteral(st.Key); ok {
+				ac.keyMode = keyInt
+				ac.keyData = idx
+			} else {
+				ac.keyMode = keyReg
+				ac.keyReg = reg
+				reg += compileExpr(context, reg, st.Key, ecnone(0))
 			}
 			acs = append(acs, ac)
 
@@ -772,7 +1448,7 @@ func compileAssignStmtRight(context *funcContext, stmt *ast.AssignStmt, reg int,
 			expr = stmt.Rhs[namesassigned]
 		}
 		idx := reg
-		if ec.ctype == ecLocal && localAssignNeedsTemp(stmt, namesassigned) {
+		if ec.ctype == ecLocal && (localAssignNeedsTemp(stmt, namesassigned) || tableOperandAliasesLocal(acs, namesassigned)) {
 			// Multiple assignment is simultaneous (Lua 5.1: all RHS
 			// expressions are evaluated before any assignment is
 			// performed). Compiling the RHS straight into the target
@@ -782,18 +1458,24 @@ func compileAssignStmtRight(context *funcContext, stmt *ast.AssignStmt, reg int,
 			// slot instead; the reverse assignment loop below moves it,
 			// which also restores stock 5.1's leftmost-wins order for
 			// duplicate targets (a, a = 1, 2 → 1). (Upstream
-			// yuin/gopher-lua has the sequential bug; found by
-			// _cli-tests fib vs C Lua.) varargopt 0: a non-last RHS
-			// adjusts to exactly one value (`...` and call results
-			// alike); the multi-return case is the branch above.
+			// yuin/gopher-lua has the sequential bug; found by _cli-tests
+			// fib vs C Lua.) varargopt 0: a non-last RHS adjusts to
+			// exactly one value (`...` and call results alike); the
+			// multi-return case is the branch above.
 			reginc := compileExpr(context, reg, expr, ecnone(0))
 			ac.needmove = reginc != 0
 			reg += reginc
 		} else {
 			reginc := compileExpr(context, reg, expr, ec)
 			if ec.ctype == ecTable {
-				if _, ok := expr.(*ast.LogicalOpExpr); !ok {
-					context.Code.PropagateKMV(context.RegTop(), &ac.valuerk, &reg, reginc)
+				if _, ok := expr.(*ast.LogicalOpExpr); !ok && context.Code.PropagateK(context.RegTop(), &ac.valuerk) {
+					// constant folded into the K operand (no register
+					// consumed) — U4g: a REGISTER value never propagates
+					// (stock exp2rk materializes non-constants into the
+					// window; attrib.lua:505 — a propagated local consumed
+					// no window slot while the reverse store loop's reg
+					// descent still counted it, misaligning every store
+					// below it in a mixed window)
 				} else {
 					ac.valuerk = idx
 					reg += reginc
@@ -818,6 +1500,27 @@ func compileAssignStmtRight(context *funcContext, stmt *ast.AssignStmt, reg int,
 	}
 	return rightreg, acs
 } // }}}
+
+// tableOperandAliasesLocal (U4g, attrib.lua:505): the local target at
+// index i's register is aliased by a field target's table operand (or a
+// shadowed-_ENV global write). The direct RHS write into the local's
+// register would clobber that table before the stores read it — stock
+// never direct-writes (its check_conflict snapshot covers the
+// parsed-before direction, reverse store order the rest); this arm gives
+// the fork's direct-write optimization the same protection.
+func tableOperandAliasesLocal(acs []*assigncontext, i int) bool {
+	reg := acs[i].ec.reg
+	for j, ac := range acs {
+		if j == i {
+			continue
+		}
+		if (ac.ec.ctype == ecTable && ac.ec.reg == reg) ||
+			(ac.ec.ctype == ecGlobal && ac.envLocalIdx == reg) {
+			return true
+		}
+	}
+	return false
+}
 
 // localAssignNeedsTemp reports whether the local target at index i of a
 // multiple assignment must not be direct-written: a later RHS expression
@@ -878,6 +1581,8 @@ func exprMentionsIdent(expr ast.Expr, name string) bool { // {{{
 		return exprMentionsIdent(ex.Expr, name)
 	case *ast.UnaryLenOpExpr:
 		return exprMentionsIdent(ex.Expr, name)
+	case *ast.UnaryBNotOpExpr:
+		return exprMentionsIdent(ex.Expr, name)
 	case *ast.Comma3Expr, *ast.StringExpr, *ast.NumberExpr,
 		*ast.TrueExpr, *ast.FalseExpr, *ast.NilExpr:
 		return false
@@ -894,26 +1599,60 @@ func compileAssignStmt(context *funcContext, stmt *ast.AssignStmt) { // {{{
 	reg, acs := compileAssignStmtLeft(context, stmt)
 	reg, acs = compileAssignStmtRight(context, stmt, reg, acs)
 
+	// U5f: stock restassign codes every store at ls->lastline — the
+	// line of the statement's LAST token (the RHS tail; the parser
+	// records it as the statement's LastLine). db.lua's large-gaps trace
+	// pins the SETTABUP there, not at the target name's line.
+	tail := eline(stmt)
+
 	for i := lennames - 1; i >= 0; i-- {
 		ex := stmt.Lhs[i]
 		switch acs[i].ec.ctype {
 		case ecLocal:
 			if acs[i].needmove {
-				code.AddABC(OP_MOVE, context.FindLocalVar(ex.(*ast.IdentExpr).Value), reg, 0, sline(ex))
+				code.AddABC(OP_MOVE, context.regOfVar(context.FindLocalVar(ex.(*ast.IdentExpr).Value)), reg, 0, tail)
 				reg -= 1
 			}
 		case ecGlobal:
-			code.AddABx(OP_SETGLOBAL, reg, context.ConstIndex(LString(ex.(*ast.IdentExpr).Value)), sline(ex))
+			name := ex.(*ast.IdentExpr).Value
+			kidx, fits := context.kStringIndex(name, sline(ex))
+			// the value lives in a register for global targets (only
+			// ecTable targets propagate their value into a K operand)
+			if acs[i].envLocalIdx > -1 {
+				// D3: _ENV shadowed by a local — the global write is a
+				// keyed table write on that register
+				if fits {
+					code.AddABCk(OP_SETFIELD, acs[i].envLocalIdx, kidx, reg, 0, tail)
+				} else {
+					loadStringK(context, reg+1, name, tail)
+					code.AddABCk(OP_SETTABLE, acs[i].envLocalIdx, reg+1, reg, 0, tail)
+				}
+			} else if fits {
+				code.AddABCk(OP_SETTABUP, envUpvalueIndexOf(context), kidx, reg, 0, tail)
+			} else {
+				// K-overflow fallback (stock luaK_indexed): the upvalue
+				// table and the key both go into registers
+				code.AddABC(OP_GETUPVAL, reg+2, envUpvalueIndexOf(context), 0, tail)
+				loadStringK(context, reg+1, name, tail)
+				code.AddABCk(OP_SETTABLE, reg+2, reg+1, reg, 0, tail)
+			}
 			reg -= 1
 		case ecUpvalue:
-			code.AddABC(OP_SETUPVAL, reg, context.Upvalues.RegisterUnique(ex.(*ast.IdentExpr).Value), 0, sline(ex))
+			code.AddABC(OP_SETUPVAL, reg, context.Upvalues.RegisterUnique(ex.(*ast.IdentExpr).Value), 0, tail)
 			reg -= 1
 		case ecTable:
-			opcode := OP_SETTABLE
-			if acs[i].keyks {
-				opcode = OP_SETTABLEKS
+			vreg, vk := opIndexOrReg(acs[i].valuerk), 0
+			if opIsK(acs[i].valuerk) {
+				vk = 1
 			}
-			code.AddABC(opcode, acs[i].ec.reg, acs[i].keyrk, acs[i].valuerk, sline(ex))
+			switch acs[i].keyMode {
+			case keyKStr:
+				code.AddABCk(OP_SETFIELD, acs[i].ec.reg, acs[i].keyData, vreg, vk, tail)
+			case keyInt:
+				code.AddABCk(OP_SETI, acs[i].ec.reg, acs[i].keyData, vreg, vk, tail)
+			default:
+				code.AddABCk(OP_SETTABLE, acs[i].ec.reg, acs[i].keyReg, vreg, vk, tail)
+			}
 			if !opIsK(acs[i].valuerk) {
 				reg -= 1
 			}
@@ -946,7 +1685,7 @@ func compileRegAssignment(context *funcContext, names []string, exprs []ast.Expr
 	// extra left names
 	if lennames > namesassigned {
 		restleft := lennames - namesassigned - 1
-		context.Code.AddLoadNil(reg, reg+restleft, line)
+		context.Code.AddABC(OP_LOADNIL, reg, restleft, 0, line)
 		reg += restleft
 	}
 
@@ -957,52 +1696,401 @@ func compileRegAssignment(context *funcContext, names []string, exprs []ast.Expr
 			varargopt = 0
 		}
 		ecupdate(ec, ecNone, reg, varargopt)
-		reg += compileExpr(context, reg, exprs[i], ec)
+		reg += compileExpr(context, reg, exprs[i], ecnone(varargopt))
 	}
 } // }}}
 
 func compileLocalAssignStmt(context *funcContext, stmt *ast.LocalAssignStmt) { // {{{
 	reg := context.RegTop()
+	// U5a (stock localstat's RDKCTC tail, lparser.c:1846): equal counts
+	// and the LAST name <const> with a foldable initializer promote that
+	// variable to a register-less compile-time constant — active for
+	// scoping, never in a register, the initializer emitting NO code.
+	if len(stmt.Names) == len(stmt.Exprs) && len(stmt.Names) > 0 &&
+		localStmtAttrib(stmt, len(stmt.Names)-1) == varKindConst {
+		if v, ok := ctcFoldValue(context, stmt.Exprs[len(stmt.Exprs)-1]); ok {
+			names := stmt.Names[:len(stmt.Names)-1]
+			exprs := stmt.Exprs[:len(stmt.Exprs)-1]
+			compileRegAssignment(context, names, exprs, reg, len(names), sline(stmt))
+			for i, name := range names {
+				context.RegisterLocalVarKind(name, localStmtAttrib(stmt, i))
+			}
+			idx := context.RegisterLocalVarKind(stmt.Names[len(stmt.Names)-1], varKindCTC)
+			context.Block.LocalVars.noteCTC(idx, v)
+			compileStmtTBC(context, stmt)
+			return
+		}
+	}
 	if len(stmt.Names) == 1 && len(stmt.Exprs) == 1 {
 		if _, ok := stmt.Exprs[0].(*ast.FunctionExpr); ok {
-			context.RegisterLocalVar(stmt.Names[0])
+			idx := context.RegisterLocalVarKind(stmt.Names[0], localStmtAttrib(stmt, 0))
 			compileRegAssignment(context, stmt.Names, stmt.Exprs, reg, len(stmt.Names), sline(stmt))
+			// U5f (stock localfunc, lparser.c:1792): the name registers
+			// before the body (so the body's self-references resolve) but
+			// "debug information will only see the variable after this
+			// point" — startpc = fs->pc after the initializing OP_CLOSURE.
+			// The pre-registered window pointed AT the closure, so a
+			// hook firing there saw the local before it materialized
+			// (db.lua:695: getlocal(2,1) answers "(temporary)" while the
+			// closure register still reads nil).
+			if info := context.dbgInfoAt(idx); info != nil {
+				info.StartPc = context.Code.LastPC() + 1
+			}
+			compileStmtTBC(context, stmt)
 			return
 		}
 	}
 
 	compileRegAssignment(context, stmt.Names, stmt.Exprs, reg, len(stmt.Names), sline(stmt))
-	for _, name := range stmt.Names {
-		context.RegisterLocalVar(name)
+	for i, name := range stmt.Names {
+		context.RegisterLocalVarKind(name, localStmtAttrib(stmt, i))
+	}
+	compileStmtTBC(context, stmt)
+}
+
+// localStmtAttrib is stmt.Attribs[i] as a variable kind ("" names —
+// plain locals — keep varKindReg).
+func localStmtAttrib(stmt *ast.LocalAssignStmt, i int) int {
+	if stmt.Attribs == nil || i >= len(stmt.Attribs) {
+		return varKindReg
+	}
+	return attribToKind(stmt.Attribs[i])
+}
+
+// compileStmtTBC registers a statement's <close> local (at most one — the
+// parser enforces it) AFTER its initializers evaluated (stock localstat's
+// checktoclose tail): OP_TBC A = the variable's register; the owning
+// block gains RefUpvalue so block-exit/break/goto CLOSE fires like a
+// captured local's would, and the function is marked NeedsClose for the
+// RETURN k bit.
+func compileStmtTBC(context *funcContext, stmt *ast.LocalAssignStmt) {
+	for i, name := range stmt.Names {
+		if localStmtAttrib(stmt, i) != varKindTBC {
+			continue
+		}
+		reg := context.regOfVar(context.FindLocalVar(name))
+		context.Code.AddABC(OP_TBC, reg, 0, 0, sline(stmt))
+		context.Block.RefUpvalue = true
+		context.NeedsClose = true
+		context.tbcActive++
 	}
 } // }}}
+
+// attribAt is attribs[i] with the no-attribute default "" (parallel
+// lists carry "" for plain names; a nil list is all-plain).
+func attribAt(attribs []string, i int) string {
+	if attribs == nil || i >= len(attribs) {
+		return ""
+	}
+	return attribs[i]
+}
+
+// globalAttribToKind maps a global declaration's attribute to its kind
+// (stock getglobalattribute's RDKCONST → GDKCONST adjustment; <close>
+// was rejected at parse).
+func globalAttribToKind(attrib string) int {
+	if attrib == "const" {
+		return varKindGlobalConst
+	}
+	return varKindGlobalReg
+}
+
+// compileGlobalDeclStmt — stock globalstat/globalnames/initglobal
+// (U5a). The collective `global *` / `global <const> *` and plain
+// declarations register entries and emit NOTHING; the entries are what
+// the searchvar port reads. With initializers the RHS compiles into the
+// value window FIRST (declarations activate after it — the RHS does not
+// see them), then each name checks-and-stores in REVERSE order
+// (initglobal's unwind): load the global's current value into a temp,
+// OP_ERRNNIL (raise `global '%s' already defined` when non-nil), store
+// the value. Register choreography (oracle-verified for `global a, b =
+// 1, 2`): values at reg..reg+n-1, var i's temp at reg+i+1, value at
+// reg+i.
+func compileGlobalDeclStmt(context *funcContext, stmt *ast.GlobalDeclStmt) { // {{{
+	line := sline(stmt)
+	if stmt.IsStar {
+		context.RegisterLocalVarKind(globalStarName, globalAttribToKind(attribAt(stmt.Attribs, 0)))
+		return
+	}
+	if len(stmt.Exprs) == 0 {
+		for i, name := range stmt.Names {
+			context.RegisterLocalVarKind(name, globalAttribToKind(attribAt(stmt.Attribs, i)))
+		}
+		return
+	}
+	n := len(stmt.Names)
+	reg := context.RegTop()
+	compileRegAssignment(context, stmt.Names, stmt.Exprs, reg, n, line)
+	for i, name := range stmt.Names {
+		context.RegisterLocalVarKind(name, globalAttribToKind(attribAt(stmt.Attribs, i)))
+	}
+	for i := n - 1; i >= 0; i-- {
+		compileGlobalInit(context, stmt.Names[i], reg+i, reg+i+1, line)
+	}
+} // }}}
+
+// compileGlobalFuncStmt — stock globalfunc (U5a): declare the name
+// FIRST (a `global function f` body's recursion sees it), compile the
+// closure, then the ERRNNIL redefinition check and the store at the
+// statement's line.
+func compileGlobalFuncStmt(context *funcContext, stmt *ast.GlobalFuncStmt) { // {{{
+	line := sline(stmt)
+	context.RegisterLocalVarKind(stmt.Name, varKindGlobalReg)
+	checkGlobalAccess(context, stmt.Name, line)
+	reg := context.RegTop()
+	compileExpr(context, reg, stmt.Func, ecnone(0))
+	compileGlobalInit(context, stmt.Name, reg, reg+1, line)
+} // }}}
+
+// compileGlobalInit is stock checkglobal + storevartop: read
+// _ENV[name] into temp, OP_ERRNNIL (Bx = the name's K index + 1, 0
+// when past MAXARG_Bx — luaK_codecheckglobal), store vreg.
+func compileGlobalInit(context *funcContext, name string, vreg, temp, line int) {
+	checkGlobalAccess(context, name, line)
+	kidx, fits := context.kStringIndex(name, line)
+	emitGlobalLoad(context, temp, name, kidx, fits, line)
+	bx := 0
+	if kidx < opMaxArgBx {
+		bx = kidx + 1
+	}
+	context.Code.AddABx(OP_ERRNNIL, temp, bx, line)
+	emitGlobalStore(context, name, kidx, fits, vreg, line)
+}
+
+// emitGlobalLoad reads _ENV[name] into reg (the ecGlobal read arm of
+// compileExpr — local-_ENV GETFIELD/GETTABLE vs GETTABUP, with the
+// K-overflow fallbacks).
+func emitGlobalLoad(context *funcContext, reg int, name string, kidx int, fits bool, line int) {
+	code := context.Code
+	if cv, ok := envConstAccess(context); ok {
+		// U5a: an RDKCTC _ENV is the table operand as a constant
+		loadConstant(context, reg, cv, line)
+		if fits {
+			code.AddABC(OP_GETFIELD, reg, reg, kidx, line)
+		} else {
+			loadStringK(context, reg+1, name, line)
+			code.AddABC(OP_GETTABLE, reg, reg, reg+1, line)
+		}
+	} else if envlocal, _ := envAccess(context); envlocal > -1 {
+		if fits {
+			code.AddABC(OP_GETFIELD, reg, envlocal, kidx, line)
+		} else {
+			loadStringK(context, reg, name, line)
+			code.AddABC(OP_GETTABLE, reg, envlocal, reg, line)
+		}
+	} else if fits {
+		code.AddABC(OP_GETTABUP, reg, envUpvalueIndexOf(context), kidx, line)
+	} else {
+		code.AddABC(OP_GETUPVAL, reg, envUpvalueIndexOf(context), 0, line)
+		loadStringK(context, reg+1, name, line)
+		code.AddABC(OP_GETTABLE, reg, reg, reg+1, line)
+	}
+}
+
+// emitGlobalStore stores vreg into _ENV[name] (compileAssignStmt's
+// ecGlobal store arm).
+func emitGlobalStore(context *funcContext, name string, kidx int, fits bool, vreg, line int) {
+	code := context.Code
+	if cv, ok := envConstAccess(context); ok {
+		// U5a: an RDKCTC _ENV is the store's table operand as a constant
+		// (the SETFIELD/SETTABLE fails at runtime, "attempt to index a
+		// number value")
+		loadConstant(context, vreg+1, cv, line)
+		if fits {
+			code.AddABCk(OP_SETFIELD, vreg+1, kidx, vreg, 0, line)
+		} else {
+			loadStringK(context, vreg+2, name, line)
+			code.AddABCk(OP_SETTABLE, vreg+1, vreg+2, vreg, 0, line)
+		}
+	} else if envlocal, _ := envAccess(context); envlocal > -1 {
+		if fits {
+			code.AddABCk(OP_SETFIELD, envlocal, kidx, vreg, 0, line)
+		} else {
+			loadStringK(context, vreg+1, name, line)
+			code.AddABCk(OP_SETTABLE, envlocal, vreg+1, vreg, 0, line)
+		}
+	} else if fits {
+		code.AddABCk(OP_SETTABUP, envUpvalueIndexOf(context), kidx, vreg, 0, line)
+	} else {
+		code.AddABC(OP_GETUPVAL, vreg+2, envUpvalueIndexOf(context), 0, line)
+		loadStringK(context, vreg+1, name, line)
+		code.AddABCk(OP_SETTABLE, vreg+2, vreg+1, vreg, 0, line)
+	}
+}
+
+// ctcValueOf resolves name to a visible RDKCTC entry's folded constant
+// (stock singlevaraux's VCONST propagation: the entry can live in this
+// function or any ancestor — it is never captured as an upvalue, the
+// value folds at the use site). Resolution stops at the first local or
+// upvalue-pool match at each level.
+func ctcValueOf(context *funcContext, name string) (LValue, bool) {
+	for fn := context; fn != nil; fn = fn.Parent {
+		if idx := fn.FindLocalVar(name); idx > -1 {
+			if fn.kindOfVar(idx) != varKindCTC {
+				return nil, false
+			}
+			return fn.ctcValOfVar(idx), true
+		}
+		if fn.Upvalues.Find(name) > -1 {
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+// ctcValOfVar is the folded constant of the varKindCTC entry at idx.
+func (fc *funcContext) ctcValOfVar(idx int) LValue {
+	_, block := fc.FindLocalVarAndBlockAt(idx)
+	return block.LocalVars.ctcValAt(idx)
+}
+
+// ctcSubst rewrites compile-time-constant identifiers appearing as
+// ARITHMETIC operands into literal values (stock's constfolding reads
+// VCONST values through const2val), so constFold can fold `k3 + (k3 <<
+// k0)` — the RDKCTC promotion test folds chains of <const> locals
+// (stock localstat tail + luaK_exp2const, code.lua's k-battery). A
+// top-level identifier is left alone (ctcFoldValue's own IdentExpr arm
+// handles it, including non-numeric constants).
+func ctcSubst(context *funcContext, expr ast.Expr) ast.Expr {
+	sub := func(e ast.Expr) ast.Expr {
+		if id, ok := e.(*ast.IdentExpr); ok {
+			if v, ok := ctcValueOf(context, id.Value); ok {
+				ce := &constLValueExpr{Value: v}
+				ce.SetLine(id.Line())
+				return ce
+			}
+		}
+		return e
+	}
+	switch ex := expr.(type) {
+	case *ast.ArithmeticOpExpr:
+		ex.Lhs = sub(ctcSubst(context, ex.Lhs))
+		ex.Rhs = sub(ctcSubst(context, ex.Rhs))
+	case *ast.UnaryMinusOpExpr:
+		ex.Expr = sub(ctcSubst(context, ex.Expr))
+	case *ast.UnaryBNotOpExpr:
+		ex.Expr = sub(ctcSubst(context, ex.Expr))
+	}
+	return expr
+}
+
+// ctcFoldValue is stock luaK_exp2const for a local-decl initializer:
+// fold arithmetic first, then accept numerals, strings, booleans, nil,
+// and references to other visible compile-time constants.
+func ctcFoldValue(context *funcContext, expr ast.Expr) (LValue, bool) {
+	switch ex := constFold(ctcSubst(context, expr)).(type) {
+	case *constLValueExpr:
+		switch ex.Value.(type) {
+		case LInteger, LNumber:
+			return ex.Value, true
+		}
+	case *ast.NumberExpr:
+		if v, err := parseNumber(ex.Value); err == nil {
+			return v, true
+		}
+	case *ast.StringExpr:
+		return LString(ex.Value), true
+	case *ast.TrueExpr:
+		return LTrue, true
+	case *ast.FalseExpr:
+		return LFalse, true
+	case *ast.NilExpr:
+		return LNil, true
+	case *ast.IdentExpr:
+		return ctcValueOf(context, ex.Value)
+	}
+	return nil, false
+}
+
+// loadConstant materializes a folded compile-time constant into reg
+// (stock's literal selection over the folded value).
+func loadConstant(fc *funcContext, reg int, v LValue, line int) {
+	switch lv := v.(type) {
+	case LInteger, LNumber:
+		loadNumber(fc, reg, v, line)
+	case LString:
+		cindex := fc.ConstIndex(lv)
+		if cindex <= opMaxArgBx {
+			fc.Code.AddABx(OP_LOADK, reg, cindex, line)
+		} else {
+			fc.Code.AddABx(OP_LOADKX, reg, 0, line)
+			fc.Code.AddAx(OP_EXTRAARG, cindex, line)
+		}
+	case LBool:
+		if lv {
+			fc.Code.AddABC(OP_LOADTRUE, reg, 0, 0, line)
+		} else {
+			fc.Code.AddABC(OP_LOADFALSE, reg, 0, 0, line)
+		}
+	default:
+		fc.Code.AddABC(OP_LOADNIL, reg, 0, 0, line)
+	}
+}
 
 func compileReturnStmt(context *funcContext, stmt *ast.ReturnStmt) { // {{{
 	lenexprs := len(stmt.Exprs)
 	code := context.Code
 	reg := context.RegTop()
 	a := reg
-	lastisvaarg := false
+	// U4 (stock luaK_finish): a function marked for closing signals it on
+	// its returns — RETURN/TAILCALL get the k bit; the simple RETURN0/1
+	// become RETURN (the only return opcode that closes). B keeps the
+	// fork's fixed-results convention (B = nres+1), so the rewritten
+	// RETURN0/1 forms carry B=1/B=2.
+	kc := 0
+	if context.NeedsClose {
+		kc = 1
+	}
 
+	if lenexprs == 0 {
+		if kc != 0 {
+			code.AddABCk(OP_RETURN, 0, 1, 0, 1, sline(stmt))
+		} else {
+			code.AddABC(OP_RETURN0, 0, 0, 0, sline(stmt))
+		}
+		return
+	}
 	if lenexprs == 1 {
 		switch ex := stmt.Exprs[0].(type) {
 		case *ast.IdentExpr:
-			if idx := context.FindLocalVar(ex.Value); idx > -1 {
-				code.AddABC(OP_RETURN, idx, 2, 0, sline(stmt))
+			// U5a: an RDKCTC name has no register — return as a constant
+			// through the generic path, not RETURN1 of regOfVar's -1
+			if idx := context.FindLocalVar(ex.Value); idx > -1 && context.kindOfVar(idx) != varKindCTC {
+				// U5b: `return t` of the named vararg parameter is a
+				// whole-value use — promote (the table then sits in the
+				// slot the RETURN1/RETURN reads)
+				if context.kindOfVar(idx) == varKindVararg {
+					context.promoteVatab()
+				}
+				reg := context.regOfVar(idx)
+				if kc != 0 {
+					code.AddABCk(OP_RETURN, reg, 2, 0, 1, sline(stmt))
+				} else {
+					code.AddABC(OP_RETURN1, reg, 0, 0, sline(stmt))
+				}
 				return
 			}
 		case *ast.FuncCallExpr:
 			if ex.AdjustRet { // return (func())
 				reg += compileExpr(context, reg, ex, ecnone(0))
+				code.AddABCk(OP_RETURN, a, 0, 0, kc, sline(stmt))
 			} else {
 				reg += compileExpr(context, reg, ex, ecnone(-2))
-				code.SetOpCode(code.LastPC(), OP_TAILCALL)
+				if context.tbcActive == 0 { // stock insidetbc: no tailcall over an open <close>
+					code.SetOpCode(code.LastPC(), OP_TAILCALL)
+					// U5a (stock luaK_finish): a closing function signals it
+					// on the TAILCALL itself too
+					if kc != 0 {
+						code.Setk(code.LastPC(), 1)
+					}
+				}
+				code.AddABCk(OP_RETURN, a, 0, 0, kc, sline(stmt))
 			}
-			code.AddABC(OP_RETURN, a, 0, 0, sline(stmt))
 			return
 		}
 	}
 
+	lastisvaarg := false
 	for i, expr := range stmt.Exprs {
 		if i == lenexprs-1 && isVarArgReturnExpr(expr) {
 			compileExpr(context, reg, expr, ecnone(-2))
@@ -1015,8 +2103,29 @@ func compileReturnStmt(context *funcContext, stmt *ast.ReturnStmt) { // {{{
 	if lastisvaarg {
 		count = 0
 	}
-	context.Code.AddABC(OP_RETURN, a, count, 0, sline(stmt))
+	// stock luaK_ret's checklimit (lcode.c:215): B = nret+1 must fit the
+	// 8-bit B field — "too many returns (limit is 255)" (calls.lua:599's
+	// 255-value return). Reported at the function's definition line
+	// (post-parse; stock raises at the current token).
+	if count > maxFuncRegisters {
+		raiseErrorLimit(context, maxFuncRegisters, "returns")
+	}
+	context.Code.AddABCk(OP_RETURN, a, count, 0, kc, sline(stmt))
 } // }}}
+
+// blockTailLine is the line stock codes a construct's trailing jump at:
+// ls->lastline at the luaK_jump call — the block's last token's line, or
+// the delimiter token's line (`then`/`do`) when the block is empty. The
+// jump-over-else (test_then_block) and the while loop-back (whilestat)
+// are both emitted BEFORE the next keyword is read, so they carry the
+// block tail, never the construct's header/end line (db.lua:25's trace:
+// coding them at the if/while line fired phantom line events).
+func blockTailLine(stmts []ast.Stmt, emptyLine int) int {
+	if n := len(stmts); n > 0 {
+		return eline(stmts[n-1])
+	}
+	return emptyLine
+}
 
 func compileIfStmt(context *funcContext, stmt *ast.IfStmt) { // {{{
 	thenlabel := context.NewLabel()
@@ -1027,7 +2136,7 @@ func compileIfStmt(context *funcContext, stmt *ast.IfStmt) { // {{{
 	context.SetLabelPc(thenlabel, context.Code.LastPC())
 	compileBlock(context, stmt.Then)
 	if len(stmt.Else) > 0 {
-		context.Code.AddASbx(OP_JMP, 0, endlabel, sline(stmt))
+		context.Code.AddSJ(OP_JMP, endlabel, blockTailLine(stmt.Then, stmt.ThenLine))
 	}
 	context.SetLabelPc(elselabel, context.Code.LastPC())
 	if len(stmt.Else) > 0 {
@@ -1038,7 +2147,6 @@ func compileIfStmt(context *funcContext, stmt *ast.IfStmt) { // {{{
 } // }}}
 
 func compileBranchCondition(context *funcContext, reg int, expr ast.Expr, thenlabel, elselabel int, hasnextcond bool) { // {{{
-	// TODO folding constants?
 	code := context.Code
 	flip := 0
 	jumplabel := elselabel
@@ -1050,7 +2158,7 @@ func compileBranchCondition(context *funcContext, reg int, expr ast.Expr, thenla
 	switch ex := expr.(type) {
 	case *ast.FalseExpr, *ast.NilExpr:
 		if !hasnextcond {
-			code.AddASbx(OP_JMP, 0, elselabel, sline(expr))
+			code.AddSJ(OP_JMP, elselabel, sline(expr))
 			return
 		}
 	case *ast.TrueExpr, *ast.NumberExpr, *ast.StringExpr:
@@ -1081,8 +2189,8 @@ func compileBranchCondition(context *funcContext, reg int, expr ast.Expr, thenla
 
 	a := reg
 	compileExprWithMVPropagation(context, expr, &reg, &a)
-	code.AddABC(OP_TEST, a, 0, 0^flip, sline(expr))
-	code.AddASbx(OP_JMP, 0, jumplabel, sline(expr))
+	code.AddABCk(OP_TEST, a, 0, 0, flip, sline(expr))
+	code.AddSJ(OP_JMP, jumplabel, sline(expr))
 } // }}}
 
 func compileWhileStmt(context *funcContext, stmt *ast.WhileStmt) { // {{{
@@ -1096,7 +2204,7 @@ func compileWhileStmt(context *funcContext, stmt *ast.WhileStmt) { // {{{
 	context.EnterBlock(elselabel, stmt)
 	compileChunk(context, stmt.Stmts, false)
 	context.CloseUpvalues()
-	context.Code.AddASbx(OP_JMP, 0, condlabel, eline(stmt))
+	context.Code.AddSJ(OP_JMP, condlabel, blockTailLine(stmt.Stmts, stmt.DoLine))
 	context.LeaveBlock()
 	context.SetLabelPc(elselabel, context.Code.LastPC())
 } // }}}
@@ -1113,26 +2221,50 @@ func compileRepeatStmt(context *funcContext, stmt *ast.RepeatStmt) { // {{{
 	compileBranchCondition(context, context.RegTop(), stmt.Condition, thenlabel, elselabel, false)
 
 	context.SetLabelPc(thenlabel, context.Code.LastPC())
+	// U5a: the block's debug windows must cover the close dance below
+	// (stock's scope block leaves AFTER the dance — its removevars endpc
+	// is past the repetition close, so both CLOSEs see the block's locals
+	// in debug.getlocal; locals.lua:1198)
+	dbg := context.Block.LocalVars.dbg
 	n := context.LeaveBlock()
 
 	if n > -1 {
 		label := context.NewLabel()
-		context.Code.AddASbx(OP_JMP, 0, label, eline(stmt))
+		context.Code.AddSJ(OP_JMP, label, eline(stmt))
 		context.SetLabelPc(elselabel, context.Code.LastPC())
 		context.Code.AddABC(OP_CLOSE, n, 0, 0, eline(stmt))
-		context.Code.AddASbx(OP_JMP, 0, initlabel, eline(stmt))
+		context.Code.AddSJ(OP_JMP, initlabel, eline(stmt))
 		context.SetLabelPc(label, context.Code.LastPC())
+		for _, info := range dbg {
+			if info != nil {
+				info.EndPc = context.Code.LastPC() + 1
+			}
+		}
 	}
 
 } // }}}
 
+// compileBreakStmt lowers break as a jump to the innermost loop's end
+// label. 5.2 allows break mid-block, so the jump may exit the scope of
+// locals in ANY block between the current one and the loop's (inclusive);
+// OP_CLOSE at the outermost such boundary closes every open upvalue above
+// it (one instruction, register-range semantics). The pre-5.2 code only
+// considered the loop block itself and missed nested do/local scopes
+// (e.g. `while true do do local t = {}; local f = function() return t
+// end; break end end` left t's upvalue open across loop iterations).
 func compileBreakStmt(context *funcContext, stmt *ast.BreakStmt) { // {{{
+	closeIdx := -1
 	for block := context.Block; block != nil; block = block.Parent {
+		if block.RefUpvalue && block.Parent != nil {
+			// keep overwriting: the OUTERMOST crossed block with captured
+			// locals owns the close register
+			closeIdx = context.nvarstackFrom(block.Parent)
+		}
 		if label := block.BreakLabel; label != labelNoJump {
-			if block.RefUpvalue {
-				context.Code.AddABC(OP_CLOSE, block.Parent.LocalVars.LastIndex(), 0, 0, sline(stmt))
+			if closeIdx > -1 {
+				context.Code.AddABC(OP_CLOSE, closeIdx, 0, 0, sline(stmt))
 			}
-			context.Code.AddASbx(OP_JMP, 0, label, sline(stmt))
+			context.Code.AddSJ(OP_JMP, label, sline(stmt))
 			return
 		}
 	}
@@ -1142,109 +2274,227 @@ func compileBreakStmt(context *funcContext, stmt *ast.BreakStmt) { // {{{
 func compileFuncDefStmt(context *funcContext, stmt *ast.FuncDefStmt) { // {{{
 	if stmt.Name.Func == nil {
 		reg := context.RegTop()
-		var treg, kreg int
+		var treg int
 		compileExprWithKMVPropagation(context, stmt.Name.Receiver, &reg, &treg)
-		kreg = loadRk(context, &reg, stmt.Func, LString(stmt.Name.Method))
 		compileExpr(context, reg, stmt.Func, ecfuncdef)
-		context.Code.AddABC(OP_SETTABLE, treg, kreg, reg, sline(stmt.Name.Receiver))
+		kidx, fits := context.kStringIndex(stmt.Name.Method, sline(stmt.Name.Receiver))
+		if fits {
+			context.Code.AddABC(OP_SETFIELD, treg, kidx, reg, sline(stmt.Name.Receiver))
+		} else {
+			// K-overflow fallback: key into a register, SETTABLE
+			loadStringK(context, reg+1, stmt.Name.Method, sline(stmt.Name.Receiver))
+			context.Code.AddABCk(OP_SETTABLE, treg, reg+1, reg, 0, sline(stmt.Name.Receiver))
+		}
 	} else {
 		astmt := &ast.AssignStmt{Lhs: []ast.Expr{stmt.Name.Func}, Rhs: []ast.Expr{stmt.Func}}
 		astmt.SetLine(sline(stmt.Func))
 		astmt.SetLastLine(eline(stmt.Func))
 		compileAssignStmt(context, astmt)
 	}
+	// U5f (stock funcstat's luaK_fixline): the definition "happens" on the
+	// statement's FIRST line — the final store instruction is re-lined
+	// there. A field-chain def lowered to an assignment otherwise carries
+	// the statement TAIL line (the assignment rule): `function a.x.y()`
+	// over an a.x that is nil errors at the SETFIELD, and errors.lua:433
+	// pins line 1 (the `function` line), not the body's `end` line
+	context.Code.lines[context.Code.LastPC()] = sline(stmt)
 } // }}}
 
+// compileNumberForStmt — stock 5.5 flow (lparser.c fornum + lvm.c
+// forprep/FORLOOP): three registers, r0=count (hidden), r1=step (hidden),
+// r2=control variable (the visible name). FORPREP falls through into the
+// body or skips past the FORLOOP; FORLOOP steps and jumps back while the
+// counter (iterations-1) is nonzero — the count never wraps, closing the
+// row-57 saturation edge.
 func compileNumberForStmt(context *funcContext, stmt *ast.NumberForStmt) { // {{{
 	code := context.Code
 	endlabel := context.NewLabel()
 	ec := &expcontext{}
 
 	context.EnterBlock(endlabel, stmt)
+	// register/compile interleaving keeps each operand's temporaries
+	// starting exactly at its own target register (r0=count slot,
+	// r1=step slot, r2=control slot = the visible name)
 	reg := context.RegTop()
-	rindex := context.RegisterLocalVar("(for index)")
-	ecupdate(ec, ecLocal, rindex, 0)
+	// U5a: a registration's flat index is a scope identity, not a slot —
+	// the register it occupies is RegTop at the call (a `global *` preamble
+	// shifts flat indices without shifting registers)
+	rfor := reg
+	idxfor0 := context.RegisterLocalVar("(for state)")
+	ecupdate(ec, ecLocal, rfor, 0)
 	compileExpr(context, reg, stmt.Init, ec)
 
 	reg = context.RegTop()
-	rlimit := context.RegisterLocalVar("(for limit)")
-	ecupdate(ec, ecLocal, rlimit, 0)
+	idxfor1 := context.RegisterLocalVar("(for state)")
+	ecupdate(ec, ecLocal, rfor+1, 0)
 	compileExpr(context, reg, stmt.Limit, ec)
 
-	reg = context.RegTop()
-	rstep := context.RegisterLocalVar("(for step)")
 	if stmt.Step == nil {
 		stmt.Step = &ast.NumberExpr{Value: "1"}
 		stmt.Step.SetLine(sline(stmt.Init))
 	}
-	ecupdate(ec, ecLocal, rstep, 0)
+	reg = context.RegTop()
+	ecupdate(ec, ecLocal, rfor+2, 0)
 	compileExpr(context, reg, stmt.Step, ec)
 
-	code.AddASbx(OP_FORPREP, rindex, 0, sline(stmt))
+	// U5f (stock fornum): the two "(for state)" windows start where
+	// adjustlocalvars(2) runs — AFTER the init/limit/step code, at the
+	// pc OP_FORPREP is about to occupy.
+	for _, idx := range []int{idxfor0, idxfor1} {
+		if info := context.dbgInfoAt(idx); info != nil {
+			info.StartPc = code.LastPC() + 1
+		}
+	}
 
-	context.RegisterLocalVar(stmt.Name)
-
-	bodypc := code.LastPC()
+	// U4: the control variable is RDKCONST (stock lparser.c) — the loop
+	// steps it internally, user code cannot assign it. U5f (stock
+	// forbody): its window starts only after OP_FORPREP — emitted here
+	// first, the registration follows the instruction.
+	code.AddABx(OP_FORPREP, rfor, 0, sline(stmt))
+	context.RegisterLocalVarKind(stmt.Name, varKindConst)
+	preppc := code.LastPC()
+	bodypc := code.LastPC() + 1
 	compileChunk(context, stmt.Stmts, false)
 
 	context.LeaveBlock()
 
-	flpc := code.LastPC()
-	code.AddASbx(OP_FORLOOP, rindex, bodypc-(flpc+1), sline(stmt))
-
+	flpc := code.LastPC() + 1 // FORLOOP's own index (about to be emitted)
+	code.AddABx(OP_FORLOOP, rfor, flpc+1-bodypc, sline(stmt))
 	context.SetLabelPc(endlabel, code.LastPC())
-	code.SetSbx(bodypc, flpc-bodypc)
-
+	if d := flpc - preppc - 1; d < 0 || d > opMaxArgBx {
+		raiseCompileError(context, sline(stmt), "control structure too long")
+	} else {
+		code.SetBx(preppc, d)
+	}
 } // }}}
 
+// compileGenericForStmt — the 5.5 four-slot layout: r0=iterator
+// function, r1=state, r2=closing variable (TFORPREP swaps it with the
+// control and registers the to-be-closed value), r3=control variable
+// (aliased with the first loop name). The three internal variables are
+// all "(for state)" (stock new_localvarliteral ×3). marktobeclosed
+// (U5a): EVERY generic-for marks the FOR block upval+insidetbc and the
+// function needclose — the loop body's returns carry the CLOSE k-bit
+// and tailcall promotion is suppressed inside (locals.lua's
+// numopen==0 battery). TWO blocks, exactly stock's forstat/forbody
+// split: the loop names activate in the BODY block (its LeaveBlock
+// CLOSE runs per iteration, closing captured loop names and body
+// locals), while the FOR block's CLOSE is emitted only after TFORLOOP
+// — loop exit, break (compileBreakStmt's crossed-block walk) and the
+// fallthrough out of the loop are the paths that close the 4th value;
+// the per-iteration path never reaches it. A single block put the CLOSE
+// between body and TFORCALL, where fallthrough executed it EVERY
+// iteration (files.lua's io.lines closed its file after line 1).
 func compileGenericForStmt(context *funcContext, stmt *ast.GenericForStmt) { // {{{
 	code := context.Code
 	endlabel := context.NewLabel()
-	bodylabel := context.NewLabel()
-	fllabel := context.NewLabel()
 	nnames := len(stmt.Names)
-
-	context.EnterBlock(endlabel, stmt)
-	rgen := context.RegisterLocalVar("(for generator)")
-	context.RegisterLocalVar("(for state)")
-	context.RegisterLocalVar("(for control)")
-
-	compileRegAssignment(context, stmt.Names, stmt.Exprs, context.RegTop()-3, 3, sline(stmt))
-
-	code.AddASbx(OP_JMP, 0, fllabel, sline(stmt))
-
-	for _, name := range stmt.Names {
-		context.RegisterLocalVar(name)
+	// stock forlist saves the line right after 'in' — the first explist
+	// token's line — and fixes TFORPREP/TFORCALL/TFORLOOP to it (the
+	// iterator-call error position, errors.lua's `for k,v in \n 3`):
+	// the statement's own 'for' line is the NUMERIC for's rule
+	fline := sline(stmt)
+	if len(stmt.Exprs) > 0 {
+		fline = stmt.Exprs[0].Line()
 	}
 
-	context.SetLabelPc(bodylabel, code.LastPC())
-	compileChunk(context, stmt.Stmts, false)
+	// the FOR block (stock forstat enterblock, isbreakable — break finds
+	// this block's endlabel through the body block's labelNoJump)
+	context.EnterBlock(endlabel, stmt)
+	// U5a: rgen is the REGISTER of the first control slot (TFOR* A
+	// operands) — RegTop at the registrations, not their flat indices
+	rgen := context.RegTop()
+	idxgen := [3]int{
+		context.RegisterLocalVar("(for state)"),
+		context.RegisterLocalVar("(for state)"),
+		context.RegisterLocalVar("(for state)"),
+	}
 
+	compileRegAssignment(context,
+		[]string{"(for state)", "(for state)", "(for state)", "(for state)"},
+		stmt.Exprs, context.RegTop()-3, 4, sline(stmt))
+
+	// U5f (stock forlist): the three "(for state)" windows start where
+	// adjustlocalvars(3) runs — after the explist's code, at the pc
+	// OP_TFORPREP is about to occupy.
+	for _, idx := range idxgen {
+		if info := context.dbgInfoAt(idx); info != nil {
+			info.StartPc = code.LastPC() + 1
+		}
+	}
+
+	// stock marktobeclosed: the closing variable's scope is the loop
+	// block itself (the internal slot has no pool entry, so the
+	// LeaveBlock countKind decrement below needs no counterpart here —
+	// the explicit tbcActive-- after LeaveBlock is the decrement)
+	context.Block.RefUpvalue = true
+	context.NeedsClose = true
+	context.tbcActive++
+
+	code.AddABx(OP_TFORPREP, rgen, 0, fline)
+	preppc := code.LastPC()
+	bodypc := code.LastPC() + 1
+
+	// the BODY block (stock forbody enterblock): U4/U5a (stock forlist)
+	// the control variable (first name) is RDKCONST, additional loop
+	// names are regular assignable locals — all activated HERE so their
+	// upvalues close at each iteration's LeaveBlock
+	context.EnterBlock(labelNoJump, stmt)
+	for i, name := range stmt.Names {
+		if i == 0 {
+			context.RegisterLocalVarKind(name, varKindConst)
+		} else {
+			context.RegisterLocalVar(name)
+		}
+	}
+	compileChunk(context, stmt.Stmts, false)
 	context.LeaveBlock()
 
-	context.SetLabelPc(fllabel, code.LastPC())
-	code.AddABC(OP_TFORLOOP, rgen, 0, nnames, sline(stmt))
-	code.AddASbx(OP_JMP, 0, bodylabel, sline(stmt))
+	tfcallpc := code.LastPC() + 1
+	code.AddABC(OP_TFORCALL, rgen, 0, nnames, fline)
+	tflpc := code.LastPC() + 1
+	code.AddABx(OP_TFORLOOP, rgen, tflpc+1-bodypc, fline)
 
+	// the FOR block closes AFTER TFORLOOP — emitted on the normal loop
+	// exit only; TFORLOOP's jump back lands above it
+	context.LeaveBlock()
+	context.tbcActive--
 	context.SetLabelPc(endlabel, code.LastPC())
-} // }}}
-
-func compileLabelStmt(context *funcContext, stmt *ast.LabelStmt, isLastStmt bool) { // {{{
-	labelId := context.NewLabel()
-	label := newLabelDesc(labelId, stmt.Name, context.Code.LastPC(), sline(stmt), context.BlockLocalVarsCount())
-	context.AddNamedLabel(label)
-	if isLastStmt {
-		label.SetNumActiveLocalVars(context.Block.Parent.LocalVarsCount())
+	if d := tfcallpc - preppc - 1; d < 0 || d > opMaxArgBx {
+		raiseCompileError(context, sline(stmt), "control structure too long")
+	} else {
+		code.SetBx(preppc, d)
 	}
-	context.ResolveForwardGoto(label)
 } // }}}
 
+// compileLabelStmt (stock labelstat: checkrepeated + createlabel). A
+// label is only visible while its block is open; duplicates are checked
+// against every ACTIVE label of the function (nested-block repeats are
+// errors, sibling-block repeats are not — the retired label is gone by
+// then). A last-statement label sits outside the block's locals.
+func compileLabelStmt(context *funcContext, stmt *ast.LabelStmt, isLastStmt bool) { // {{{
+	if old := context.findActiveLabel(stmt.Name, 0); old != nil {
+		raiseCompileError(context, sline(stmt), "label '%s' already defined on line %d", stmt.Name, old.Line)
+	}
+	label := newLabelDesc(context.NewLabel(), stmt.Name, context.Code.LastPC(), sline(stmt), context.BlockLocalVarsCount())
+	if isLastStmt {
+		label.NumActiveLocalVars = context.Block.entryNactvar
+	}
+	context.labels = append(context.labels, label)
+	context.SetLabelPc(label.Id, label.Pc)
+} // }}}
+
+// compileGotoStmt (stock gotostat + newgotoentry): a jump plus a DEAD
+// CLOSE placeholder after it (B=1 marks it dead). Resolution happens at
+// block exit (solveGotos/closeGoto); if the jump turns out to need a
+// close, the pair swaps so the CLOSE runs before the jump. The goto never
+// searches backward for a label at creation — backward and forward gotos
+// resolve identically at leaveblock.
 func compileGotoStmt(context *funcContext, stmt *ast.GotoStmt) { // {{{
-	context.Code.AddABC(OP_CLOSE, 0, 0, 0, sline(stmt))
-	context.Code.AddASbx(OP_JMP, 0, labelNoJump, sline(stmt))
-	label := newLabelDesc(-1, stmt.Label, context.Code.LastPC(), sline(stmt), context.BlockLocalVarsCount())
-	context.AddUnresolvedGoto(label)
-	context.FindLabel(context.Block, label, context.gotosCount-1)
+	context.Code.AddSJ(OP_JMP, labelNoJump, sline(stmt))
+	context.Code.AddABC(OP_CLOSE, 0, 1, 0, sline(stmt)) // dead placeholder
+	label := newLabelDesc(-1, stmt.Label, context.Code.LastPC()-1, sline(stmt), context.BlockLocalVarsCount())
+	context.gotos = append(context.gotos, label)
 } // }}}
 
 func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) int { // {{{
@@ -1260,56 +2510,134 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 		code.AddABx(OP_LOADK, sreg, context.ConstIndex(LString(ex.Value)), sline(ex))
 		return sused
 	case *ast.NumberExpr:
+		// integer literals keep their syntactic subtype (U2/D1):
+		// parseNumber yields LInteger or LNumber, loadNumber picks
+		// LOADI/LOADF/LOADK per stock luaK_int/luaK_float
 		num, err := parseNumber(ex.Value)
 		if err != nil {
 			num = LNumber(math.NaN())
 		}
-		code.AddABx(OP_LOADK, sreg, context.ConstIndex(num), sline(ex))
+		loadNumber(context, sreg, num, sline(ex))
 		return sused
 	case *constLValueExpr:
-		code.AddABx(OP_LOADK, sreg, context.ConstIndex(ex.Value), sline(ex))
+		loadNumber(context, sreg, ex.Value, sline(ex))
 		return sused
 	case *ast.NilExpr:
-		code.AddLoadNil(sreg, sreg, sline(ex))
+		code.AddABC(OP_LOADNIL, sreg, 0, 0, sline(ex))
 		return sused
 	case *ast.FalseExpr:
-		code.AddABC(OP_LOADBOOL, sreg, 0, 0, sline(ex))
+		code.AddABC(OP_LOADFALSE, sreg, 0, 0, sline(ex))
 		return sused
 	case *ast.TrueExpr:
-		code.AddABC(OP_LOADBOOL, sreg, 1, 0, sline(ex))
+		code.AddABC(OP_LOADTRUE, sreg, 0, 0, sline(ex))
 		return sused
 	case *ast.IdentExpr:
 		switch getIdentRefType(context, context, ex) {
+		case ecConst:
+			// U5a: an RDKCTC reference folds to the stored literal (stock
+			// VCONST — dischargevars' const2exp); no register is read
+			if v, ok := ctcValueOf(context, ex.Value); ok {
+				loadConstant(context, sreg, v, sline(ex))
+			}
 		case ecGlobal:
-			code.AddABx(OP_GETGLOBAL, sreg, context.ConstIndex(LString(ex.Value)), sline(ex))
+			// D3: a global reads a field of _ENV. With _ENV shadowed by
+			// a local, that is a plain keyed table read; otherwise it is
+			// a field of the frame function's _ENV upvalue cell
+			// (GETTABUP — same shape as stock). A key past the 8-bit K
+			// range takes stock's fallback: key (and the upvalue table)
+			// into registers, GETTABLE.
+			kidx, fits := context.kStringIndex(ex.Value, sline(ex))
+			if cv, ok := envConstAccess(context); ok {
+				// U5a: an RDKCTC _ENV is the table operand as a constant
+				// (attrib.lua:461) — the load then fails at runtime with
+				// "attempt to index a number value"
+				loadConstant(context, sreg, cv, sline(ex))
+				if fits {
+					code.AddABC(OP_GETFIELD, sreg, sreg, kidx, sline(ex))
+				} else {
+					loadStringK(context, sreg+1, ex.Value, sline(ex))
+					code.AddABC(OP_GETTABLE, sreg, sreg, sreg+1, sline(ex))
+				}
+			} else if envlocal, _ := envAccess(context); envlocal > -1 {
+				if fits {
+					code.AddABC(OP_GETFIELD, sreg, envlocal, kidx, sline(ex))
+				} else {
+					loadStringK(context, reg, ex.Value, sline(ex))
+					code.AddABC(OP_GETTABLE, sreg, envlocal, reg, sline(ex))
+				}
+			} else if fits {
+				code.AddABC(OP_GETTABUP, sreg, envUpvalueIndexOf(context), kidx, sline(ex))
+			} else {
+				envreg := reg
+				code.AddABC(OP_GETUPVAL, envreg, envUpvalueIndexOf(context), 0, sline(ex))
+				loadStringK(context, envreg+1, ex.Value, sline(ex))
+				code.AddABC(OP_GETTABLE, sreg, envreg, envreg+1, sline(ex))
+			}
 		case ecUpvalue:
 			code.AddABC(OP_GETUPVAL, sreg, context.Upvalues.RegisterUnique(ex.Value), 0, sline(ex))
 		case ecLocal:
-			b := context.FindLocalVar(ex.Value)
-			code.AddABC(OP_MOVE, sreg, b, 0, sline(ex))
+			idx := context.FindLocalVar(ex.Value)
+			// U5b (stock luaK_dischargevars' VVARGVAR arm): a whole-value
+			// use of the named vararg parameter promotes the function to
+			// the table model (luaK_vapar2local) — the register then holds
+			// the vararg table and the read is a plain MOVE like any local.
+			if context.kindOfVar(idx) == varKindVararg {
+				context.promoteVatab()
+			}
+			code.AddABC(OP_MOVE, sreg, context.regOfVar(idx), 0, sline(ex))
 		}
 		return sused
 	case *ast.Comma3Expr:
-		if context.Proto.IsVarArg == 0 {
+		if context.Proto.IsVarArg&VarArgAny == 0 {
 			raiseCompileError(context, sline(ex), "cannot use '...' outside a vararg function")
 		}
-		context.Proto.IsVarArg &= ^VarArgNeedsArg
-		code.AddABC(OP_VARARG, sreg, 2+ec.varargopt, 0, sline(ex))
+		// B = numparams: under the table model the vararg table sits in
+		// register np, and OP_VARARG's k bit (set by the finish pass for
+		// promoted functions) selects "count comes from the table" — the
+		// runtime reads it at ci->func.p + B + 1, i.e. register B (stock
+		// lparser.c:1291 emits B=numparams at the use site; luaT_getvarargs
+		// resolves hvalue(func.p+B+1)). Hidden model ignores B.
+		code.AddABCk(OP_VARARG, sreg, int(context.Proto.NumParameters), 2+ec.varargopt, 0, sline(ex))
 		if context.RegTop() > (sreg+2+ec.varargopt) || ec.varargopt < -1 {
 			return 0
 		}
 		return (sreg + 1 + ec.varargopt) - reg
 	case *ast.AttrGetExpr:
+		// U5b (stock luaK_indexed's VVARGIND arm): an indexed READ of the
+		// named vararg parameter compiles as OP_GETVARG — the key ALWAYS in
+		// a fresh register (stock luaK_exp2anyreg, even constants), B the
+		// vararg slot's register. It runs only in the hidden model; the
+		// finish pass rewrites it to GETTABLE for a promoted function
+		// (A=dest, B=table register, C=key register).
+		if ident, ok := ex.Object.(*ast.IdentExpr); ok {
+			if idx := context.FindLocalVar(ident.Value); idx > -1 && context.kindOfVar(idx) == varKindVararg {
+				keyreg := reg
+				reg++
+				compileExpr(context, keyreg, ex.Key, ecnone(0))
+				code.AddABC(OP_GETVARG, sreg, context.regOfVar(idx), keyreg, sline(ex))
+				return sused
+			}
+		}
 		a := sreg
 		b := reg
 		compileExprWithMVPropagation(context, ex.Object, &reg, &b)
-		c := reg
-		compileExprWithKMVPropagation(context, ex.Key, &reg, &c)
-		opcode := OP_GETTABLE
-		if _, ok := ex.Key.(*ast.StringExpr); ok {
-			opcode = OP_GETTABLEKS
+		if str, ok := ex.Key.(*ast.StringExpr); ok {
+			kidx, fits := context.kStringIndex(str.Value, sline(ex))
+			if fits {
+				code.AddABC(OP_GETFIELD, a, b, kidx, sline(ex))
+			} else {
+				// K-overflow fallback (stock isKstr miss): key into a
+				// register, GETTABLE
+				loadStringK(context, reg, str.Value, sline(ex))
+				code.AddABC(OP_GETTABLE, a, b, reg, sline(ex))
+			}
+		} else if idx, ok := intKeyLiteral(ex.Key); ok {
+			code.AddABC(OP_GETI, a, b, idx, sline(ex))
+		} else {
+			c := reg
+			reg += compileExpr(context, reg, ex.Key, ecnone(0))
+			code.AddABC(OP_GETTABLE, a, b, c, sline(ex))
 		}
-		code.AddABC(opcode, a, b, c, sline(ex))
 		return sused
 	case *ast.TableExpr:
 		compileTableExpr(context, reg, ex, ec)
@@ -1320,7 +2648,7 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 	case *ast.StringConcatOpExpr:
 		compileStringConcatOpExpr(context, reg, ex, ec)
 		return sused
-	case *ast.UnaryMinusOpExpr, *ast.UnaryNotOpExpr, *ast.UnaryLenOpExpr:
+	case *ast.UnaryMinusOpExpr, *ast.UnaryNotOpExpr, *ast.UnaryLenOpExpr, *ast.UnaryBNotOpExpr:
 		compileUnaryOpExpr(context, reg, ex, ec)
 		return sused
 	case *ast.RelationalOpExpr:
@@ -1336,18 +2664,45 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 		compileFunctionExpr(childcontext, ex, ec)
 		protono := len(context.Proto.FunctionPrototypes)
 		context.Proto.FunctionPrototypes = append(context.Proto.FunctionPrototypes, childcontext.Proto)
-		code.AddABx(OP_CLOSURE, sreg, protono, sline(ex))
+		// U5f: stock emits OP_CLOSURE when the expression is discharged to
+		// a register — after body() consumed the closing `end` — so the
+		// instruction carries ls->lastline = the `end` line (LastLine,
+		// == LastLineDefined), not the `function` keyword's line (db.lua's
+		// local-function trace battery: CLOSURE@end is the chunk's first
+		// traced line)
+		code.AddABx(OP_CLOSURE, sreg, protono, eline(ex))
+		// capture descriptors live in the child proto (stock Upvaldesc);
+		// marking the defining block's RefUpvalue drives OP_CLOSE
+		// emission as the old pseudo-instructions did
 		for _, upvalue := range childcontext.Upvalues.List() {
+			// stock singlevaraux caps captures at MAXUPVAL (255) per
+			// function (luaY_checklimit "upvalues"; errors.lua:768's
+			// 127+127+battery)
+			if len(childcontext.Proto.Upvalues) >= maxUpvalues {
+				raiseErrorLimit(childcontext, maxUpvalues, "upvalues")
+			}
 			localidx, block := context.FindLocalVarAndBlock(upvalue.Name)
 			if localidx > -1 {
-				code.AddABC(OP_MOVE, 0, localidx, 0, sline(ex))
+				// U5b (stock singlevaraux's capture arm, lparser.c): an
+				// upvalue capture of the named vararg parameter promotes
+				// the OWNING function to the table model — the upvalue cell
+				// then holds the table. Passthrough levels need nothing:
+				// their own capture resolves at the owning level's walk.
+				if context.kindOfVar(localidx) == varKindVararg {
+					context.promoteVatab()
+				}
+				childcontext.Proto.Upvalues = append(childcontext.Proto.Upvalues,
+					Upvaldesc{InStack: true, Idx: uint8(context.regOfVar(localidx)), Name: upvalue.Name})
 				block.RefUpvalue = true
+				// stock markupval sets fs->needclose alongside bl->upval
+				context.NeedsClose = true
 			} else {
 				upvalueidx := context.Upvalues.Find(upvalue.Name)
 				if upvalueidx < 0 {
 					upvalueidx = context.Upvalues.RegisterUnique(upvalue.Name)
 				}
-				code.AddABC(OP_GETUPVAL, 0, upvalueidx, 0, sline(ex))
+				childcontext.Proto.Upvalues = append(childcontext.Proto.Upvalues,
+					Upvaldesc{InStack: false, Idx: uint8(upvalueidx), Name: upvalue.Name})
 			}
 		}
 		return sused
@@ -1375,35 +2730,51 @@ func compileExprWithMVPropagation(context *funcContext, expr ast.Expr, reg *int,
 	compileExprWithPropagation(context, expr, reg, save, context.Code.PropagateMV)
 } // }}}
 
+// constFold folds arithmetic on numerals, porting stock lcode.c
+// constfolding/validop (U2b): operands keep their syntactic subtype, int
+// ops fold with 5.3 wrap-around semantics, ops that would error are left
+// for runtime (division by zero, non-integral bitwise operands), and
+// float results equal to 0 or NaN are never folded (avoids -0.0/NaN in
+// the constant pool).
 func constFold(exp ast.Expr) ast.Expr { // {{{
 	switch expr := exp.(type) {
 	case *ast.ArithmeticOpExpr:
-		lvalue, lisconst := lnumberValue(constFold(expr.Lhs))
-		rvalue, risconst := lnumberValue(constFold(expr.Rhs))
+		lvalue, lisconst := constNumberValue(constFold(expr.Lhs))
+		rvalue, risconst := constNumberValue(constFold(expr.Rhs))
 		if lisconst && risconst {
-			switch expr.Operator {
-			case "+":
-				return &constLValueExpr{Value: lvalue + rvalue}
-			case "-":
-				return &constLValueExpr{Value: lvalue - rvalue}
-			case "*":
-				return &constLValueExpr{Value: lvalue * rvalue}
-			case "/":
-				return &constLValueExpr{Value: lvalue / rvalue}
-			case "%":
-				return &constLValueExpr{Value: luaModulo(lvalue, rvalue)}
-			case "^":
-				return &constLValueExpr{Value: LNumber(math.Pow(float64(lvalue), float64(rvalue)))}
-			default:
-				panic(fmt.Sprintf("unknown binop: %v", expr.Operator))
+			op := arithOpForOperator(expr.Operator)
+			if !foldValidOp(op, lvalue, rvalue) {
+				return expr
 			}
-		} else {
-			return expr
+			if v, _, res := arithCompute(op, lvalue, rvalue); res == arithDone {
+				if f, isFloat := v.(LNumber); isFloat && (f != f || f == 0) {
+					return expr
+				}
+				return &constLValueExpr{Value: v}
+			}
 		}
+		return expr
 	case *ast.UnaryMinusOpExpr:
 		expr.Expr = constFold(expr.Expr)
-		if value, ok := lnumberValue(expr.Expr); ok {
-			return &constLValueExpr{Value: LNumber(-value)}
+		if value, ok := constNumberValue(expr.Expr); ok {
+			if iv, isInt := value.(LInteger); isInt {
+				return &constLValueExpr{Value: -iv}
+			}
+			if fv := value.(LNumber); fv != 0 && fv == fv {
+				return &constLValueExpr{Value: -fv}
+			}
+		}
+		return expr
+	case *ast.UnaryBNotOpExpr:
+		expr.Expr = constFold(expr.Expr)
+		if value, ok := constNumberValue(expr.Expr); ok {
+			// validop's rule: both operands must convert to integers
+			if iv, isInt := value.(LInteger); isInt {
+				return &constLValueExpr{Value: ^iv}
+			}
+			if iv, ok := toIntBitwise(value); ok {
+				return &constLValueExpr{Value: ^LInteger(iv)}
+			}
 		}
 		return expr
 	default:
@@ -1412,11 +2783,76 @@ func constFold(exp ast.Expr) ast.Expr { // {{{
 	}
 } // }}}
 
+// constNumberValue extracts the numeral value (subtype preserved) of a
+// constant expression.
+func constNumberValue(expr ast.Expr) (LValue, bool) {
+	if ex, ok := expr.(*ast.NumberExpr); ok {
+		lv, err := parseNumber(ex.Value)
+		if err != nil {
+			return LNumber(math.NaN()), true
+		}
+		return lv, true
+	} else if ex, ok := expr.(*constLValueExpr); ok {
+		switch ex.Value.(type) {
+		case LNumber, LInteger:
+			return ex.Value, true
+		}
+	}
+	return nil, false
+}
+
+// arithOpForOperator maps the AST operator string to its opcode.
+func arithOpForOperator(opr string) int {
+	switch opr {
+	case "+":
+		return OP_ADD
+	case "-":
+		return OP_SUB
+	case "*":
+		return OP_MUL
+	case "/":
+		return OP_DIV
+	case "%":
+		return OP_MOD
+	case "^":
+		return OP_POW
+	case "//":
+		return OP_IDIV
+	case "&":
+		return OP_BAND
+	case "|":
+		return OP_BOR
+	case "~":
+		return OP_BXOR
+	case "<<":
+		return OP_SHL
+	case ">>":
+		return OP_SHR
+	}
+	panic(fmt.Sprintf("unknown binop: %v", opr))
+}
+
+// foldValidOp ports stock lcode.c validop: the folding guard for
+// error-prone operations (bitwise needs integer-convertible operands;
+// the divisions need a nonzero divisor).
+func foldValidOp(op int, v1, v2 LValue) bool {
+	switch op {
+	case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR, OP_BNOT:
+		_, ok1 := toIntBitwise(v1)
+		_, ok2 := toIntBitwise(v2)
+		return ok1 && ok2
+	case OP_DIV, OP_IDIV, OP_MOD:
+		return LVAsNumber(v2) != 0
+	}
+	return true
+}
+
 func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *expcontext) { // {{{
 	context.Proto.LineDefined = sline(funcexpr)
 	context.Proto.LastLineDefined = eline(funcexpr)
 	if len(funcexpr.ParList.Names) > maxRegisters {
-		raiseCompileError(context, context.Proto.LineDefined, "register overflow")
+		// stock: params are locals (adjustlocalvars' MAXVARS check)
+		raiseErrorLimit(context, maxRegisters, "local variables")
 	}
 	context.Proto.NumParameters = uint8(len(funcexpr.ParList.Names))
 	if ec.ctype == ecMethod {
@@ -1427,24 +2863,153 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 		context.RegisterLocalVar(name)
 	}
 	if funcexpr.ParList.HasVargs {
-		if CompatVarArg {
-			context.Proto.IsVarArg = VarArgHasArg | VarArgNeedsArg
-			if context.Parent != nil {
-				context.RegisterLocalVar("arg")
-			}
+		// U5b (stock parlist, lparser.c): `...` reserves the after-params
+		// register slot via a pool entry AT NumParameters — named
+		// (RDKVAVAR: indexed reads are OP_GETVARG, whole-value uses /
+		// writes / captures promote the table model, assignment-locked)
+		// or the unnamed placeholder (stock's new_localvarliteral
+		// "(vararg table)"). NumParameters counts the fixed params only,
+		// so the slot is register np — the extras' first cell in the
+		// hidden layout, the vararg table's cell in the table layout.
+		context.Proto.IsVarArg = VarArgHidden
+		// VARARGPREP is every vararg proto's first instruction (stock
+		// setvararg: A=0,0,0 — the runtime reads numparams from the
+		// proto). U5b: the interpreter runs it for real — hidden model
+		// copies the fixed params above the extra arguments, table model
+		// (a promoted function) builds {1..n, n=n} into the param slot.
+		// U5f ordering (stock parlist): the params register BEFORE
+		// setvararg codes OP_VARARGPREP, the vararg entry AFTER it —
+		// StartPc 0 for the params, 1 for the vararg — so the locals
+		// live at pc 0 are exactly the parameters (debug.getlocal over a
+		// non-active function never answers "(vararg table)" or the
+		// named vararg, db.lua:269's assert).
+		//
+		// U5f: stock codes VARARGPREP at ls->lastline — the `function`
+		// token's line for a body (== LineDefined), but the lexer's
+		// INIT lastline (1) for the main chunk, whose setvararg runs
+		// before the first token is read (db.lua:124's trace battery:
+		// the line-0 event LineDefined would fire is not stock's)
+		vline := context.Proto.LineDefined
+		if context.Parent == nil {
+			vline = 1
 		}
-		context.Proto.IsVarArg |= VarArgIsVarArg
+		context.Code.AddABC(OP_VARARGPREP, 0, 0, 0, vline)
+		if name := funcexpr.ParList.VArgName; name != "" {
+			context.RegisterLocalVarKind(name, varKindVararg)
+		} else if context.Parent != nil {
+			// mainfunc exception (stock lparser.c): the main chunk calls
+			// setvararg directly — VARARGPREP but no locvar AND no
+			// reserved slot, so main's locals start at register 0 like
+			// stock's main proto. That keeps DbgLocals' entry order ==
+			// register order, which varinfo's localNameAt(reg+1)
+			// convention depends on ("(local 'x')" hints). The unnamed
+			// slot is unreferenceable anyway (no name to resolve).
+			context.RegisterLocalVar(varargTableName)
+		}
 	}
+	// the root block's entry level: parameters (+ the vararg slot) only
+	context.Block.entryNactvar = context.BlockLocalVarsCount()
 
 	compileChunk(context, funcexpr.Stmts, false)
 
-	context.Code.AddABC(OP_RETURN, 0, 1, 0, eline(funcexpr))
+	// U5a (stock luaK_finish): the implicit final return goes through the
+	// same close rewrite as explicit ones — RETURN0 becomes RETURN with
+	// the k bit when the function needs closing, so the instruction names
+	// the __close dispatch (funcnamefromcode's RETURN arm — traceback
+	// frames "in metamethod 'close'", locals.lua:544)
+	retstmt := &ast.ReturnStmt{}
+	rline := eline(funcexpr)
+	if context.Parent == nil {
+		// U5f: stock's close_func codes the implicit return at ls->lastline
+		// — the line of the LAST CONSUMED TOKEN. For a function that is
+		// its `end` (eline's value — getinfo 'L' pins it: the activelines
+		// set includes the `end` line, getinfo01.lua). The main chunk is
+		// the exception: mainfunc's check(EOS) consumes the EOF token
+		// BEFORE close_func, so lastline still holds the last REAL
+		// token's line (the parser records the EOF line itself as the
+		// chunk's eline, one past a trailing newline) — pinning that one
+		// fired a phantom line event at the hook seam (stock fires none:
+		// changedline says same line). No statements at all: lastline is
+		// the lexer's init 1 (nothing was consumed before EOS)
+		if n := len(funcexpr.Stmts); n > 0 {
+			rline = eline(funcexpr.Stmts[n-1])
+		} else {
+			rline = 1
+		}
+	}
+	retstmt.SetLine(rline)
+	retstmt.SetLastLine(rline)
+	compileReturnStmt(context, retstmt)
+	// extendToClose: the final RETURN (just emitted) closes this
+	// function's tbc variables — its __close dispatch is the last
+	// instruction that must still see the locals
 	context.EndScope()
-	context.CheckUnresolvedGoto()
+	context.finishFunctionGotos()
+	// U5b (stock luaK_finish, the vararg half): the deferred finalization,
+	// run only now — a promoting use or <close> declaration may follow an
+	// already-compiled return, so every RETURN0/1 must survive to here.
+	// A promoted function flips to the table model (VATAB clears VAHID);
+	// GETVARG becomes GETTABLE (A=dest, B=the table's register, C=key
+	// register) and VARARG gets k=1 (B already carries numparams, the
+	// table's register). Every return of a hidden-model function signals
+	// it via C=numparams+1 (the runtime un-shifts the frame); RETURN0/1 —
+	// which cannot carry C — become RETURN first (B=1/B=2, the fork's
+	// nres+1 convention, unlike stock's top-relative B=0) together with
+	// the close k bit.
+	np := int(context.Proto.NumParameters)
+	vahid := context.Proto.IsVarArg&VarArgHidden != 0
+	if context.vatab {
+		context.Proto.IsVarArg = VarArgTable
+		vahid = false
+	}
+	needret := context.NeedsClose || vahid
+	if needret || context.vatab {
+		for pc := 0; pc < context.Code.pc; pc++ {
+			switch op := opGetOpCode(context.Code.At(pc)); op {
+			case OP_RETURN0, OP_RETURN1:
+				if !needret {
+					break
+				}
+				context.Code.SetOpCode(pc, OP_RETURN)
+				context.Code.SetB(pc, boolInt(op == OP_RETURN1)+1)
+				if context.NeedsClose {
+					context.Code.Setk(pc, 1)
+				}
+				if vahid {
+					context.Code.SetC(pc, np+1)
+				}
+			case OP_RETURN, OP_TAILCALL:
+				if context.NeedsClose {
+					context.Code.Setk(pc, 1)
+				}
+				if vahid {
+					context.Code.SetC(pc, np+1)
+				}
+			case OP_GETVARG:
+				if context.vatab {
+					context.Code.SetOpCode(pc, OP_GETTABLE)
+				}
+			case OP_VARARG:
+				if context.vatab {
+					context.Code.Setk(pc, 1)
+				}
+			}
+		}
+	}
 	context.Proto.Code = context.Code.List()
 	context.Proto.DbgSourcePositions = context.Code.PosList()
 	context.Proto.DbgUpvalues = context.Upvalues.Names()
 	context.Proto.NumUpvalues = uint8(len(context.Proto.DbgUpvalues))
+	// D3: record where _ENV lives for the loader seeding (the main
+	// chunk's _ENV cell is seeded at load; -1 = no globals)
+	context.Proto.EnvUpvalueIndex = int8(context.Upvalues.Find(envUpvalueName))
+	// the main chunk has no parent to resolve captures: its only
+	// upvalue is _ENV (loader-seeded, dummy descriptor)
+	if context.Parent == nil {
+		for range context.Upvalues.Names() {
+			context.Proto.Upvalues = append(context.Proto.Upvalues, Upvaldesc{InStack: false, Idx: 0, Name: envUpvalueName})
+		}
+	}
 	for _, clv := range context.Proto.Constants {
 		sv := ""
 		if slv, ok := clv.(LString); ok {
@@ -1457,19 +3022,17 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 
 func compileTableExpr(context *funcContext, reg int, ex *ast.TableExpr, ec *expcontext) { // {{{
 	code := context.Code
-	/*
-		tablereg := savereg(ec, reg)
-		if tablereg == reg {
-			reg += 1
-		}
-	*/
 	tablereg := reg
 	reg++
-	code.AddABC(OP_NEWTABLE, tablereg, 0, 0, sline(ex))
+	code.AddvABCk(OP_NEWTABLE, tablereg, 0, 0, 0, sline(ex))
 	tablepc := code.LastPC()
+	// NEWTABLE's size operands are patched after the constructor is
+	// known; EXTRAARG always follows (stock's shape)
+	code.AddAx(OP_EXTRAARG, 0, sline(ex))
 	regbase := reg
 
-	arraycount := 0
+	arraycount := 0 // array items evaluated so far
+	stored := 0     // array items already SETLISTed into the table
 	lastvararg := false
 	for i, field := range ex.Fields {
 		islast := i == len(ex.Fields)-1
@@ -1483,48 +3046,162 @@ func compileTableExpr(context *funcContext, reg int, ex *ast.TableExpr, ec *expc
 			}
 		} else {
 			regorg := reg
-			b := reg
-			compileExprWithKMVPropagation(context, field.Key, &reg, &b)
-			c := reg
-			compileExprWithKMVPropagation(context, field.Value, &reg, &c)
-			opcode := OP_SETTABLE
-			if _, ok := field.Key.(*ast.StringExpr); ok {
-				opcode = OP_SETTABLEKS
+			line := sline(ex)
+			var vreg int
+			if str, ok := field.Key.(*ast.StringExpr); ok {
+				kidx, fits := context.kStringIndex(str.Value, line)
+				compileExprWithKMVPropagation(context, field.Value, &reg, &vreg)
+				vk := boolInt(opIsK(vreg))
+				if fits {
+					code.AddABCk(OP_SETFIELD, tablereg, kidx, opIndexOrReg(vreg), vk, line)
+				} else {
+					// K-overflow fallback: key into a register, SETTABLE
+					loadStringK(context, reg, str.Value, line)
+					reg++
+					code.AddABCk(OP_SETTABLE, tablereg, reg-1, opIndexOrReg(vreg), vk, line)
+				}
+			} else {
+				b := reg
+				reg += compileExpr(context, reg, field.Key, ecnone(0))
+				compileExprWithKMVPropagation(context, field.Value, &reg, &vreg)
+				vk := boolInt(opIsK(vreg))
+				code.AddABCk(OP_SETTABLE, tablereg, b, opIndexOrReg(vreg), vk, line)
 			}
-			code.AddABC(opcode, tablereg, b, c, sline(ex))
 			reg = regorg
 		}
 		flush := arraycount % FieldsPerFlush
 		if (arraycount != 0 && (flush == 0 || islast)) || lastvararg {
 			reg = regbase
-			num := flush
-			if num == 0 {
-				num = FieldsPerFlush
-			}
-			c := (arraycount-1)/FieldsPerFlush + 1
-			b := num
-			if islast && isVarArgReturnExpr(field.Value) {
-				b = 0
+			n := arraycount - stored // this batch (fits vB: flush < 64)
+			if lastvararg {
+				n = 0 // multret: store up to top
 			}
 			line := field.Value
 			if field.Key != nil {
 				line = field.Key
 			}
-			if c > 511 {
-				c = 0
+			if stored > opMaxArgsvC {
+				code.AddvABCk(OP_SETLIST, tablereg, n, stored%(opMaxArgsvC+1), 1, sline(line))
+				code.AddAx(OP_EXTRAARG, stored/(opMaxArgsvC+1), sline(line))
+			} else {
+				code.AddvABCk(OP_SETLIST, tablereg, n, stored, 0, sline(line))
 			}
-			code.AddABC(OP_SETLIST, tablereg, b, c, sline(line))
-			if c == 0 {
-				code.Add(uint32(c), sline(line))
-			}
+			stored = arraycount
 		}
 	}
-	code.SetB(tablepc, int2Fb(arraycount))
-	code.SetC(tablepc, int2Fb(len(ex.Fields)-arraycount))
+	// patch NEWTABLE's size hints (stock luaK_settablesize): vB is
+	// ceillog2(hash size)+1, the array size splits over vC/EXTRAARG
+	hashsize := len(ex.Fields) - arraycount
+	vb := 0
+	if hashsize > 0 {
+		vb = ceilLog2(hashsize) + 1
+	}
+	extra := arraycount / (opMaxArgsvC + 1)
+	code.SetvB(tablepc, vb)
+	code.SetvC(tablepc, arraycount%(opMaxArgsvC+1))
+	code.Setk(tablepc, boolInt(extra > 0))
+	code.SetAx(tablepc+1, extra)
 	if shouldmove(ec, tablereg) {
 		code.AddABC(OP_MOVE, ec.reg, tablereg, 0, sline(ex))
 	}
 } // }}}
+
+// ceilLog2 is stock luaO_ceillog2 (capacity hint math only).
+func ceilLog2(x int) int {
+	n := 0
+	x--
+	for x > 0 {
+		x >>= 1
+		n++
+	}
+	return n
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// emitArith writes a binary arithmetic/bitwise operation with its MMBIN
+// fallback slot, porting stock lcode.c's selection (codecommutative /
+// codearith / codebitwise / finishbinexpneg / the shift immediates):
+// small-integer second operands become sC immediates (ADDI/SHLI/SHRI),
+// numeric constants in the 8-bit K range ride the *K opcodes, and
+// everything else takes the register form — each followed by the
+// MMBIN/MMBINI/MMBINK slot carrying the metamethod event and flip.
+func emitArith(context *funcContext, a int, lhs, rhs opnd, op int, reg int, line int) {
+	code := context.Code
+	tm := arithTM(op)
+	flip := 0
+
+	// commutative ops may swap a constant into second position
+	if op == OP_ADD || op == OP_MUL || op == OP_BAND || op == OP_BOR || op == OP_BXOR {
+		if lhs.kind != opndReg && rhs.kind == opndReg {
+			lhs, rhs = rhs, lhs
+			flip = 1
+		}
+	}
+	// (imm << r): SHLI's immediate is the FIRST operand (stock OPR_SHL)
+	if op == OP_SHL && lhs.kind == opndInt && rhs.kind == opndReg && fitsC(lhs.ival) {
+		code.AddABCk(OP_SHLI, a, rhs.reg, int2sC(int(lhs.ival)), 0, line)
+		code.AddABCk(OP_MMBINI, rhs.reg, int2sC(int(lhs.ival)), tm, 1, line)
+		return
+	}
+	// a non-register lhs must materialize into a register now
+	next := reg
+	if lhs.kind != opndReg {
+		lhs.reg = next
+		materializeReg(context, lhs, next, line)
+		next++
+	}
+	v1 := lhs.reg
+
+	// negate-immediate forms: (r - I) as (r + -I), (r << I) as (r >> -I);
+	// the MMBINI slot keeps the ORIGINAL operand for metamethods
+	if (op == OP_SUB || op == OP_SHL) && rhs.kind == opndInt && fitsC(rhs.ival) && fitsC(-rhs.ival) {
+		if op == OP_SUB {
+			code.AddABCk(OP_ADDI, a, v1, int2sC(int(-rhs.ival)), 0, line)
+		} else {
+			code.AddABCk(OP_SHRI, a, v1, int2sC(int(-rhs.ival)), 0, line)
+		}
+		code.AddABCk(OP_MMBINI, v1, int2sC(int(rhs.ival)), tm, 0, line)
+		return
+	}
+	// ADDI: immediate addition
+	if op == OP_ADD && rhs.kind == opndInt && fitsC(rhs.ival) {
+		code.AddABCk(OP_ADDI, a, v1, int2sC(int(rhs.ival)), 0, line)
+		code.AddABCk(OP_MMBINI, v1, int2sC(int(rhs.ival)), tm, flip, line)
+		return
+	}
+	// SHRI: immediate right shift
+	if op == OP_SHR && rhs.kind == opndInt && fitsC(rhs.ival) {
+		code.AddABCk(OP_SHRI, a, v1, int2sC(int(rhs.ival)), 0, line)
+		code.AddABCk(OP_MMBINI, v1, int2sC(int(rhs.ival)), tm, 0, line)
+		return
+	}
+	// K-operand forms: ADD..BXOR have K variants — the bitwise ones
+	// accept only integer constants (BANDK &c read K[C]:integer), and
+	// SHL/SHR have none
+	bitwise := op == OP_BAND || op == OP_BOR || op == OP_BXOR
+	if rhs.kind != opndReg && op != OP_SHL && op != OP_SHR &&
+		(!bitwise || rhs.kind == opndInt) &&
+		materializeK(context, rhs) <= opMaxIndexK {
+		kidx := materializeK(context, rhs)
+		kop := op - OP_ADD + OP_ADDK
+		code.AddABCk(kop, a, v1, kidx, 0, line)
+		code.AddABCk(OP_MMBINK, v1, kidx, tm, flip, line)
+		return
+	}
+	if rhs.kind != opndReg {
+		rhs.reg = next
+		materializeReg(context, rhs, next, line)
+		next++
+	}
+	code.AddABCk(op, a, v1, rhs.reg, 0, line)
+	code.AddABCk(OP_MMBIN, v1, rhs.reg, tm, 0, line)
+}
 
 func compileArithmeticOpExpr(context *funcContext, reg int, expr *ast.ArithmeticOpExpr, ec *expcontext) { // {{{
 	exp := constFold(expr)
@@ -1535,27 +3212,10 @@ func compileArithmeticOpExpr(context *funcContext, reg int, expr *ast.Arithmetic
 	}
 	expr, _ = exp.(*ast.ArithmeticOpExpr)
 	a := savereg(ec, reg)
-	b := reg
-	compileExprWithKMVPropagation(context, expr.Lhs, &reg, &b)
-	c := reg
-	compileExprWithKMVPropagation(context, expr.Rhs, &reg, &c)
-
-	op := 0
-	switch expr.Operator {
-	case "+":
-		op = OP_ADD
-	case "-":
-		op = OP_SUB
-	case "*":
-		op = OP_MUL
-	case "/":
-		op = OP_DIV
-	case "%":
-		op = OP_MOD
-	case "^":
-		op = OP_POW
-	}
-	context.Code.AddABC(op, a, b, c, sline(expr))
+	lhs, reg2, lsingle := compileConstOperand(context, expr.Lhs, reg, true)
+	infixLine(context, lhs, lsingle, sline(expr))
+	rhs, rnext, _ := compileConstOperand(context, expr.Rhs, reg2, true)
+	emitArith(context, a, lhs, rhs, arithOpForOperator(expr.Operator), rnext, sline(expr))
 } // }}}
 
 func compileStringConcatOpExpr(context *funcContext, reg int, expr *ast.StringConcatOpExpr, ec *expcontext) { // {{{
@@ -1576,7 +3236,14 @@ func compileStringConcatOpExpr(context *funcContext, reg int, expr *ast.StringCo
 	for pc := code.LastPC(); pc != 0 && opGetOpCode(code.At(pc)) == OP_CONCAT; pc-- {
 		code.Pop()
 	}
-	code.AddABC(OP_CONCAT, a, basereg, basereg+crange, sline(expr))
+	// CONCAT's operands are R[A]..R[A+B-1] (the result overwrites the
+	// first operand); a local-target destination gets the result moved
+	if a != basereg {
+		code.AddABC(OP_CONCAT, basereg, crange+1, 0, sline(expr))
+		code.AddABC(OP_MOVE, a, basereg, 0, sline(expr))
+	} else {
+		code.AddABC(OP_CONCAT, a, crange+1, 0, sline(expr))
+	}
 } // }}}
 
 func compileUnaryOpExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) { // {{{
@@ -1594,13 +3261,23 @@ func compileUnaryOpExpr(context *funcContext, reg int, expr ast.Expr, ec *expcon
 		ex, _ = exp.(*ast.UnaryMinusOpExpr)
 		operandexpr = ex.Expr
 		opcode = OP_UNM
+	case *ast.UnaryBNotOpExpr:
+		exp := constFold(ex)
+		if lvexpr, ok := exp.(*constLValueExpr); ok {
+			exp.SetLine(sline(expr))
+			compileExpr(context, reg, lvexpr, ec)
+			return
+		}
+		ex, _ = exp.(*ast.UnaryBNotOpExpr)
+		operandexpr = ex.Expr
+		opcode = OP_BNOT
 	case *ast.UnaryNotOpExpr:
 		switch ex.Expr.(type) {
 		case *ast.TrueExpr:
-			code.AddABC(OP_LOADBOOL, savereg(ec, reg), 0, 0, sline(expr))
+			code.AddABC(OP_LOADFALSE, savereg(ec, reg), 0, 0, sline(expr))
 			return
 		case *ast.FalseExpr, *ast.NilExpr:
-			code.AddABC(OP_LOADBOOL, savereg(ec, reg), 1, 0, sline(expr))
+			code.AddABC(OP_LOADTRUE, savereg(ec, reg), 0, 0, sline(expr))
 			return
 		default:
 			opcode = OP_NOT
@@ -1617,37 +3294,134 @@ func compileUnaryOpExpr(context *funcContext, reg int, expr ast.Expr, ec *expcon
 	code.AddABC(opcode, a, b, 0, sline(expr))
 } // }}}
 
+// compileRelationalOpExprAux emits a comparison feeding a jump, porting
+// stock's codeeq/codeorder selection: register operands with EQ/LT/LE,
+// sC immediates with EQI/LTI/LEI/GTI/GEI (C marking a float-sourced
+// immediate), pooled constants with EQK. k selects which comparison
+// outcome takes the following jump (docondjump: cond == k → jump,
+// cond != k → skip it).
 func compileRelationalOpExprAux(context *funcContext, reg int, expr *ast.RelationalOpExpr, flip int, label int) { // {{{
 	code := context.Code
-	b := reg
-	compileExprWithKMVPropagation(context, expr.Lhs, &reg, &b)
-	c := reg
-	compileExprWithKMVPropagation(context, expr.Rhs, &reg, &c)
-	switch expr.Operator {
-	case "<":
-		code.AddABC(OP_LT, 0^flip, b, c, sline(expr))
+	lhs, reg2, lsingle := compileConstOperand(context, expr.Lhs, reg, false)
+	infixLine(context, lhs, lsingle, sline(expr))
+	rhs, rnext, _ := compileConstOperand(context, expr.Rhs, reg2, false)
+	line := sline(expr)
+
+	// (a > b) <=> (b < a); (a >= b) <=> (b <= a) — swap the operand
+	// descriptors and compile the mirrored operator (stock luaK_posfix)
+	operator := expr.Operator
+	switch operator {
 	case ">":
-		code.AddABC(OP_LT, 0^flip, c, b, sline(expr))
-	case "<=":
-		code.AddABC(OP_LE, 0^flip, b, c, sline(expr))
+		lhs, rhs = rhs, lhs
+		operator = "<"
 	case ">=":
-		code.AddABC(OP_LE, 0^flip, c, b, sline(expr))
-	case "==":
-		code.AddABC(OP_EQ, 0^flip, b, c, sline(expr))
-	case "~=":
-		code.AddABC(OP_EQ, 1^flip, b, c, sline(expr))
+		lhs, rhs = rhs, lhs
+		operator = "<="
 	}
-	code.AddASbx(OP_JMP, 0, label, sline(expr))
+
+	// operand materializer: the register a (possibly constant) operand
+	// lands in, allocating a scratch register when needed
+	operandReg := func(o *opnd) int {
+		if o.kind == opndReg {
+			return o.reg
+		}
+		o.reg = rnext
+		materializeReg(context, *o, rnext, line)
+		rnext++
+		return o.reg
+	}
+
+	switch operator {
+	case "==", "~=":
+		k := 0
+		if operator == "~=" {
+			k = 1
+		}
+		k ^= flip
+		// the register operand must come first (stock codeeq swaps a
+		// leading constant away; == is commutative)
+		if lhs.kind != opndReg && rhs.kind == opndReg {
+			lhs, rhs = rhs, lhs
+		}
+		v1 := operandReg(&lhs)
+		switch {
+		case rhs.kind == opndInt && fitsC(rhs.ival):
+			code.AddABCk(OP_EQI, v1, int2sC(int(rhs.ival)), 0, k, line)
+		case rhs.kind == opndFloat && fitsC(rhs.ival):
+			code.AddABCk(OP_EQI, v1, int2sC(int(rhs.ival)), 1, k, line)
+		case rhs.kind != opndReg && materializeK(context, rhs) <= opMaxIndexK:
+			code.AddABCk(OP_EQK, v1, materializeK(context, rhs), 0, k, line)
+		default:
+			v2 := operandReg(&rhs)
+			code.AddABCk(OP_EQ, v1, v2, 0, k, line)
+		}
+	case "<", "<=":
+		// immediate second operand → LTI/LEI; immediate first operand →
+		// the mirrored GTI/GEI over the SECOND operand's register
+		if imm, isFloat, ok := orderImmediate(rhs); ok && lhs.kind == opndReg {
+			code.AddABCk(opLTI(operator), lhs.reg, int2sC(imm), boolInt(isFloat), flip, line)
+			code.AddSJ(OP_JMP, label, line)
+			return
+		}
+		if imm, isFloat, ok := orderImmediate(lhs); ok && rhs.kind == opndReg {
+			code.AddABCk(opGTI(operator), rhs.reg, int2sC(imm), boolInt(isFloat), flip, line)
+			code.AddSJ(OP_JMP, label, line)
+			return
+		}
+		v1 := operandReg(&lhs)
+		v2 := operandReg(&rhs)
+		code.AddABCk(opLT(operator), v1, v2, 0, flip, line)
+	}
+	code.AddSJ(OP_JMP, label, line)
 } // }}}
+
+// the order-op opcode selectors ("<"→LTI, "<="→LEI, and the GTI/GEI
+// mirrors used when the immediate is the first operand)
+func opLTI(operator string) int {
+	if operator == "<=" {
+		return OP_LEI
+	}
+	return OP_LTI
+}
+
+func opGTI(operator string) int {
+	if operator == "<=" {
+		return OP_GEI
+	}
+	return OP_GTI
+}
+
+func opLT(operator string) int {
+	if operator == "<=" {
+		return OP_LE
+	}
+	return OP_LT
+}
+
+// orderImmediate extracts the sC immediate of a numeric constant operand
+// for the order-comparison family (stock isSCnumber).
+func orderImmediate(o opnd) (imm int, isFloat bool, ok bool) {
+	switch o.kind {
+	case opndInt:
+		if fitsC(o.ival) {
+			return int(o.ival), false, true
+		}
+	case opndFloat:
+		if fitsC(o.ival) {
+			return int(o.ival), true, true
+		}
+	}
+	return 0, false, false
+}
 
 func compileRelationalOpExpr(context *funcContext, reg int, expr *ast.RelationalOpExpr, ec *expcontext) { // {{{
 	a := savereg(ec, reg)
 	code := context.Code
 	jumplabel := context.NewLabel()
 	compileRelationalOpExprAux(context, reg, expr, 1, jumplabel)
-	code.AddABC(OP_LOADBOOL, a, 0, 1, sline(expr))
+	code.AddABC(OP_LFALSESKIP, a, 0, 0, sline(expr))
 	context.SetLabelPc(jumplabel, code.LastPC())
-	code.AddABC(OP_LOADBOOL, a, 1, 0, sline(expr))
+	code.AddABC(OP_LOADTRUE, a, 0, 0, sline(expr))
 } // }}}
 
 func compileLogicalOpExpr(context *funcContext, reg int, expr *ast.LogicalOpExpr, ec *expcontext) { // {{{
@@ -1668,13 +3442,13 @@ func compileLogicalOpExpr(context *funcContext, reg int, expr *ast.LogicalOpExpr
 
 	if lb.b {
 		context.SetLabelPc(lb.f, code.LastPC())
-		code.AddABC(OP_LOADBOOL, a, 0, 1, sline(expr))
+		code.AddABC(OP_LFALSESKIP, a, 0, 0, sline(expr))
 		context.SetLabelPc(lb.t, code.LastPC())
-		code.AddABC(OP_LOADBOOL, a, 1, 0, sline(expr))
+		code.AddABC(OP_LOADTRUE, a, 0, 0, sline(expr))
 	}
 
 	lastinst := code.Last()
-	if opGetOpCode(lastinst) == OP_JMP && opGetArgSbx(lastinst) == endlabel {
+	if opGetOpCode(lastinst) == OP_JMP && opGetArgsJ(lastinst) == endlabel {
 		code.Pop()
 	}
 
@@ -1682,7 +3456,6 @@ func compileLogicalOpExpr(context *funcContext, reg int, expr *ast.LogicalOpExpr
 } // }}}
 
 func compileLogicalOpExprAux(context *funcContext, reg int, expr ast.Expr, ec *expcontext, thenlabel, elselabel int, hasnextcond bool, lb *lblabels) { // {{{
-	// TODO folding constants?
 	code := context.Code
 	flip := 0
 	jumplabel := elselabel
@@ -1694,34 +3467,34 @@ func compileLogicalOpExprAux(context *funcContext, reg int, expr ast.Expr, ec *e
 	switch ex := expr.(type) {
 	case *ast.FalseExpr:
 		if elselabel == lb.e {
-			code.AddASbx(OP_JMP, 0, lb.f, sline(expr))
+			code.AddSJ(OP_JMP, lb.f, sline(expr))
 			lb.b = true
 		} else {
-			code.AddASbx(OP_JMP, 0, elselabel, sline(expr))
+			code.AddSJ(OP_JMP, elselabel, sline(expr))
 		}
 		return
 	case *ast.NilExpr:
 		if elselabel == lb.e {
 			compileExpr(context, reg, expr, ec)
-			code.AddASbx(OP_JMP, 0, lb.e, sline(expr))
+			code.AddSJ(OP_JMP, lb.e, sline(expr))
 		} else {
-			code.AddASbx(OP_JMP, 0, elselabel, sline(expr))
+			code.AddSJ(OP_JMP, elselabel, sline(expr))
 		}
 		return
 	case *ast.TrueExpr:
 		if thenlabel == lb.e {
-			code.AddASbx(OP_JMP, 0, lb.t, sline(expr))
+			code.AddSJ(OP_JMP, lb.t, sline(expr))
 			lb.b = true
 		} else {
-			code.AddASbx(OP_JMP, 0, thenlabel, sline(expr))
+			code.AddSJ(OP_JMP, thenlabel, sline(expr))
 		}
 		return
 	case *ast.NumberExpr, *ast.StringExpr:
 		if thenlabel == lb.e {
 			compileExpr(context, reg, expr, ec)
-			code.AddASbx(OP_JMP, 0, lb.e, sline(expr))
+			code.AddSJ(OP_JMP, lb.e, sline(expr))
 		} else {
-			code.AddASbx(OP_JMP, 0, thenlabel, sline(expr))
+			code.AddSJ(OP_JMP, thenlabel, sline(expr))
 		}
 		return
 	case *ast.LogicalOpExpr:
@@ -1760,12 +3533,18 @@ func compileLogicalOpExprAux(context *funcContext, reg int, expr ast.Expr, ec *e
 	isLastOr := thenlabel == lb.e && hasnextcond
 
 	if ident, ok := expr.(*ast.IdentExpr); ok && (isLastAnd || isLastOr) && getIdentRefType(context, context, ident) == ecLocal {
-		b := context.FindLocalVar(ident.Value)
+		idx := context.FindLocalVar(ident.Value)
+		// U5b: TESTSET/TEST of the named vararg parameter is a whole-value
+		// use (the truth test reads the table) — promote
+		if context.kindOfVar(idx) == varKindVararg {
+			context.promoteVatab()
+		}
+		b := context.regOfVar(idx)
 		op := OP_TESTSET
 		if sreg == b {
 			op = OP_TEST
 		}
-		code.AddABC(op, sreg, b, 0^flip, sline(expr))
+		code.AddABCk(op, sreg, b, 0, flip, sline(expr))
 	} else if !hasnextcond && thenlabel == elselabel {
 		reg += compileExpr(context, reg, expr, &expcontext{ec.ctype, intMax(a, sreg), ec.varargopt})
 		last := context.Code.Last()
@@ -1777,12 +3556,12 @@ func compileLogicalOpExprAux(context *funcContext, reg int, expr ast.Expr, ec *e
 	} else {
 		reg += compileExpr(context, reg, expr, ecnone(0))
 		if !hasnextcond {
-			code.AddABC(OP_TEST, a, 0, 0^flip, sline(expr))
+			code.AddABCk(OP_TEST, a, 0, 0, flip, sline(expr))
 		} else {
-			code.AddABC(OP_TESTSET, sreg, a, 0^flip, sline(expr))
+			code.AddABCk(OP_TESTSET, sreg, a, 0, flip, sline(expr))
 		}
 	}
-	code.AddASbx(OP_JMP, 0, jumplabel, sline(expr))
+	code.AddSJ(OP_JMP, jumplabel, sline(expr))
 } // }}}
 
 func compileFuncCallExpr(context *funcContext, reg int, expr *ast.FuncCallExpr, ec *expcontext) int { // {{{
@@ -1801,8 +3580,17 @@ func compileFuncCallExpr(context *funcContext, reg int, expr *ast.FuncCallExpr, 
 	} else { // hoge:method()
 		b := reg
 		compileExprWithMVPropagation(context, expr.Receiver, &reg, &b)
-		c := loadRk(context, &reg, expr, LString(expr.Method))
-		context.Code.AddABC(OP_SELF, funcreg, b, c, sline(expr))
+		if kidx := context.ConstIndex(LString(expr.Method)); kidx <= opMaxIndexK {
+			context.Code.AddABC(OP_SELF, funcreg, b, kidx, sline(expr))
+		} else {
+			// long method names past the K range: stock's fallback
+			// (luaK_self) — MOVE the receiver, GETTABLE the method
+			keyreg := reg
+			reg++
+			context.Code.AddABx(OP_LOADK, keyreg, kidx, sline(expr))
+			context.Code.AddABC(OP_MOVE, funcreg+1, b, 0, sline(expr))
+			context.Code.AddABC(OP_GETTABLE, funcreg, b, keyreg, sline(expr))
+		}
 		// increments a register for an implicit "self"
 		reg = b + 1
 		reg2 := funcreg + 2
@@ -1826,7 +3614,7 @@ func compileFuncCallExpr(context *funcContext, reg int, expr *ast.FuncCallExpr, 
 		b = 0
 	}
 	context.Code.AddABC(OP_CALL, funcreg, b, ec.varargopt+2, sline(expr))
-	context.Proto.DbgCalls = append(context.Proto.DbgCalls, DbgCall{Pc: context.Code.LastPC(), Name: name})
+	context.Proto.DbgCalls = append(context.Proto.DbgCalls, DbgCall{Pc: context.Code.LastPC(), Name: name, Method: expr.Func == nil})
 
 	if ec.varargopt == 0 && shouldmove(ec, funcreg) {
 		context.Code.AddABC(OP_MOVE, ec.reg, funcreg, 0, sline(expr))
@@ -1838,29 +3626,212 @@ func compileFuncCallExpr(context *funcContext, reg int, expr *ast.FuncCallExpr, 
 	return ec.varargopt + 1
 } // }}}
 
-func loadRk(context *funcContext, reg *int, expr ast.Expr, cnst LValue) int { // {{{
-	cindex := context.ConstIndex(cnst)
-	if cindex <= opMaxIndexRk {
-		return opRkAsk(cindex)
-	} else {
-		ret := *reg
-		*reg++
-		context.Code.AddABx(OP_LOADK, ret, cindex, sline(expr))
-		return ret
-	}
-} // }}}
-
+// getIdentRefType classifies a name: a local of the compiling function
+// (ecLocal), a local of an enclosing function or a named upvalue visible
+// through the chain (ecUpvalue — the closure-capture loop wires the cell
+// at OP_CLOSURE), or ecGlobal. U1 (D3): globals resolve through _ENV, so
+// the upvalue pool itself is a resolution target — the main chunk's _ENV
+// lives there (Compile registers it at index 0), and that is also how a
+// nested function finds it before the chain falls off to ecGlobal.
 func getIdentRefType(context *funcContext, current *funcContext, expr *ast.IdentExpr) expContextType { // {{{
 	if current == nil {
+		// U5a (stock buildvar): the name fell through local/upvalue
+		// resolution everywhere — it is a global ACCESS, subject to the
+		// declaring function's preambular state
+		checkGlobalAccess(context, expr.Value, sline(expr))
 		return ecGlobal
-	} else if current.FindLocalVar(expr.Value) > -1 {
-		if current == context {
-			return ecLocal
+	}
+	// U5a: one descending walk over this level's blocks — locals and named
+	// global declarations interleave by declaration order (stock's flat
+	// actvar array in searchvar), the newest entry shadowing regardless of
+	// kind: `do global X; X = 20 end` writes the global even with an outer
+	// local X (goto.lua:311), and an enclosing function's `global var1
+	// <const>` locks nested function writes (locals.lua:217 — VGLOBAL
+	// propagates through singlevaraux's recursion)
+	for block := current.Block; block != nil; block = block.Parent {
+		pool := block.LocalVars
+		for i := len(pool.names) - 1; i >= 0; i-- {
+			if isGlobalKind(pool.kinds[i]) {
+				if pool.names[i] == expr.Value { // '*' matches no program name
+					if envIsGlobal(context) {
+						raiseCompileError(context, sline(expr), "_ENV is global when accessing variable '%s'", expr.Value)
+					}
+					return ecGlobal
+				}
+				continue
+			}
+			if pool.names[i] == expr.Value {
+				// U5a (stock searchvar's local arm): an RDKCTC entry
+				// resolves as VCONST at any chain level — never a local,
+				// never an upvalue (singlevaraux returns without
+				// capturing; the value folds from the owning function's
+				// Vardesc)
+				idx := i + pool.offset
+				if current.kindOfVar(idx) == varKindCTC {
+					return ecConst
+				}
+				if current == context {
+					return ecLocal
+				}
+				return ecUpvalue
+			}
 		}
+	}
+	if current.Upvalues.Find(expr.Value) > -1 {
 		return ecUpvalue
 	}
 	return getIdentRefType(context, current.Parent, expr)
 } // }}}
+
+/*
+globalDeclState ports stock searchvar's preambular walk (lparser.c:414)
+for a name that resolves as a global in the function being compiled:
+walking the active entries innermost-out (descending index), a NAMED
+global declaration that does not match voids the implicit preamble
+(`variable 'x' not declared` from then on) — but a matching named entry
+RESOLVES immediately (the walk returns; voiding collected on the way
+dies with it, stock overwrites u.info with the match's index). A
+collective `global *` entry records whenever no collective was seen yet
+(even after voiding — stock records while u.info < 0) and re-opens the
+preamble for everything below it. U5a fix: stock's u.info accumulates
+across singlevaraux's WHOLE recursion — each level's entries, then its
+upvalue pool (a hit there stops the walk: the name resolved as an
+upvalue), then the enclosing level. An enclosing function's named
+declaration is therefore visible to nested functions (locking writes
+and rescuing the name from not-declared); locals are already excluded —
+resolution never falls through to the global arm while one matches.
+*/
+func globalDeclState(fc *funcContext, name string) (starKind, namedKind int, found, voided bool) {
+	starKind, namedKind = -1, -1
+	starSeen, voided := false, false
+	for fn := fc; fn != nil; fn = fn.Parent {
+		for block := fn.Block; block != nil; block = block.Parent {
+			pool := block.LocalVars
+			for i := len(pool.names) - 1; i >= 0; i-- {
+				kind := pool.kinds[i]
+				if !isGlobalKind(kind) {
+					continue
+				}
+				if pool.names[i] == globalStarName {
+					if !starSeen { // the innermost collective entry wins
+						starSeen = true
+						starKind = kind
+					}
+				} else if pool.names[i] == name {
+					// the match wins outright: entries below it (outer) never
+					// apply (stock returns VGLOBAL here)
+					namedKind = kind
+					return starKind, namedKind, true, false
+				} else if !starSeen && !voided {
+					// a non-matching named declaration voids the implicit
+					// preamble (until a collective entry re-opens it — stock
+					// voids only while u.info == -1)
+					voided = true
+				}
+			}
+		}
+		if fn.Upvalues.Find(name) > -1 {
+			break // resolved as an upvalue at this level (stock searchupvalue)
+		}
+	}
+	// a collective entry anywhere in scope wins over the voiding (stock
+	// overwrites info -2 with the star's index)
+	return starKind, namedKind, false, voided && !starSeen
+}
+
+// envIsGlobal reports whether _ENV itself resolves as a global
+// declaration (stock buildglobal's semerror condition — reachable only
+// through an explicit `global _ENV`, goto.lua:321): per chain level,
+// the innermost _ENV-named entry among locals and global declarations
+// decides, then the level's upvalue pool (singlevaraux's order).
+func envIsGlobal(context *funcContext) bool {
+	for fn := context; fn != nil; fn = fn.Parent {
+		for block := fn.Block; block != nil; block = block.Parent {
+			pool := block.LocalVars
+			for i := len(pool.names) - 1; i >= 0; i-- {
+				if pool.names[i] != envUpvalueName {
+					continue
+				}
+				return isGlobalKind(pool.kinds[i])
+			}
+		}
+		if fn.Upvalues.Find(envUpvalueName) > -1 {
+			return false // resolved as an upvalue at this level
+		}
+	}
+	return false
+}
+
+// checkGlobalAccess raises stock buildvar/buildglobal's semerrors for a
+// name that resolves as a global in the function being compiled: the
+// not-declared error under a voided preamble (reads and writes alike —
+// searchvar's u.info == -2), then the `_ENV is global` error when _ENV
+// itself was declared global.
+func checkGlobalAccess(context *funcContext, name string, line int) {
+	_, _, _, voided := globalDeclState(context, name)
+	if voided {
+		raiseCompileError(context, line, "variable '%s' not declared", name)
+	}
+	if envIsGlobal(context) {
+		raiseCompileError(context, line, "_ENV is global when accessing variable '%s'", name)
+	}
+}
+
+// checkGlobalWrite is checkGlobalAccess plus the read-only check: a
+// matching `global x <const>` entry or an active `global <const> *`
+// makes the assignment a compile error (stock check_readonly's
+// VINDEXUP/ro arm).
+func checkGlobalWrite(context *funcContext, name string, line int) {
+	checkGlobalAccess(context, name, line)
+	starKind, namedKind, found, _ := globalDeclState(context, name)
+	if (found && namedKind == varKindGlobalConst) || (!found && starKind == varKindGlobalConst) {
+		raiseCompileError(context, line, "attempt to assign to const variable '%s'", name)
+	}
+}
+
+// envUpvalueName is the upvalue globals resolve through (Lua 5.2's _ENV
+// scheme, upgrade plan D3).
+const envUpvalueName = "_ENV"
+
+// envConstAccess reports _ENV's folded constant when the function being
+// compiled sees _ENV as an RDKCTC entry (`local _ENV <const> = 11`,
+// attrib.lua:461): register-less, so the keyed-global sites must use the
+// constant itself as the table operand (stock discharges VCONST) — the
+// access then fails at runtime with "attempt to index a number value"
+// instead of silently falling through to the _ENV upvalue.
+func envConstAccess(context *funcContext) (LValue, bool) {
+	if idx := context.FindLocalVar(envUpvalueName); idx > -1 && context.kindOfVar(idx) == varKindCTC {
+		return context.ctcValOfVar(idx), true
+	}
+	return nil, false
+}
+
+// envAccess resolves how the function being compiled sees _ENV: either a
+// local (`local _ENV = t` shadows the upvalue and global accesses compile
+// as table reads on that register) or the _ENV upvalue (registered on
+// first use; for the main chunk Compile pre-registers it at index 0, for
+// any nested function RegisterUnique adds it and the OP_CLOSURE capture
+// descriptors wire the cell from the enclosing scope).
+func envAccess(context *funcContext) (localReg, upvalIdx int) {
+	if idx := context.FindLocalVar(envUpvalueName); idx > -1 {
+		// U5a: the consumers use this as a REGISTER operand (GETFIELD/
+		// SETFIELD B) — regOfVar, never the flat index (a `global *`
+		// preamble shifts flat indices without shifting registers)
+		// U5b: a vararg parameter named _ENV is used as a whole value
+		// (the environment table operand) — promote
+		if context.kindOfVar(idx) == varKindVararg {
+			context.promoteVatab()
+		}
+		return context.regOfVar(idx), -1
+	}
+	return -1, context.Upvalues.RegisterUnique(envUpvalueName)
+}
+
+// envUpvalueIndexOf is envAccess's upvalue arm (GETTABUP/SETTABUP B).
+func envUpvalueIndexOf(context *funcContext) int {
+	_, idx := envAccess(context)
+	return idx
+}
 
 func getExprName(context *funcContext, expr ast.Expr) string { // {{{
 	switch ex := expr.(type) {
@@ -1876,80 +3847,119 @@ func getExprName(context *funcContext, expr ast.Expr) string { // {{{
 	return "?"
 } // }}}
 
+// patchCode finalizes a proto: resolves label-id jump payloads to pc
+// offsets (with jump-to-jump chaining, stock luaK_finish) and computes
+// NumUsedRegisters from the instruction stream.
 func patchCode(context *funcContext) { // {{{
 	maxreg := 1
 	if np := int(context.Proto.NumParameters); np > 1 {
 		maxreg = np
 	}
-	moven := 0
-	code := context.Code.List()
+	// an immutable snapshot: chain-following must read pristine label
+	// payloads, not offsets already written for earlier jumps
+	code := append([]uint32(nil), context.Code.List()...)
+
 	for pc := 0; pc < len(code); pc++ {
 		inst := code[pc]
-		curop := opGetOpCode(inst)
-		switch curop {
-		case OP_CLOSURE:
-			pc += int(context.Proto.FunctionPrototypes[opGetArgBx(inst)].NumUpvalues)
-			moven = 0
-			continue
-		case OP_SETGLOBAL, OP_SETUPVAL, OP_EQ, OP_LT, OP_LE, OP_TEST,
-			OP_TAILCALL, OP_RETURN, OP_FORPREP, OP_FORLOOP, OP_TFORLOOP,
-			OP_SETLIST, OP_CLOSE:
-			/* nothing to do */
+		switch opGetOpCode(inst) {
+		case OP_JMP: // resolve the label id to an sJ offset
+			label := opGetArgsJ(inst)
+			count := 0 // avoiding infinite loops
+			for count < 5 {
+				tpc := context.GetLabelPc(label) + 1
+				if tpc <= 0 || tpc >= len(code) || opGetOpCode(code[tpc]) != OP_JMP {
+					break
+				}
+				next := opGetArgsJ(code[tpc])
+				if next == label {
+					break
+				}
+				label = next
+				count++
+			}
+			distance := context.GetLabelPc(label) - pc
+			if distance > opMaxArgsJ-opOffsetSJ || distance < -(opOffsetSJ+1) {
+				raiseCompileError(context, context.Proto.LineDefined, "control structure too long")
+			}
+			context.Code.SetSJ(pc, distance)
+		case OP_LOADKX, OP_NEWTABLE:
+			pc++ // skip the EXTRAARG word (no register use)
+			if reg := opGetArgA(inst); reg > maxreg {
+				maxreg = reg
+			}
+		case OP_SETLIST:
+			if opGetArgk(inst) != 0 {
+				pc++ // EXTRAARG
+			}
+			if reg := opGetArgA(inst) + opGetArgvB(inst); reg > maxreg {
+				maxreg = reg
+			}
 		case OP_CALL:
 			if reg := opGetArgA(inst) + opGetArgC(inst) - 2; reg > maxreg {
 				maxreg = reg
 			}
-		case OP_VARARG:
+		case OP_TAILCALL:
 			if reg := opGetArgA(inst) + opGetArgB(inst) - 1; reg > maxreg {
 				maxreg = reg
+			}
+		case OP_RETURN:
+			if b := opGetArgB(inst); b != 0 {
+				if reg := opGetArgA(inst) + b - 2; reg > maxreg {
+					maxreg = reg
+				}
+			}
+		case OP_VARARG:
+			if c := opGetArgC(inst); c != 0 {
+				if reg := opGetArgA(inst) + c - 2; reg > maxreg {
+					maxreg = reg
+				}
 			}
 		case OP_SELF:
 			if reg := opGetArgA(inst) + 1; reg > maxreg {
 				maxreg = reg
 			}
 		case OP_LOADNIL:
-			if reg := opGetArgB(inst); reg > maxreg {
+			if reg := opGetArgA(inst) + opGetArgB(inst); reg > maxreg {
 				maxreg = reg
 			}
-		case OP_JMP: // jump to jump optimization
-			distance := 0
-			count := 0 // avoiding infinite loops
-			for jmp := inst; opGetOpCode(jmp) == OP_JMP && count < 5; jmp = context.Code.At(pc + distance + 1) {
-				d := context.GetLabelPc(opGetArgSbx(jmp)) - pc
-				if d > opMaxArgSbx {
-					if distance == 0 {
-						raiseCompileError(context, context.Proto.LineDefined, "too long to jump.")
-					}
-					break
-				}
-				distance = d
-				count++
+		case OP_CONCAT:
+			if reg := opGetArgA(inst) + opGetArgB(inst) - 1; reg > maxreg {
+				maxreg = reg
 			}
-			if distance == 0 {
-				context.Code.SetOpCode(pc, OP_NOP)
-			} else {
-				context.Code.SetSbx(pc, distance)
+		case OP_FORPREP, OP_FORLOOP:
+			if reg := opGetArgA(inst) + 2; reg > maxreg {
+				maxreg = reg
 			}
+		case OP_TFORLOOP:
+			if reg := opGetArgA(inst) + 3; reg > maxreg {
+				maxreg = reg
+			}
+		case OP_TFORCALL:
+			c := opGetArgC(inst)
+			if c < 2 {
+				c = 2 // the iterator call's state+control arguments
+			}
+			if reg := opGetArgA(inst) + 3 + c; reg > maxreg {
+				maxreg = reg
+			}
+		case OP_SETTABUP, OP_SETUPVAL, OP_CLOSE, OP_TBC, OP_RETURN0,
+			OP_RETURN1, OP_MMBIN, OP_MMBINI, OP_MMBINK, OP_EQ, OP_LT,
+			OP_LE, OP_EQK, OP_EQI, OP_LTI, OP_LEI, OP_GTI, OP_GEI,
+			OP_TEST, OP_TFORPREP, OP_EXTRAARG, OP_VARARGPREP:
+			/* no register result */
 		default:
 			if reg := opGetArgA(inst); reg > maxreg {
 				maxreg = reg
 			}
 		}
-
-		// bulk move optimization(reducing op dipatch costs)
-		if curop == OP_MOVE {
-			moven++
-		} else {
-			if moven > 1 {
-				context.Code.SetOpCode(pc-moven, OP_MOVEN)
-				context.Code.SetC(pc-moven, intMin(moven-1, opMaxArgsC))
-			}
-			moven = 0
-		}
 	}
 	maxreg++
-	if maxreg > maxRegisters {
-		raiseCompileError(context, context.Proto.LineDefined, "register overflow(too many local variables)")
+	// U5a: the window limit is MAX_FSTACK (255), not MAXVARS (200) — stock
+	// separates adjustlocalvars' declared-variable check from luaK_checkstack's
+	// maxstacksize; conflating them rejected legal 200-local chunks as soon as
+	// an expression needed a temp above register 200 (goto.lua:411).
+	if maxreg > maxFuncRegisters {
+		raiseErrorLimit(context, maxFuncRegisters, "registers")
 	}
 	context.Proto.NumUsedRegisters = uint8(maxreg)
 } // }}}
@@ -1972,6 +3982,11 @@ func Compile(chunk []ast.Stmt, name string) (proto *FunctionProto, err error) { 
 		funcexpr.SetLastLine(eline(chunk[len(chunk)-1]) + 1)
 	}
 	context := newFuncContext(name, nil)
+	// D3: the main chunk declares _ENV as upvalue 0 — the loader seeds
+	// the cell with the chunk's environment (load's env argument, the
+	// thread env by default); nested functions capture it through the
+	// normal OP_CLOSURE machinery.
+	context.Upvalues.Register(envUpvalueName)
 	compileFunctionExpr(context, funcexpr, ecnone(0))
 	proto = context.Proto
 	return

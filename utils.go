@@ -2,6 +2,7 @@ package lua
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -136,45 +137,186 @@ func isInteger(v LNumber) bool {
 	//return frac == 0.0
 }
 
-func isArrayKey(v LNumber) bool {
-	return isInteger(v) && v < LNumber(int((^uint(0))>>1)) && v > LNumber(0) && v < LNumber(MaxArrayIndex)
+// isNumberValue reports whether v belongs to one of the two "number"
+// subtypes (float or integer).
+func isNumberValue(v LValue) bool {
+	switch v.(type) {
+	case LNumber, LInteger:
+		return true
+	default:
+		return false
+	}
 }
 
-// parseNumber: string → LNumber with stock Lua 5.1 semantics (the vendored
-// runtime's luaO_str2d/strtod, which the wasm engines run): leading zeros
-// stay DECIMAL. The old ParseInt(s, 0) read "0255" as octal 173 — the
-// fuzzer caught `-(0 .. 255)` printing -173 on interp vs -255 on wasm.
-// Hex integers keep working via the 0x prefix (sign allowed, matching
-// strtod); underscores are not digits (Go's base-0 syntax is not Lua's).
-func parseNumber(number string) (LNumber, error) {
-	var value LNumber
+// floatToIntExact converts a float to its exact integer value (stock
+// luaV_flttointeger with F2Ieq): fails on NaN/±Inf and on any float with
+// a fractional part or outside the int64 range. Out-of-range floats must
+// be rejected BEFORE int64(f) — Go leaves that conversion
+// implementation-defined, unlike C's truncation contract.
+func floatToIntExact(f float64) (int64, bool) {
+	if f != f || f >= 9223372036854775808.0 || f < -9223372036854775808.0 {
+		return 0, false
+	}
+	i := int64(f)
+	if float64(i) == f {
+		return i, true
+	}
+	return 0, false
+}
+
+// intFitsFloat reports whether |i| <= 2^53: the range where float64(i)
+// round-trips exactly, so mixed int/float comparisons can compare as
+// floats (stock l_intfitsf).
+func intFitsFloat(i int64) bool {
+	return i <= 9007199254740992 && i >= -9007199254740992
+}
+
+// parseNumber: string → number with stock luaO_str2num semantics,
+// preserving the syntactic subtype (U2/D1): integer syntax yields LInteger
+// — plain hex accumulates in *unsigned* arithmetic and wraps (0xFFFFFFFFFFFFFFFF
+// == -1), decimal overflow falls back to float — while every dot- or
+// exponent-bearing form yields LNumber. Leading zeros stay DECIMAL ("0777"
+// is 777, never octal — the old ParseInt(s, 0) read "0255" as 173; the
+// fuzzer caught `-(0 .. 255)` printing -173 on interp vs -255 on wasm).
+// Hex floats ("0x1.8p3", and dot-bearing hex without a p-exponent, which
+// C's strtod accepts but Go's ParseFloat requires) and trailing-dot
+// decimal forms ("3.", "3.e5") normalize to Go syntax first. A leading
+// sign is accepted (string→number coercion; numeral literals never carry
+// one). Underscores are not digits (Go's base-0 syntax is not Lua's). The
+// parse package's numeralOK mirrors this acceptance for lex-time
+// validation.
+func parseNumber(number string) (LValue, error) {
 	number = strings.Trim(number, " \t\n\v\f\r")
 	if strings.IndexByte(number, '_') >= 0 {
 		return LNumber(0), fmt.Errorf("invalid number: %s", number)
 	}
 	body := number
+	sign := ""
 	if len(body) > 0 && (body[0] == '-' || body[0] == '+') {
-		body = body[1:]
+		sign, body = body[:1], body[1:]
 	}
 	isHex := len(body) > 1 && body[0] == '0' && (body[1] == 'x' || body[1] == 'X')
 	if isHex {
-		// strtod parses hex integers and hex floats ("0x1.8p3"); Go's
-		// ParseFloat needs a p-exponent, so take hex ints here first
-		if v, err := strconv.ParseInt(number, 0, LNumberBit); err == nil {
-			return LNumber(v), nil
+		h := body[2:]
+		if strings.IndexAny(h, ".pP") >= 0 {
+			if !numeralHasMantissaDigit(h, true) {
+				return LNumber(0), fmt.Errorf("invalid number: %s", number)
+			}
+			if v, err := strconv.ParseFloat(normalizeNumeral(number), LNumberBit); err == nil || errors.Is(err, strconv.ErrRange) {
+				return LNumber(v), nil
+			}
+		} else {
+			// plain hex integer: accumulate in unsigned arithmetic so
+			// more than 64 bits wraps exactly like stock l_str2int
+			// (0xFFFFFFFFFFFFFFFF parses as -1, not as a float)
+			u, ok := uint64(0), true
+			for i := 0; i < len(h); i++ {
+				d := hexDigitValue(h[i])
+				if d < 0 {
+					ok = false
+					break
+				}
+				u = u<<4 | uint64(d)
+			}
+			if ok && len(h) > 0 {
+				v := int64(u)
+				if sign == "-" {
+					v = -v
+				}
+				return LInteger(v), nil
+			}
+			// fall through: "0x" alone, trailing garbage, ...
 		}
-		if v, err := strconv.ParseUint(number, 0, LNumberBit); err == nil {
-			return LNumber(v), nil
-		}
-	} else if v, err := strconv.ParseInt(number, 10, LNumberBit); err == nil {
-		return LNumber(v), nil
-	}
-	if v2, err2 := strconv.ParseFloat(number, LNumberBit); err2 == nil {
-		value = LNumber(v2)
 	} else {
-		return LNumber(0), err2
+		if v, err := strconv.ParseInt(number, 10, LNumberBit); err == nil {
+			return LInteger(v), nil
+		}
+		// the mantissa must carry a digit — "." / "-." / ".e1" are not
+		// numbers even after the trailing-dot fixup (strtod contract)
+		if !numeralHasMantissaDigit(body, false) {
+			return LNumber(0), fmt.Errorf("invalid number: %s", number)
+		}
+		// decimal integer overflow (2^63 and beyond): float, per 5.4+
+		if v, err := strconv.ParseFloat(normalizeNumeral(number), LNumberBit); err == nil || errors.Is(err, strconv.ErrRange) {
+			return LNumber(v), nil
+		}
 	}
-	return value, nil
+	return LNumber(0), fmt.Errorf("invalid number: %s", number)
+}
+
+func hexDigitValue(c byte) int {
+	switch {
+	case '0' <= c && c <= '9':
+		return int(c - '0')
+	case 'a' <= c && c <= 'f':
+		return int(c-'a') + 10
+	case 'A' <= c && c <= 'F':
+		return int(c-'A') + 10
+	}
+	return -1
+}
+
+// normalizeNumeral adapts Lua numeral syntax to Go's ParseFloat: a digit
+// after a '.' not followed by one ("3." → "3.0", "3.e5" → "3.0e5") and,
+// for dot-bearing hex numerals without a p-exponent, an explicit "p0"
+// ("0x8.8" → "0x8.8p0" — C strtod accepts the bare form, Go requires the
+// exponent). The digit test is base-aware ('e' is a hex digit but a
+// decimal exponent marker). parse/lexer.go carries the same helper for
+// lex-time validation.
+func normalizeNumeral(s string) string {
+	b := []byte(s)
+	j := 0
+	if j < len(b) && (b[j] == '-' || b[j] == '+') {
+		j++
+	}
+	hex := j+1 < len(b) && b[j] == '0' && (b[j+1] == 'x' || b[j+1] == 'X')
+	for i := j; i < len(b); i++ {
+		if b[i] == '.' {
+			next := byte(0) // the end counts as "no digit follows"
+			if i+1 < len(b) {
+				next = b[i+1]
+			}
+			if !(isHexNumeralDigit(next) && (hex || (next >= '0' && next <= '9'))) {
+				b = append(b, 0)
+				copy(b[i+2:], b[i+1:])
+				b[i+1] = '0'
+				i++ // skip the inserted zero
+			}
+		}
+	}
+	t := string(b)
+	ht := t
+	if len(ht) > 0 && (ht[0] == '-' || ht[0] == '+') {
+		ht = ht[1:]
+	}
+	if len(ht) > 2 && ht[0] == '0' && (ht[1] == 'x' || ht[1] == 'X') && strings.IndexAny(ht, "pP") < 0 {
+		t += "p0"
+	}
+	return t
+}
+
+func isHexNumeralDigit(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+// numeralHasMantissaDigit reports whether the numeral's mantissa carries
+// at least one digit — C's strtod contract: "." and "0x." are not numbers
+// no matter what the trailing-dot fixup manufactures (math.lua:411,
+// not tonumber'.').
+func numeralHasMantissaDigit(body string, hex bool) bool {
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if isHexNumeralDigit(c) && (hex || (c >= '0' && c <= '9')) {
+			return true
+		}
+		if !hex && (c == 'e' || c == 'E') {
+			return false // exponent: the mantissa is complete
+		}
+		if hex && (c == 'p' || c == 'P') {
+			return false
+		}
+	}
+	return false
 }
 
 func popenArgs(arg string) (string, []string) {

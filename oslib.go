@@ -3,6 +3,7 @@ package lua
 import (
 	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -16,6 +17,8 @@ func getIntField(L *LState, tb *LTable, key string, v int) int {
 	ret := tb.RawGetString(key)
 
 	switch lv := ret.(type) {
+	case LInteger:
+		return int(lv)
 	case LNumber:
 		return int(lv)
 	case LString:
@@ -29,7 +32,7 @@ func getIntField(L *LState, tb *LTable, key string, v int) int {
 			}
 		}
 		if num, err := parseNumber(slv); err == nil {
-			return int(num)
+			return int(LVAsNumber(num))
 		}
 	default:
 		return v
@@ -77,6 +80,9 @@ func osDiffTime(L *LState) int {
 	return 1
 }
 
+// osExecute implements the 5.2 return contract: on success
+// (true, "exit", 0); on failure (nil, "exit"|"signal", status). (5.1
+// returned just the exit number; the nil becomes false in 5.3+.)
 func osExecute(L *LState) int {
 	var procAttr os.ProcAttr
 	procAttr.Files = []*os.File{os.Stdin, os.Stdout, os.Stderr}
@@ -84,23 +90,67 @@ func osExecute(L *LState) int {
 	args = append([]string{cmd}, args...)
 	process, err := os.StartProcess(cmd, args, &procAttr)
 	if err != nil {
+		L.Push(LNil)
+		L.Push(LString("exit"))
 		L.Push(LNumber(1))
-		return 1
+		return 3
 	}
 
 	ps, err := process.Wait()
 	if err != nil || !ps.Success() {
-		L.Push(LNumber(1))
-		return 1
+		reason := "exit"
+		code := 1
+		if err == nil {
+			if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				reason = "signal"
+				code = int(ws.Signal())
+			} else {
+				code = ps.ExitCode()
+			}
+		}
+		L.Push(LNil)
+		L.Push(LString(reason))
+		L.Push(LNumber(code))
+		return 3
 	}
+	L.Push(LTrue)
+	L.Push(LString("exit"))
 	L.Push(LNumber(0))
-	return 1
+	return 3
 }
 
+// osExit ports stock os_exit (5.4's two-argument shape): a boolean first
+// argument maps true→0 / false→1, anything else is the exit status
+// (default 0); a truthy second argument runs a full state close (every
+// live main-thread tbc/upvalue close, U4d) before exiting.
 func osExit(L *LState) int {
-	L.Close()
-	os.Exit(L.OptInt(1, 0))
-	return 1
+	status := 0
+	if b, ok := L.Get(1).(LBool); ok {
+		if !bool(b) {
+			status = 1
+		}
+	} else {
+		status = L.OptInt(1, 0)
+	}
+	if !LVIsFalse(L.Get(2)) {
+		L.Close()
+	}
+	os.Exit(status)
+	return 0
+}
+
+// setDateFields mirrors stock loslib.c setallfields: the os.date("*t")
+// table fields as integers, with yday/wday resolved and isdst a boolean.
+func setDateFields(ret *LTable, t time.Time) {
+	ret.RawSetString("year", LInteger(t.Year()))
+	ret.RawSetString("month", LInteger(int(t.Month())))
+	ret.RawSetString("day", LInteger(t.Day()))
+	ret.RawSetString("hour", LInteger(t.Hour()))
+	ret.RawSetString("min", LInteger(t.Minute()))
+	ret.RawSetString("sec", LInteger(t.Second()))
+	ret.RawSetString("yday", LInteger(t.YearDay()))
+	ret.RawSetString("wday", LInteger(int(t.Weekday())+1))
+	ret.RawSetString("isdst", LBool(t.IsDST()))
 }
 
 func osDate(L *LState) int {
@@ -120,17 +170,10 @@ func osDate(L *LState) int {
 			t = t.UTC()
 		}
 		if strings.HasPrefix(cfmt, "*t") {
+			// stock 5.5 setallfields: every field an integer (U3 tail),
+			// real yday/wday, isdst from the time value.
 			ret := L.NewTable()
-			ret.RawSetString("year", LNumber(t.Year()))
-			ret.RawSetString("month", LNumber(t.Month()))
-			ret.RawSetString("day", LNumber(t.Day()))
-			ret.RawSetString("hour", LNumber(t.Hour()))
-			ret.RawSetString("min", LNumber(t.Minute()))
-			ret.RawSetString("sec", LNumber(t.Second()))
-			ret.RawSetString("wday", LNumber(t.Weekday()+1))
-			// TODO yday & dst
-			ret.RawSetString("yday", LNumber(0))
-			ret.RawSetString("isdst", LFalse)
+			setDateFields(ret, t)
 			L.Push(ret)
 			return 1
 		}
@@ -193,11 +236,11 @@ func osSetEnv(L *LState) int {
 
 func osTime(L *LState) int {
 	if L.GetTop() == 0 {
-		L.Push(LNumber(time.Now().Unix()))
+		L.Push(LInteger(time.Now().Unix()))
 	} else {
 		lv := L.CheckAny(1)
 		if lv == LNil {
-			L.Push(LNumber(time.Now().Unix()))
+			L.Push(LInteger(time.Now().Unix()))
 		} else {
 			tbl, ok := lv.(*LTable)
 			if !ok {
@@ -210,12 +253,11 @@ func osTime(L *LState) int {
 			month := getIntField(L, tbl, "month", -1)
 			year := getIntField(L, tbl, "year", -1)
 			isdst := getBoolField(L, tbl, "isdst", false)
+			_ = isdst // stock lets isdst hint mktime; Go has no such hint
 			t := time.Date(year, time.Month(month), day, hour, min, sec, 0, time.Local)
-			// TODO dst
-			if false {
-				print(isdst)
-			}
-			L.Push(LNumber(t.Unix()))
+			// stock os.time normalizes the table (setallfields writeback)
+			setDateFields(tbl, t)
+			L.Push(LInteger(t.Unix()))
 		}
 	}
 	return 1

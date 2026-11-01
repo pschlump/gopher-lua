@@ -80,25 +80,23 @@ stack traceback:]])
 ok, result = xpcall(level1, function(err)
   return debug.traceback("msg", 9)
 end)
-assert(result == string.gsub([[msg
-stack traceback:
-@TAB@[G]: ?]], "@TAB@", "\t"))
+assert(result == [[msg
+stack traceback:]])
 local ok, result = xpcall(level1, function(err)
   return debug.traceback("msg", 0)
 end)
 
 assert(result == string.gsub([[msg
 stack traceback:
-@TAB@[G]: in function 'traceback'
-@TAB@issues.lua:87: in function <issues.lua:86>
-@TAB@[G]: in function 'error'
-@TAB@issues.lua:71: in function 'level4'
-@TAB@issues.lua:72: in function 'level3'
-@TAB@issues.lua:73: in function 'level2'
+@TAB@[C]: in field 'traceback'
+@TAB@issues.lua:86: in function <issues.lua:85>
+@TAB@[C]: in global 'error'
+@TAB@issues.lua:71: in upvalue 'level4'
+@TAB@issues.lua:72: in upvalue 'level3'
+@TAB@issues.lua:73: in upvalue 'level2'
 @TAB@issues.lua:74: in function <issues.lua:74>
-@TAB@[G]: in function 'xpcall'
-@TAB@issues.lua:86: in main chunk
-@TAB@[G]: ?]], "@TAB@", "\t"))
+@TAB@[C]: in global 'xpcall'
+@TAB@issues.lua:85: in main chunk]], "@TAB@", "\t"))
 
 local ok, result = xpcall(level1, function(err)
   return debug.traceback("msg", 3)
@@ -106,13 +104,12 @@ end)
 
 assert(result == string.gsub([[msg
 stack traceback:
-@TAB@issues.lua:71: in function 'level4'
-@TAB@issues.lua:72: in function 'level3'
-@TAB@issues.lua:73: in function 'level2'
+@TAB@issues.lua:71: in upvalue 'level4'
+@TAB@issues.lua:72: in upvalue 'level3'
+@TAB@issues.lua:73: in upvalue 'level2'
 @TAB@issues.lua:74: in function <issues.lua:74>
-@TAB@[G]: in function 'xpcall'
-@TAB@issues.lua:103: in main chunk
-@TAB@[G]: ?]], "@TAB@", "\t"))
+@TAB@[C]: in global 'xpcall'
+@TAB@issues.lua:101: in main chunk]], "@TAB@", "\t"))
 
 -- issue 81
 local tbl = {
@@ -164,7 +161,7 @@ assert(s:match("([^-]+)-world") == "hello")
 -- issue 93
 local t = {}
 local ok, msg = pcall(function() t.notfound() end)
-assert(not ok and string.find(msg, "attempt to call a non-function object", 1, true))
+assert(not ok and string.find(msg, "attempt to call a nil value", 1, true))
 
 -- issue 150
 local util = {
@@ -214,7 +211,7 @@ assert(message == "attempt to call a number value")
 ok, message = pcall(function()
   pcall()
 end)
-assert(not ok and string.find(message, "bad argument #1 to pcall", 1, true))
+assert(not ok and string.find(message, "bad argument #1 to 'pcall'", 1, true))
 
 -- issue 216
 local function bar()

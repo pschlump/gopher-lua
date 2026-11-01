@@ -10,105 +10,160 @@ import (
 const emptyLString LString = LString("")
 
 func OpenString(L *LState) int {
-	var mod *LTable
-	//_, ok := L.G.builtinMts[int(LTString)]
-	//if !ok {
-	mod = L.RegisterModule(StringLibName, strFuncs).(*LTable)
-	gmatch := L.NewClosure(strGmatch, L.NewFunction(strGmatchIter))
-	mod.RawSetString("gmatch", gmatch)
-	mod.RawSetString("gfind", gmatch)
-	mod.RawSetString("__index", mod)
-	L.G.builtinMts[int(LTString)] = mod
-	//}
+	mod := L.RegisterModule(StringLibName, strFuncs).(*LTable)
+	// U1 (D8 hard cut): gfind (the 5.0/5.1 alias for gmatch) is removed.
+	// U3c (row 58): the string metatable is a separate table carrying
+	// the arith metamethods + __index = the library (stock
+	// createmetatable shape) — the module table itself is no longer the
+	// metatable, so user overrides via getmetatable("") stay clean.
+	L.G.builtinMts[int(LTString)] = createStringMetatable(L, mod)
 	L.Push(mod)
 	return 1
 }
 
 var strFuncs = map[string]LGFunction{
-	"byte":    strByte,
-	"char":    strChar,
-	"dump":    strDump,
-	"find":    strFind,
-	"format":  strFormat,
-	"gsub":    strGsub,
-	"len":     strLen,
-	"lower":   strLower,
-	"match":   strMatch,
-	"rep":     strRep,
-	"reverse": strReverse,
-	"sub":     strSub,
-	"upper":   strUpper,
+	"byte":     strByte,
+	"char":     strChar,
+	"dump":     strDump,
+	"find":     strFind,
+	"format":   strFormat,
+	"gmatch":   strGmatch,
+	"gsub":     strGsub,
+	"len":      strLen,
+	"lower":    strLower,
+	"match":    strMatch,
+	"pack":     strPack,     // U3g (packlib.go)
+	"packsize": strPacksize, //
+	"unpack":   strUnpack,   //
+	"rep":      strRep,
+	"reverse":  strReverse,
+	"sub":      strSub,
+	"upper":    strUpper,
 }
 
-func strByte(L *LState) int {
-	str := L.CheckString(1)
-	start := L.OptInt(2, 1) - 1
-	end := L.OptInt(3, -1)
-	l := len(str)
-	if start < 0 {
-		start = l + start + 1
+// posRelatI ports posrelatI: relative initial position (negative counts
+// back from the end), clipped to [1, inf).
+func posRelatI(pos int64, l int) int64 {
+	if pos > 0 {
+		return pos
 	}
-	if end < 0 {
-		end = l + end + 1
-	}
-
-	if L.GetTop() == 2 {
-		if start < 0 || start >= l {
-			return 0
-		}
-		L.Push(LNumber(str[start]))
+	if pos == 0 {
 		return 1
 	}
-
-	start = intMax(start, 0)
-	end = intMin(end, l)
-	if end < 0 || end <= start || start >= l {
-		return 0
+	if pos < -int64(l) {
+		return 1
 	}
-
-	for i := start; i < end; i++ {
-		L.Push(LNumber(str[i]))
-	}
-	return end - start
+	return int64(l) + pos + 1
 }
 
+// getEndPos ports getendpos: optional ending position (default def),
+// clipped to [0, len].
+func getEndPos(L *LState, arg int, def int64, l int) int64 {
+	pos := optInteger(L, arg, def)
+	if pos > int64(l) {
+		return int64(l)
+	}
+	if pos >= 0 {
+		return pos
+	}
+	if pos < -int64(l) {
+		return 0
+	}
+	return int64(l) + pos + 1
+}
+
+// strByte ports str_byte: the byte values (integers) of every character
+// starting in [i, j] (j defaults to i); an empty interval returns no
+// values.
+func strByte(L *LState) int {
+	str := L.CheckString(1)
+	l := len(str)
+	pi := optInteger(L, 2, 1)
+	posi := posRelatI(pi, l)
+	pose := getEndPos(L, 3, pi, l)
+	if posi > pose {
+		return 0 // empty interval
+	}
+	if pose-posi >= 1<<31-1 {
+		L.RaiseError("string slice too long")
+	}
+	n := int(pose-posi) + 1
+	for i := 0; i < n; i++ {
+		L.Push(LInteger(int64(str[posi-1+int64(i)])))
+	}
+	return n
+}
+
+// strChar ports str_char: bytes from the (unsigned-checked) arguments.
 func strChar(L *LState) int {
 	top := L.GetTop()
-	bytes := make([]byte, L.GetTop())
+	bytes := make([]byte, top)
 	for i := 1; i <= top; i++ {
-		bytes[i-1] = uint8(L.CheckInt(i))
+		c := uint64(checkInteger(L, i))
+		if c > 255 {
+			L.ArgError(i, "value out of range")
+		}
+		bytes[i-1] = byte(c)
 	}
-	L.Push(LString(string(bytes)))
+	L.Push(LString(bytes))
 	return 1
 }
 
+// strDump is string.dump ([f [, strip]]) — U5f, stock lstrlib str_dump
+// over dump.go's ldump port. Only Lua functions dump (an ArgError
+// otherwise; stock's argcheck text), and the blob is the stock 5.5.1
+// precompiled format (load-compatible in both directions).
 func strDump(L *LState) int {
-	L.RaiseError("GopherLua does not support the string.dump")
+	fn := L.Get(1)
+	if lf, ok := fn.(*LFunction); ok && !lf.IsG {
+		strip := LVAsBool(L.Get(2))
+		L.Push(LString(dumpProto(lf.Proto, strip)))
+		return 1
+	}
+	L.ArgError(1, "Lua function expected")
 	return 0
 }
 
+// pmHasSpecials ports nospecials: whether the pattern contains any of
+// Lua's magic characters (a pattern without them is a plain substring).
+func pmHasSpecials(p string) bool {
+	return strings.ContainsAny(p, "^$*+?.([%-")
+}
+
+// strFind ports str_find_aux(find=1): init via posrelatI (start after
+// the string's end fails immediately); an empty pattern or plain=true
+// does a plain search; otherwise the pattern matcher. Positions are
+// integers.
 func strFind(L *LState) int {
 	str := L.CheckString(1)
 	pattern := L.CheckString(2)
-	if len(pattern) == 0 {
-		L.Push(LNumber(1))
-		L.Push(LNumber(0))
-		return 2
+	ls := len(str)
+	init := int(posRelatI(optInteger(L, 3, 1), ls)) - 1
+	if init > ls {
+		L.Push(LNil)
+		return 1
 	}
-	init := luaIndex2StringIndex(str, L.OptInt(3, 1), true)
 	plain := false
 	if L.GetTop() == 4 {
 		plain = LVAsBool(L.Get(4))
 	}
-
-	if plain {
+	if plain || !pmHasSpecials(pattern) {
+		if len(pattern) == 0 {
+			if init <= ls {
+				L.Push(LInteger(int64(init + 1)))
+				L.Push(LInteger(int64(init)))
+				return 2
+			}
+			L.Push(LNil)
+			return 1
+		}
 		pos := strings.Index(str[init:], pattern)
 		if pos < 0 {
 			L.Push(LNil)
 			return 1
 		}
-		L.Push(LNumber(init+pos) + 1)
-		L.Push(LNumber(init + pos + len(pattern)))
+		L.Push(LInteger(int64(init + pos + 1)))
+		L.Push(LInteger(int64(init + pos + len(pattern))))
 		return 2
 	}
 
@@ -121,11 +176,11 @@ func strFind(L *LState) int {
 		return 1
 	}
 	md := mds[0]
-	L.Push(LNumber(md.Capture(0) + 1))
-	L.Push(LNumber(md.Capture(1)))
+	L.Push(LInteger(int64(md.Capture(0) + 1)))
+	L.Push(LInteger(int64(md.Capture(1))))
 	for i := 2; i < md.CaptureLength(); i += 2 {
 		if md.IsPosCapture(i) {
-			L.Push(LNumber(md.Capture(i)))
+			L.Push(LInteger(int64(md.Capture(i))))
 		} else {
 			L.Push(LString(str[md.Capture(i):md.Capture(i+1)]))
 		}
@@ -133,17 +188,7 @@ func strFind(L *LState) int {
 	return md.CaptureLength()/2 + 1
 }
 
-func strFormat(L *LState) int {
-	str := L.CheckString(1)
-	args := make([]interface{}, L.GetTop()-1)
-	top := L.GetTop()
-	for i := 2; i <= top; i++ {
-		args[i-2] = L.Get(i)
-	}
-	npat := strings.Count(str, "%") - strings.Count(str, "%%")
-	L.Push(LString(fmt.Sprintf(str, args[:intMin(npat, len(args))]...)))
-	return 1
-}
+// strFormat lives in formatlib.go (the stock 5.5.1 port, U3c).
 
 func strGsub(L *LState) int {
 	str := L.CheckString(1)
@@ -158,7 +203,7 @@ func strGsub(L *LState) int {
 	}
 	if len(mds) == 0 {
 		L.SetTop(1)
-		L.Push(LNumber(0))
+		L.Push(LInteger(0))
 		return 2
 	}
 	switch lv := repl.(type) {
@@ -169,7 +214,8 @@ func strGsub(L *LState) int {
 	case *LFunction:
 		L.Push(LString(strGsubFunc(L, str, lv, mds)))
 	}
-	L.Push(LNumber(len(mds)))
+	// stock pushes the count as an integer (str_gsub's lua_pushinteger)
+	L.Push(LInteger(int64(len(mds))))
 	return 2
 }
 
@@ -178,12 +224,15 @@ type replaceInfo struct {
 	String   string
 }
 
+// checkCaptureIndex is stock get_onecapture's range check for a
+// replacement-side '%n': out of range errors with the digit as written
+// ("invalid capture index %2"; pm.lua:255).
 func checkCaptureIndex(L *LState, m *pm.MatchData, idx int) {
 	if idx <= 2 {
 		return
 	}
 	if idx >= m.CaptureLength() {
-		L.RaiseError("invalid capture index")
+		L.RaiseError("invalid capture index %%%d", idx/2)
 	}
 }
 
@@ -201,6 +250,11 @@ func capturedString(L *LState, m *pm.MatchData, str string, idx int) string {
 }
 
 func strGsubDoReplace(str string, info []replaceInfo) string {
+	if len(info) == 0 {
+		// stock str_gsub with zero substitutions returns the ORIGINAL
+		// string (same identity — pm.lua:428's string.format("%p") battery)
+		return str
+	}
 	offset := 0
 	buf := []byte(str)
 	for _, replace := range info {
@@ -218,27 +272,40 @@ func strGsubDoReplace(str string, info []replaceInfo) string {
 	return string(buf)
 }
 
+// strGsubStr ports stock add_s: '%%' is one '%', '%0' the whole match,
+// '%1'..'%9' the capture (a %1 with no captures is the whole match —
+// get_onecapture's i==0 case), and anything else after '%' — including a
+// trailing lone '%' — is "invalid use of '%' in replacement string"
+// (pm.lua:258's battery).
 func strGsubStr(L *LState, str string, repl string, matches []*pm.MatchData) string {
 	infoList := make([]replaceInfo, 0, len(matches))
 	for _, match := range matches {
 		start, end := match.Capture(0), match.Capture(1)
-		sc := newFlagScanner('%', "", "", repl)
-		for c, eos := sc.Next(); !eos; c, eos = sc.Next() {
-			if !sc.ChangeFlag {
-				if sc.HasFlag {
-					if c >= '0' && c <= '9' {
-						sc.AppendString(capturedString(L, match, str, 2*(int(c)-48)))
-					} else {
-						sc.AppendChar('%')
-						sc.AppendChar(c)
-					}
-					sc.HasFlag = false
-				} else {
-					sc.AppendChar(c)
-				}
+		buf := make([]byte, 0, len(repl))
+		for i := 0; i < len(repl); i++ {
+			if repl[i] != '%' {
+				buf = append(buf, repl[i])
+				continue
+			}
+			i++
+			c := byte(0) // a trailing lone '%' reads C's NUL: the error arm
+			if i < len(repl) {
+				c = repl[i]
+			}
+			switch {
+			case c == '%':
+				buf = append(buf, '%')
+			case '1' <= c && c <= '9':
+				buf = append(buf, capturedString(L, match, str, 2*(int(c)-48))...)
+			case c == '0':
+				buf = append(buf, str[start:end]...)
+			default:
+				// (the %s form keeps go vet's format check happy — the
+				// message itself contains a literal '%')
+				L.RaiseError("%s", "invalid use of '%' in replacement string")
 			}
 		}
-		infoList = append(infoList, replaceInfo{[]int{start, end}, sc.String()})
+		infoList = append(infoList, replaceInfo{[]int{start, end}, string(buf)})
 	}
 
 	return strGsubDoReplace(str, infoList)
@@ -258,6 +325,12 @@ func strGsubTable(L *LState, str string, repl *LTable, matches []*pm.MatchData) 
 			value = L.GetField(repl, str[match.Capture(idx):match.Capture(idx+1)])
 		}
 		if !LVIsFalse(value) {
+			// stock add_value: a truthy non-string replacement is an error
+			// ("invalid replacement value (a table)"; pm.lua:254) — nil or
+			// false keeps the original match
+			if !LVCanConvToString(value) {
+				L.RaiseError("invalid replacement value (a %s)", value.Type().String())
+			}
 			infoList = append(infoList, replaceInfo{[]int{match.Capture(0), match.Capture(1)}, LVAsString(value)})
 		}
 	}
@@ -286,6 +359,11 @@ func strGsubFunc(L *LState, str string, repl *LFunction, matches []*pm.MatchData
 		L.Call(nargs, 1)
 		ret := L.reg.Pop()
 		if !LVIsFalse(ret) {
+			// stock add_value (the function arm): a truthy non-string
+			// return is an error; nil/false keeps the original match
+			if !LVCanConvToString(ret) {
+				L.RaiseError("invalid replacement value (a %s)", ret.Type().String())
+			}
 			infoList = append(infoList, replaceInfo{[]int{start, end}, LVAsString(ret)})
 		}
 	}
@@ -294,20 +372,36 @@ func strGsubFunc(L *LState, str string, repl *LFunction, matches []*pm.MatchData
 
 type strMatchData struct {
 	str     string
+	pattern string // lazy: compiled by the first iterator call, like stock
+	init    int
 	pos     int
 	matches []*pm.MatchData
 }
 
+// strGmatchIter keeps its state in an UPVALUE (stock gmatch_aux reads
+// the GMatchState from upvalue 3) so the iterator also works called
+// without arguments — e.g. resumed across a coroutine via
+// coroutine.wrap(string.gmatch(...)).
 func strGmatchIter(L *LState) int {
-	md := L.CheckUserData(1).Value.(*strMatchData)
-	str := md.str
-	matches := md.matches
-	idx := md.pos
-	md.pos += 1
+	md, _ := L.Get(UpvalueIndex(1)).(*LUserData)
+	state := md.Value.(*strMatchData)
+	str := state.str
+	if state.matches == nil {
+		// stock constructs lazily: a malformed pattern raises at the
+		// FIRST iterator call (gmatch_aux), from this call site's
+		// position — not at construction (the ledger row for this fix)
+		mds, err := pm.Find(state.pattern, []byte(str), state.init, -1)
+		if err != nil {
+			L.RaiseError("%s", err.Error())
+		}
+		state.matches = mds
+	}
+	matches := state.matches
+	idx := state.pos
+	state.pos++
 	if idx == len(matches) {
 		return 0
 	}
-	L.Push(L.Get(1))
 	match := matches[idx]
 	if match.CaptureLength() == 2 {
 		L.Push(LString(str[match.Capture(0):match.Capture(1)]))
@@ -316,7 +410,7 @@ func strGmatchIter(L *LState) int {
 
 	for i := 2; i < match.CaptureLength(); i += 2 {
 		if match.IsPosCapture(i) {
-			L.Push(LNumber(match.Capture(i)))
+			L.Push(LInteger(int64(match.Capture(i))))
 		} else {
 			L.Push(LString(str[match.Capture(i):match.Capture(i+1)]))
 		}
@@ -324,52 +418,72 @@ func strGmatchIter(L *LState) int {
 	return match.CaptureLength()/2 - 1
 }
 
+// strGmatch ports gmatch: the iterator closure carries the match state
+// in an upvalue (it ignores its state/control arguments — gmatch_aux
+// reads everything from upvalues, so a resume across coroutine.wrap
+// works). U5f: stock 5.5 returns ONLY the iterator (the iterator+str+0
+// triple was the pre-5.4 convention; the generic-for adjust_assigns the
+// 4 control slots with nils); keeping 3 leaked "str, 0" into every
+// multret use — select("#", gmatch(...)) counted 3, and
+// getinfo(gmatch("abc","a")) read "abc" as the options string
+// (db.lua:739). 5.5 gained an init position (negative counts from the
+// end).
 func strGmatch(L *LState) int {
 	str := L.CheckString(1)
 	pattern := L.CheckString(2)
-	mds, err := pm.Find(pattern, []byte(str), 0, -1)
-	if err != nil {
-		L.RaiseError("%s", err.Error())
+	ls := len(str)
+	init := int(posRelatI(optInteger(L, 3, 1), ls)) - 1
+	if init < 0 {
+		init = 0
 	}
-	L.Push(L.Get(UpvalueIndex(1)))
+	// only the arguments are checked here — the pattern itself is
+	// compiled by the first iterator call (stock gmatch_aux; a
+	// malformed pattern raises there, pcall-catchable like stock)
 	ud := L.NewUserData()
-	ud.Value = &strMatchData{str, 0, mds}
-	L.Push(ud)
-	return 2
+	ud.Value = &strMatchData{str: str, pattern: pattern, init: init}
+	L.Push(L.NewClosure(strGmatchIter, ud))
+	return 1
 }
 
 func strLen(L *LState) int {
 	str := L.CheckString(1)
-	L.Push(LNumber(len(str)))
+	L.Push(LInteger(int64(len(str))))
 	return 1
 }
 
+// strLower/strUpper are byte-wise ASCII case conversions (stock runs
+// tolower/toupper per byte in the C locale — not UTF-8 aware).
 func strLower(L *LState) int {
 	str := L.CheckString(1)
-	L.Push(LString(strings.ToLower(str)))
+	b := []byte(str)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	L.Push(LString(b))
 	return 1
 }
 
+// strMatch ports str_find_aux(find=0): init via posrelatI; returns the
+// captures (or the whole match).
 func strMatch(L *LState) int {
 	str := L.CheckString(1)
 	pattern := L.CheckString(2)
-	offset := L.OptInt(3, 1)
 	l := len(str)
-	if offset < 0 {
-		offset = l + offset + 1
-	}
-	offset--
-	if offset < 0 {
-		offset = 0
+	init := int(posRelatI(optInteger(L, 3, 1), l)) - 1
+	if init > l {
+		L.Push(LNil)
+		return 1
 	}
 
-	mds, err := pm.Find(pattern, unsafeFastStringToReadOnlyBytes(str), offset, 1)
+	mds, err := pm.Find(pattern, unsafeFastStringToReadOnlyBytes(str), init, 1)
 	if err != nil {
 		L.RaiseError("%s", err.Error())
 	}
 	if len(mds) == 0 {
 		L.Push(LNil)
-		return 0
+		return 1
 	}
 	md := mds[0]
 	nsubs := md.CaptureLength() / 2
@@ -380,7 +494,7 @@ func strMatch(L *LState) int {
 	default:
 		for i := 2; i < md.CaptureLength(); i += 2 {
 			if md.IsPosCapture(i) {
-				L.Push(LNumber(md.Capture(i)))
+				L.Push(LInteger(int64(md.Capture(i))))
 			} else {
 				L.Push(LString(str[md.Capture(i):md.Capture(i+1)]))
 			}
@@ -389,14 +503,29 @@ func strMatch(L *LState) int {
 	}
 }
 
+// strRep ports str_rep: n copies joined by sep (n <= 0 or both empty →
+// ""), with stock's "resulting string too large" overflow guard.
 func strRep(L *LState) int {
 	str := L.CheckString(1)
-	n := L.CheckInt(2)
-	if n < 0 {
+	n := checkInteger(L, 2)
+	sep := L.OptString(3, "")
+	slen, lsep := int64(len(str)), int64(len(sep))
+	const maxSize = int64(1)<<62 - 1 // stock MAX_SIZE over size_t/lua_Integer
+	if n <= 0 || slen|lsep == 0 {
 		L.Push(emptyLString)
-	} else {
-		L.Push(LString(strings.Repeat(str, n)))
+		return 1
 	}
+	if slen > maxSize-lsep || slen+lsep > maxSize/n {
+		L.RaiseError("resulting string too large")
+	}
+	buf := make([]byte, 0, int(n*(slen+lsep))-int(lsep))
+	for i := int64(0); i < n; i++ {
+		if i > 0 {
+			buf = append(buf, sep...)
+		}
+		buf = append(buf, str...)
+	}
+	L.Push(LString(buf))
 	return 1
 }
 
@@ -411,38 +540,30 @@ func strReverse(L *LState) int {
 	return 1
 }
 
+// strSub ports str_sub: posrelatI start, getendpos end (default -1).
 func strSub(L *LState) int {
 	str := L.CheckString(1)
-	start := luaIndex2StringIndex(str, L.CheckInt(2), true)
-	end := luaIndex2StringIndex(str, L.OptInt(3, -1), false)
 	l := len(str)
-	if start >= l || end < start {
-		L.Push(emptyLString)
+	start := posRelatI(checkInteger(L, 2), l)
+	end := getEndPos(L, 3, -1, l)
+	if start <= end {
+		L.Push(LString(str[start-1 : end]))
 	} else {
-		L.Push(LString(str[start:end]))
+		L.Push(emptyLString)
 	}
 	return 1
 }
 
 func strUpper(L *LState) int {
 	str := L.CheckString(1)
-	L.Push(LString(strings.ToUpper(str)))
+	b := []byte(str)
+	for i, c := range b {
+		if 'a' <= c && c <= 'z' {
+			b[i] = c - ('a' - 'A')
+		}
+	}
+	L.Push(LString(b))
 	return 1
-}
-
-func luaIndex2StringIndex(str string, i int, start bool) int {
-	if start && i != 0 {
-		i -= 1
-	}
-	l := len(str)
-	if i < 0 {
-		i = l + i + 1
-	}
-	i = intMax(0, i)
-	if !start && i > l {
-		i = l
-	}
-	return i
 }
 
 //

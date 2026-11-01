@@ -5,11 +5,22 @@ import (
 	"strings"
 )
 
+// Vararg model flags (U5b, stock lobject.h PF_*): every vararg function
+// starts hidden-args (VARARGPREP copies func+params above the extras and
+// shifts the frame); a whole-value use / index write / upvalue capture of
+// the named parameter promotes the function to the table model at finish
+// time (needvatab — VARARGPREP then builds {1..n, n=n} into the param
+// slot, GETVARG rewrites to GETTABLE, VARARG gets k=1). NumParameters
+// counts the fixed params only — the vararg parameter itself occupies the
+// register AT NumParameters, reserved by parlist like stock's
+// `adjustlocalvars(ls, 1)` + `luaK_reserveregs`.
 const (
-	VarArgHasArg   uint8 = 1
-	VarArgIsVarArg uint8 = 2
-	VarArgNeedsArg uint8 = 4
+	VarArgHidden uint8 = 1 // PF_VAHID — hidden extra args (stock default)
+	VarArgTable  uint8 = 2 // PF_VATAB — materialized vararg table
 )
+
+// VarArgAny is the isvararg(p) test mask (either model marks the proto).
+const VarArgAny = VarArgHidden | VarArgTable
 
 type DbgLocalInfo struct {
 	Name    string
@@ -20,10 +31,33 @@ type DbgLocalInfo struct {
 type DbgCall struct {
 	Name string
 	Pc   int
+	// Method records a colon-syntax call site (`obj:name(...)`): stock's
+	// luaL_argerror does not count the implicit self in the argument
+	// number and has a dedicated "bad self" error for arg 1 (U3b).
+	Method bool
+}
+
+// Upvaldesc is a compiled upvalue-capture descriptor (U2c, stock
+// lobject.h Upvaldesc minus the kind field — <const> attributes arrive
+// with U5): InStack captures the parent's register Idx, otherwise the
+// parent's upvalue Idx. These replace the fork's old pseudo-instructions
+// after OP_CLOSURE.
+type Upvaldesc struct {
+	InStack bool
+	Idx     uint8
+	Name    string
 }
 
 type FunctionProto struct {
-	SourceName         string
+	SourceName string
+	// SourceIsNull marks stock's NULL source (U5f): a stripped binary
+	// chunk carries no source string, and getinfo/where render "?"
+	// shapes for it. A TEXT load with an explicit empty chunkname
+	// (load(s, "")) is a REAL empty source — `[string ""]` (db.lua:73)
+	// — so "" alone must not take the NULL path. Only the undump sets
+	// the flag (dumping an empty TString is size 0, identical to NULL,
+	// so every undumped empty source IS stock's NULL).
+	SourceIsNull       bool
 	LineDefined        int
 	LastLineDefined    int
 	NumUpvalues        uint8
@@ -33,6 +67,14 @@ type FunctionProto struct {
 	Code               []uint32
 	Constants          []LValue
 	FunctionPrototypes []*FunctionProto
+	Upvalues           []Upvaldesc
+
+	// EnvUpvalueIndex: the upvalue slot holding _ENV, the table global
+	// accesses resolve through (5.2 scheme, upgrade plan D3). -1 when the
+	// function references no globals. Used by the loader to seed the
+	// main chunk's _ENV cell (GETTABUP/SETTABUP address the cell by the
+	// B operand directly).
+	EnvUpvalueIndex int8
 
 	DbgSourcePositions []int
 	DbgLocals          []*DbgLocalInfo
@@ -50,6 +92,21 @@ type Upvalue struct {
 	index  int
 	value  LValue
 	closed bool
+	// lightID is the stable light userdata debug.upvalueid(f, n) hands
+	// out for this cell (U5c, stock returns the Upvalue pointer itself;
+	// the fork's pointer doubles as the Go map key, so a dedicated
+	// object preserves identity). Lazily created, never GC-visible.
+	lightID *LUserData
+}
+
+// UpvalueID returns the identity object for this upvalue cell — the
+// same cell answers the same light userdata, different cells different
+// ones (stock db_upvalueid's semantics over the Upvalue pointer).
+func (uv *Upvalue) UpvalueID() *LUserData {
+	if uv.lightID == nil {
+		uv.lightID = &LUserData{Light: true}
+	}
+	return uv.lightID
 }
 
 func (uv *Upvalue) Value() LValue {
@@ -96,9 +153,11 @@ func newFunctionProto(name string) *FunctionProto {
 		NumParameters:      0,
 		IsVarArg:           0,
 		NumUsedRegisters:   2,
+		EnvUpvalueIndex:    -1,
 		Code:               make([]uint32, 0, 128),
 		Constants:          make([]LValue, 0, 32),
 		FunctionPrototypes: make([]*FunctionProto, 0, 16),
+		Upvalues:           make([]Upvaldesc, 0, 8),
 
 		DbgSourcePositions: make([]int, 0, 128),
 		DbgLocals:          make([]*DbgLocalInfo, 0, 16),
@@ -182,16 +241,12 @@ func (fn *LFunction) LocalName(regno, pc int) (string, bool) {
 	if fn.IsG {
 		return "", false
 	}
-	p := fn.Proto
-	for i := 0; i < len(p.DbgLocals) && p.DbgLocals[i].StartPc < pc; i++ {
-		if pc < p.DbgLocals[i].EndPc {
-			regno--
-			if regno == 0 {
-				return p.DbgLocals[i].Name, true
-			}
-		}
-	}
-	return "", false
+	// U5f: stock luaF_getlocalname — the loop guard is startpc <= pc (a
+	// local is visible AT its own initializing instruction; the old strict
+	// < hid a local whose StartPc was exactly the query pc, so the
+	// return-hook battery saw the block's last-declared locals as
+	// "(temporary)", db.lua:515). localNameAt is the stock-exact walk.
+	return localNameAt(fn.Proto, regno, pc)
 }
 
 /* }}} */

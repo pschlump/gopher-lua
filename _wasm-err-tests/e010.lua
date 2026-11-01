@@ -1,1 +1,0 @@
-print(pcall(error, 'wrapped'))

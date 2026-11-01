@@ -26,21 +26,10 @@ var gluaTests []string = []string{
 	"goto.lua",
 }
 
-var luaTests []string = []string{
-	"attrib.lua",
-	"calls.lua",
-	"closure.lua",
-	"constructs.lua",
-	"events.lua",
-	"literals.lua",
-	"locals.lua",
-	"math.lua",
-	"sort.lua",
-	"strings.lua",
-	"vararg.lua",
-	"pm.lua",
-	"files.lua",
-}
+// The _lua5.1-tests interp leg (TestLua, two files by the end) was
+// retired with the corpus at U8: the 5.1 oracle, its engine, and the
+// vendored tree went together (ledger row 55's executed retirement).
+// Portable substance lives on in _u1 (TestU1Gate) and _lua5.5-tests.
 
 func testScriptCompile(t *testing.T, script string) {
 	file, err := os.Open(script)
@@ -141,10 +130,6 @@ func TestLocalVarFree(t *testing.T) {
 
 func TestGlua(t *testing.T) {
 	testScriptDir(t, gluaTests, "_glua-tests")
-}
-
-func TestLua(t *testing.T) {
-	testScriptDir(t, luaTests, "_lua5.1-tests")
 }
 
 func TestMergingLoadNilBug2(t *testing.T) {

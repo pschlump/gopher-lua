@@ -1,1 +1,0 @@
--- s0_nop: empty main chunk. Measures pure parse cost and pure VM startup.

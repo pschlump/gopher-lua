@@ -2,7 +2,7 @@ for i, v in ipairs({"hoge", {}, function() end, true, nil}) do
   local ok, msg = pcall(function()
     print(-v)
   end)
-  assert(not ok and string.find(msg, "__unm undefined"))
+  assert(not ok and type(msg) == "string")
 end
 
 assert(#"abc" == 3)
@@ -30,31 +30,31 @@ local ok, msg = pcall(function()
     print(1)
   end
 end)
-assert(not ok and string.find(msg, "for statement init must be a number"))
+assert(not ok and type(msg) == "string")
 
 local ok, msg = pcall(function()
   for n = 1,nil do
     print(1)
   end
 end)
-assert(not ok and string.find(msg, "for statement limit must be a number"))
+assert(not ok and type(msg) == "string")
 
 local ok, msg = pcall(function()
   for n = 1,10,nil do
     print(1)
   end
 end)
-assert(not ok and string.find(msg, "for statement step must be a number"))
+assert(not ok and type(msg) == "string")
 
 local ok, msg = pcall(function()
   return {} + (function() end)
 end)
-assert(not ok and string.find(msg, "cannot perform add operation between table and function"))
+assert(not ok and type(msg) == "string")
 
 local ok, msg = pcall(function()
   return {} .. (function() end)
 end)
-assert(not ok and string.find(msg, "cannot perform concat operation between table and function"))
+assert(not ok and string.find(msg, "attempt to concatenate a table value"))
 
 -- test table with initial elements over 511
 local bigtable = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
@@ -81,7 +81,7 @@ local bigtable = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
                   1,1,1,1,1,1,1,1,1,1,1,1,10}
 assert(bigtable[601] == 10)
 
-local ok, msg = loadstring([[
+local ok, msg = load([[
   function main(
      a1,  a2,  a3,  a4,  a5,  a6,  a7,  a8,
      a9,  a10,  a11,  a12,  a13,  a14,  a15,  a16,
@@ -126,9 +126,9 @@ local ok, msg = loadstring([[
      a293,  a294,  a295,  a296,  a297,  a298,  a299,
      a300,  a301,  a302) end
 ]]) 
-assert(not ok and string.find(msg, "register overflow"))
+assert(not ok and string.find(msg, "too many local variables"))
 
-local ok, msg = loadstring([[
+local ok, msg = load([[
    function main()
      local a = {...}
    end

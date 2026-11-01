@@ -53,11 +53,11 @@ func TestGlobalsProtectionErrors(t *testing.T) {
 		{"_G.pairs = nil return 1", "test:1: Attempt to modify a readonly table"},
 		{"return _G[nil]",
 			"test:1: Second argument to luaProtectedTableError must be a string or number"},
-		// rawset goes through baseRawSet, whose guard raises with the
-		// caller's position (a G-function level-1 raise) — the prefixed
-		// form in both the caught and uncaught shapes (the glasm bare-
-		// under-pcall form was a C-VM execution artifact; ledger row).
-		{"rawset(_G, 'g3', 1) return 1", "test:1: Attempt to modify a readonly table"},
+		// rawset goes through baseRawSet, whose guard raises BARE (level
+		// 0) — N5/Redis parity: the bytecode set paths carry "chunk:N:"
+		// but Redis's rawset builtin adds no position; the raise line
+		// still resolves (raise-time traceback) for the on-@ suffix.
+		{"rawset(_G, 'g3', 1) return 1", "Attempt to modify a readonly table"},
 	}
 	for _, c := range cases {
 		res, err := runProtected(t, e, c.src)

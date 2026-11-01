@@ -223,6 +223,17 @@ func TestHostFunctionErrors(t *testing.T) {
 	if se.ErrValue.Str != "ERR wrong number of arguments for 'get' command" {
 		t.Fatalf("verbatim error text: %q", se.ErrValue.Str)
 	}
+	// raise line: hostfn raises carry no position prefix, so the line is
+	// the raise-time traceback's top Lua frame — the Redis shape (its
+	// error handler reports the traceback's top line: "on @user_script:3")
+	_, err = runScript(t, e, "local a = 1\nlocal b = 2\nredis.call('GET')", RunOptions{})
+	se, ok = err.(*ScriptError)
+	if !ok {
+		t.Fatalf("multiline: want ScriptError, got %T %v", err, err)
+	}
+	if se.Line != 3 {
+		t.Fatalf("hostfn raise line: got %d, want 3 (traceback top frame)", se.Line)
+	}
 	// pcall catches it as a string value
 	res, err := runScript(t, e, `local ok, e = pcall(redis.call, 'GET') return ok, e`, RunOptions{})
 	if err != nil {

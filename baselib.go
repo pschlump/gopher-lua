@@ -634,8 +634,12 @@ func baseRawSet(L *LState) int {
 	if tb.readonly {
 		// N2: rawset is the one stdlib writer that bypasses setField (it
 		// IS the raw path) — the readonly guard lives here explicitly,
-		// matching the C engine's interposed luaH_* setters.
-		L.RaiseError("Attempt to modify a readonly table")
+		// matching the C engine's interposed luaH_* setters. Level 0
+		// (N5): Redis's rawset builtin raises BARE — the bytecode set
+		// paths carry "chunk:N:" (setField/setFieldString) but the raise
+		// from inside the C function adds no position; the raise site's
+		// line still reports via the raise-time traceback.
+		L.Error(LString("Attempt to modify a readonly table"), 0)
 	}
 	L.RawSet(tb, L.CheckAny(2), L.CheckAny(3))
 	return 0

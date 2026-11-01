@@ -308,6 +308,15 @@ func (vm *VM) reseed(seed int64) error {
 // outside the Lua error protocol (ApiErrorPanic — the engine-bug class,
 // glasm's TrapError analog) is returned as-is so the daemon logs it
 // rather than answering it as a script error.
+//
+// Line: the message's own position prefix wins (level-1 raises carry
+// "chunk:N:"); prefixless errors (level-0 raises, hostfn errors) take
+// the raise-time traceback — PCall captures the Lua stack trace while
+// the dying frames are still live, and its first positioned frame is
+// the innermost Lua frame. This is the Redis shape: its error handler
+// reports the traceback's top line whatever the raise level. (Reading
+// the frame stack after PCall returns cannot work — recovery restores
+// sp before returning, unwinding every frame the call pushed.)
 func mapError(err error, s *Script, rctx context.Context) error {
 	ae, ok := err.(*lua.ApiError)
 	if !ok {
@@ -335,7 +344,39 @@ func mapError(err error, s *Script, rctx context.Context) error {
 	if cerr != nil {
 		ev = String(ae.Object.String())
 	}
-	return &ScriptError{ErrValue: ev, Line: raiseLine(ae.Object, s.name)}
+	line := raiseLine(ae.Object, s.name)
+	if line == 0 {
+		line = tracebackTopLine(ae.StackTrace, s.name)
+	}
+	return &ScriptError{ErrValue: ev, Line: line}
+}
+
+// tracebackTopLine scans a raise-time Lua traceback for the first
+// positioned frame of the named chunk — the innermost Lua frame's
+// current line, the raise position for errors that carry no prefix of
+// their own. Traceback lines render "\t<chunkid>:<line>: in <what>"
+// (Go frames have no line and never match); 0 = nothing found.
+func tracebackTopLine(tb, name string) int {
+	if name == "" {
+		return 0
+	}
+	name = strings.TrimPrefix(name, "=")
+	prefix := name + ":"
+	for _, ln := range strings.Split(tb, "\n") {
+		ln = strings.TrimPrefix(ln, "\t")
+		if !strings.HasPrefix(ln, prefix) {
+			continue
+		}
+		rest := ln[len(prefix):]
+		i := strings.IndexByte(rest, ':')
+		if i <= 0 {
+			continue
+		}
+		if n, err := strconv.Atoi(rest[:i]); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 // raiseLine extracts the raise position from a string error value's

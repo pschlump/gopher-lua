@@ -32,6 +32,14 @@ type RunOptions struct {
 	// ("context deadline exceeded") at the first instruction after the
 	// deadline — pure-Go, preemptible at every instruction (the glasm
 	// row-99/100 STW-wedge class cannot occur). Zero disables the timer.
+	//
+	// The deadline/kill class is normalized on the way out (mapError):
+	// when the run context fired and the interpreter raised its message,
+	// the error crosses as ScriptError{String("context deadline
+	// exceeded"), Line: 0} — bare, no position — for the deadline timer,
+	// a Kill, and a caller-ctx cancel alike. The daemon-side manager
+	// (Ultima's RunOnVM shape) keys on exactly this pair and distinguishes
+	// the three cases via its own flags.
 	Deadline time.Duration
 	// Seed reseals the VM's math.random stream for this run
 	// (math.randomseed(n) over the interpreter's own stock xoshiro256**
@@ -253,7 +261,7 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 	fn := L.NewFunctionFromProto(s.Proto)
 	L.Push(fn)
 	if perr := L.PCall(0, lua.MultRet, nil); perr != nil {
-		return Result{}, mapError(perr, s)
+		return Result{}, mapError(perr, s, rctx)
 	}
 	n := L.GetTop() - base
 	vals := make([]Value, 0, max(n, 1))
@@ -293,16 +301,32 @@ func (vm *VM) reseed(seed int64) error {
 	return nil
 }
 
-// mapError classifies a PCall failure: Lua-level errors (ApiErrorRun /
-// ApiErrorSyntax — script raises, library errors, hostfn errors, the
-// deadline raise) become ScriptError with the exact error value; a Go
-// panic outside the Lua error protocol (ApiErrorPanic — the
-// engine-bug class, glasm's TrapError analog) is returned as-is so the
-// daemon logs it rather than answering it as a script error.
-func mapError(err error, s *Script) error {
+// mapError classifies a PCall failure: the deadline/kill class
+// normalizes to its bare contract first, then Lua-level errors
+// (ApiErrorRun / ApiErrorSyntax — script raises, library errors, hostfn
+// errors) become ScriptError with the exact error value; a Go panic
+// outside the Lua error protocol (ApiErrorPanic — the engine-bug class,
+// glasm's TrapError analog) is returned as-is so the daemon logs it
+// rather than answering it as a script error.
+func mapError(err error, s *Script, rctx context.Context) error {
 	ae, ok := err.(*lua.ApiError)
 	if !ok {
 		return err
+	}
+	// The deadline/kill class: the run context fired and the interpreter
+	// raised its message (with whatever position prefix the raise site
+	// carried). It crosses as the bare contract — Line 0, "context
+	// deadline exceeded" — for the deadline timer, Kill, and a
+	// caller-ctx cancel alike (the glasm runtime staged the same shape;
+	// its ledger row 37). The exact/suffix match keeps a script that
+	// errors this very text on the ordinary path when no context fired.
+	if cerr := rctx.Err(); cerr != nil {
+		if str, ok := ae.Object.(lua.LString); ok {
+			msg := string(str)
+			if msg == cerr.Error() || strings.HasSuffix(msg, ": "+cerr.Error()) {
+				return &ScriptError{ErrValue: String("context deadline exceeded"), Line: 0}
+			}
+		}
 	}
 	if ae.Type == lua.ApiErrorPanic {
 		return fmt.Errorf("host: engine-level failure (backend bug class): %w", err)
@@ -355,9 +379,10 @@ func (vm *VM) UsedBytes() int64 {
 
 // Kill cancels the in-flight run's context: the next instruction check
 // raises the ordinary (pcall-catchable) deadline-class error, exactly as
-// if the run's Deadline had fired. No-op between runs. This is the
-// SCRIPT KILL mechanism: the daemon's scripting manager calls it on the
-// VM a killable script is running on.
+// if the run's Deadline had fired — normalized per mapError to the bare
+// contract (ErrValue "context deadline exceeded", Line 0). No-op between
+// runs. This is the SCRIPT KILL mechanism: the daemon's scripting
+// manager calls it on the VM a killable script is running on.
 func (vm *VM) Kill() {
 	vm.cancelMu.Lock()
 	f := vm.cancel

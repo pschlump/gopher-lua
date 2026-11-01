@@ -463,14 +463,17 @@ func TestDeadlineKill(t *testing.T) {
 	if !ok {
 		t.Fatalf("want ScriptError, got %T %v", err, err)
 	}
-	if !strings.Contains(se.Error(), "context deadline exceeded") {
-		t.Fatalf("deadline text: %q", se.Error())
+	// the bare contract the daemon keys on (RunOptions.Deadline, mapError):
+	// no position, exactly this text — for the timer, Kill, and caller-ctx
+	// cancel alike
+	if se.ErrValue.Kind != KindString || se.ErrValue.Str != "context deadline exceeded" || se.Line != 0 {
+		t.Fatalf("deadline contract: want (String \"context deadline exceeded\", 0), got (%v, %d)", se.ErrValue, se.Line)
 	}
 	// the VM is reusable: the run context died with the run, and the
 	// same script can be killed again cleanly
 	_, err = vm.Run(context.Background(), s, RunOptions{Deadline: 250 * time.Millisecond})
 	se2, ok := err.(*ScriptError)
-	if !ok || !strings.Contains(se2.Error(), "context deadline exceeded") {
+	if !ok || se2.ErrValue.Str != "context deadline exceeded" || se2.Line != 0 {
 		t.Fatalf("second run after kill: %T %v — VM wedged", err, err)
 	}
 }
@@ -492,10 +495,11 @@ func TestDeadlineNormalAndCancel(t *testing.T) {
 	}()
 	_, err := e.Run(ctx, s, RunOptions{})
 	if se, ok := err.(*ScriptError); ok {
-		// the interpreter raises the context's own error text
-		txt := se.Error()
-		if !strings.Contains(txt, "context canceled") && !strings.Contains(txt, "context deadline exceeded") {
-			t.Fatalf("ctx cancel kill (script error): %q", txt)
+		// the caller-ctx cancel rides the same normalized contract as the
+		// timer and Kill (mapError): bare "context deadline exceeded", no
+		// position — the manager distinguishes the cases via its own flags
+		if se.ErrValue.Kind != KindString || se.ErrValue.Str != "context deadline exceeded" || se.Line != 0 {
+			t.Fatalf("ctx cancel kill (script error): want the bare deadline contract, got (%v, %d)", se.ErrValue, se.Line)
 		}
 		return
 	}
@@ -524,7 +528,11 @@ func TestKill(t *testing.T) {
 	select {
 	case err := <-res:
 		se, ok := err.(*ScriptError)
-		if !ok || !strings.Contains(se.Error(), "context canceled") {
+		// Kill rides the normalized deadline contract (mapError): bare
+		// "context deadline exceeded", Line 0 — indistinguishable from the
+		// timer at this layer by design; the manager's own flag tells them
+		// apart
+		if !ok || se.ErrValue.Kind != KindString || se.ErrValue.Str != "context deadline exceeded" || se.Line != 0 {
 			t.Fatalf("kill: %T %v", err, err)
 		}
 	case <-time.After(5 * time.Second):

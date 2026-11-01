@@ -112,6 +112,32 @@ mechanism-free)
 - **N1 — embed core (~2–3 days):** `host/` package: `Engine`/`VM`/`Script`,
   proto cache, VM pool, `RegisterGlobal`/`RegisterValue`, `EventSink`,
   `Seed`, `Deadline`. Reuse glasm `host/`'s test-suite shape.
+  **DONE (2026-11-01):** `host/` = `host.go` (Engine, compile cache,
+  pool, registry-freeze rules), `vm.go` (VM, Run/Kill, deadline via
+  `SetContext` + per-run cancel), `value.go` (the seam Value,
+  API-identical to glasm's wire Value; conversions are direct
+  LValue-tree walks carrying the retired encoder's caps — depth 8,
+  512 entries + More, cycle/deep sentinels, 4096/frame, 64-deep
+  host→guest guard, 65 536-value conversion budget replacing the
+  staging-buffer bound), `hostfn.go` (trampolines; hostfn errors raise
+  bare `lua_error` — verbatim Redis texts, the rt_sea_raise_nopos
+  analog; panics contained), `lru.go`. Mechanism-born deletions vs
+  glasm: `NewEngine` returns no error; no ErrScriptBound/one-script law
+  (protos are self-contained); no TrapError (ApiErrorPanic maps to a
+  plain engine error); pooled-VM recycling is runs-served (1024), not a
+  frozen-GC watermark. Reentrancy: contention serializes on the mutex;
+  ErrReentrant fires only while the owner sits inside a host function
+  (hostDepth counter — only the lock-holder runs trampolines), narrower
+  than glasm's whole-run window. Root-package companion fix (race
+  class): `gcMemBytes`/`gcMode`/`warnOn` made concurrency-safe —
+  package globals mutated at runtime, benign single-VM, unsound under
+  parallel VMs; behavior-neutral (golden gate green); `gcMode` stays
+  process-wide = a known cross-VM divergence (stock's is per
+  global state), ledger row when the ledger exists. Gates:
+  `host_test.go` + `compilecache_test.go` + `vmcache_test.go`
+  (glasm shapes; expectations re-pinned where glasm's were wasm-seam
+  residuals — error("inner",0) is bare per stock, print's table marker
+  decodes instead of dropping the frame), green under `-race -count=2`.
 - **N2 — sandbox (~3–5 days):** globals protection (byte-matched texts);
   stdlib selection — exclude `io`/`os`/`package`/`debug` by default, the
   `lua55_prod.wasm` posture, as an engine option; coroutine spawn cap
@@ -199,16 +225,16 @@ text, numerals — is a bug, not a trade).
 |---|---|---|
 | done | N0 carve + this plan | — |
 | done | N3a golden-corpus gate (58 goldens, byte-stable) | — |
-| 2 | N1 embed core | ~2–3 days |
-| 3 | P0 measurement rig + baseline | ~1 day |
-| 4 | P1 register windows | 1–2 weeks |
-| 5 | N2 sandbox (budget, protection, stdlib) | ~3–5 days |
-| 6 | P2 table engine | 2–4 weeks |
-| 7 | P3 interning | ~1 week |
-| 8 | N3b embedcmp legs, N5 Ultima cutover | ~2–3 days |
-| 9 | P4/P5 | by data |
+| done | N1 embed core (`host/`, race-gated) | — |
+| 2 | P0 measurement rig + baseline | ~1 day |
+| 3 | P1 register windows | 1–2 weeks |
+| 4 | N2 sandbox (budget, protection, stdlib) | ~3–5 days |
+| 5 | P2 table engine | 2–4 weeks |
+| 6 | P3 interning | ~1 week |
+| 7 | N3b embedcmp legs, N5 Ultima cutover | ~2–3 days |
+| 8 | P4/P5 | by data |
 
-A usable Ultima engine exists after step 5 (~3 weeks in); the full program
+A usable Ultima engine exists after step 4 (~3 weeks in); the full program
 is ~6–9 weeks.
 
 ## 7. Open decisions

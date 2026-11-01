@@ -8,6 +8,8 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -168,12 +170,18 @@ func gcApplyParam(p uint8, x int64) int64 {
 // generational mode) is row 79 / U5c territory.
 // gcMode tracks the reported collector mode ("incremental" default —
 // pushmode's oldmode protocol; the fork has no real mode machinery).
-var gcMode = "incremental"
+// Mutex-guarded: independent LStates (the embed's parallel-VM posture)
+// may query/switch concurrently; the tracking is process-wide, a
+// known cross-VM divergence from stock's per-global-state field.
+var (
+	gcModeMu sync.Mutex
+	gcMode   = "incremental"
+)
 
 func baseCollectGarbage(L *LState) int {
 	switch opt := L.OptString(1, "collect"); opt {
 	case "count":
-		L.Push(LNumber(float64(gcMemBytes) / 1024))
+		L.Push(LNumber(float64(gcMemBytes.Load()) / 1024))
 		return 1
 	case "collect":
 		runtime.GC()
@@ -201,8 +209,10 @@ func baseCollectGarbage(L *LState) int {
 		// pushmode: report the previous mode and switch the tracking
 		// (gc.lua:15-17's oldmode battery) — the collection itself is
 		// the host runtime's
+		gcModeMu.Lock()
 		L.Push(LString(gcMode))
 		gcMode = opt
+		gcModeMu.Unlock()
 	case "param":
 		// U5c (stock LUA_GCPARAM, upgrade plan D10): the six tunables'
 		// protocol — answer the OLD value as a percent integer, set a
@@ -799,7 +809,11 @@ func baseType(L *LState) int {
 
 // warnOn mirrors the default handler's state (lauxlib warnfon/warnfoff):
 // warnings print to stderr until an "@off" control message arrives.
-var warnOn = true
+// Atomic: independent LStates may warn concurrently; the flag is
+// process-wide, like the C runtime's single stderr stream.
+var warnOn atomic.Bool
+
+func init() { warnOn.Store(true) }
 
 // baseWarn ports luaB_warn: all arguments must be strings (checked
 // before emitting anything); every argument but the last continues the
@@ -819,13 +833,13 @@ func baseWarn(L *LState) int {
 		if last && len(m) > 0 && m[0] == '@' {
 			switch m {
 			case "@on":
-				warnOn = true
+				warnOn.Store(true)
 			case "@off":
-				warnOn = false
+				warnOn.Store(false)
 			}
 			continue
 		}
-		if warnOn {
+		if warnOn.Load() {
 			if i == 0 {
 				fmt.Fprintf(os.Stderr, "Lua warning: %s", m)
 			} else {

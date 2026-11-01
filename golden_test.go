@@ -35,10 +35,10 @@ import (
 const goldenDir = "_goldens"
 
 var goldenSkipsOfficial = map[string]string{
-	"main.lua":  "suite driver: spawns the lua binary as subprocesses (RUN/auxrun); the gate runs each test file directly instead",
-	"all.lua":   "suite driver: dofiles main.lua and every file in sequence (subprocess driver) — see main.lua skip",
-	"heavy.lua": "stress script excluded from the official all.lua run; creates multi-hundred-MB strings (machine-dependent, not gate material)",
-	"files.lua": "the /dev/full block (files.lua:474-482) asserts io.flush FAILS with ENOSPC — macOS has no /dev/full, so the block cannot be expressed; everything through line 470 was green under the glasm gates. Revisit only with an ENOSPC-capable stand-in.",
+	"main.lua":    "suite driver: spawns the lua binary as subprocesses (RUN/auxrun); the gate runs each test file directly instead",
+	"all.lua":     "suite driver: dofiles main.lua and every file in sequence (subprocess driver) — see main.lua skip",
+	"heavy.lua":   "stress script excluded from the official all.lua run; creates multi-hundred-MB strings (machine-dependent, not gate material)",
+	"files.lua":   "the /dev/full block (files.lua:474-482) asserts io.flush FAILS with ENOSPC — macOS has no /dev/full, so the block cannot be expressed; everything through line 470 was green under the glasm gates. Revisit only with an ENOSPC-capable stand-in.",
 	"closure.lua": "glasm row 79: no automatic GC cycles — closure.lua:39's repeat-until-GC waits for an unsolicited collection the fork never runs (weak tables DO clear on collectgarbage('collect'), gc.go; hangs, not fails)",
 	"gc.lua":      "glasm row 79 (U5f): the full-collection weak walk (gc.go) is in, but fine-grained cycle semantics diverge (:316 finalizer reachability, :340 register residue)",
 	"gengc.lua":   "glasm row 79 (U5c): generational-GC surface — gengc.lua:122 needs a minor collection to clear a __mode=\"kv\" table's entries",

@@ -1,5 +1,7 @@
 package lua
 
+import "sync/atomic"
+
 const defaultArrayCap = 32
 const defaultHashCap = 32
 
@@ -35,10 +37,11 @@ func (lv lValueArraySorter) Less(i, j int) bool {
 // so bytes are charged at the big allocation sites (a table's array/hash
 // preallocation). It is monotonic — freed tables are not refunded — and
 // only deltas are observable (sort.lua:19's memdiff battery); the value
-// is never printed by the official suite.
-var gcMemBytes int64
+// is never printed by the official suite. Atomic: independent LStates
+// (the embed's parallel-VM posture) charge it concurrently.
+var gcMemBytes atomic.Int64
 
-func gcCharge(bytes int64) { gcMemBytes += bytes }
+func gcCharge(bytes int64) { gcMemBytes.Add(bytes) }
 
 func newLTable(acap int, hcap int) *LTable {
 	if acap < 0 {

@@ -197,9 +197,22 @@ mechanism-free)
   ~0.85), no-pool 24–28 µs ≈ 1.6× C's own fresh (was ~2.6 ms — the
   pool is now an optimization, not feasibility), warm RSS 8.1–8.6 MB
   (was 50–70)**; RET cross-check zero mismatches, 7 scripts × 5 legs.
-- **N5 — Ultima cutover:** EVAL/SCRIPT over `host/` per Ultima M8
-  (`../ultima`); glasm's How-To §5 remains the shape of the plan, rewritten
-  for the native package.
+- **N5 — Ultima cutover — DONE (2026-11-01, ultima `main` 85c66a6-line,
+  commit "N5: cut EVAL/SCRIPT onto the native Lua 5.5.1 embed engine"):**
+  `../ultima` consumes this repo through `host` via a sibling `replace`
+  (like `../pluto`); the vendored yuin 5.1 tree + host shim
+  (`third_party/gopher-lua`) and the `gopher_lua_original` experiment are
+  deleted. Contract deltas landed here for the cutover: the deadline/kill
+  normalization (0403677) and the raise-line contract — prefixless raises
+  report the raise-time traceback top frame; `rawset`'s readonly guard
+  raises bare, Redis's C-builtin shape (3daee73). 5.5.1 semantic deltas
+  ledgered ultima-side (`docs/Redis-Errors.md` §11): `error(nil)` →
+  stock's `<no error object>`, integer staging lossless beyond 2^53.
+  Gates: ultima `go test ./...` + `-race` over scripting/commands/tests;
+  **the M8 differential corpus vs live redis-server 7.2.7 ran 332
+  comparisons, 0 mismatches** (two engine-law divergences unit-pinned
+  instead). Ultima docs: `AGENTS.md` (engine note, sibling list),
+  `docs/implementation-history.md` §N5, `docs/ULTIMA-DESIGN.md` M8 row.
 
 **Memory budget decision — TAKEN (N2, 2026-11-01):** the wasm posture's
 semantics (per-VM budget, pcall-catchable "not enough memory") shipped as
@@ -251,19 +264,19 @@ text, numerals — is a bug, not a trade).
 
 ## 6. Sequencing
 
-| Order | Milestone | Estimate |
-|---|---|---|
-| done | N0 carve + this plan | — |
-| done | N3a golden-corpus gate (58 goldens, byte-stable) | — |
-| done | N1 embed core (`host/`, race-gated) | — |
-| 2 | P0 measurement rig + baseline | ~1 day |
-| 3 | P1 register windows | 1–2 weeks |
-| 4 | done N2 sandbox (budget, protection, stdlib) | ~3–5 days |
-| 5 | P2 table engine | 2–4 weeks |
-| 6 | P3 interning | ~1 week |
-| done | N3b embedcmp legs (Embedded-EVAL-Perf.md) | — |
-| 7 | N5 Ultima cutover | ~2–3 days |
-| 8 | P4/P5 | by data |
+| Order | Milestone                                        | Estimate  |
+|-------|--------------------------------------------------|-----------|
+| done  | N0 carve + this plan                             | —         |
+| done  | N3a golden-corpus gate (58 goldens, byte-stable) | —         |
+| done  | N1 embed core (`host/`, race-gated)              | —         |
+| 2     | P0 measurement rig + baseline                    | ~1 day    |
+| 3     | P1 register windows                              | 1–2 weeks |
+| 4     | done N2 sandbox (budget, protection, stdlib)     | ~3–5 days |
+| 5     | P2 table engine                                  | 2–4 weeks |
+| 6     | P3 interning                                     | ~1 week   |
+| done  | N3b embedcmp legs (Embedded-EVAL-Perf.md)        | —         |
+| done  | N5 Ultima cutover (differential 332/0 vs live Redis) | —     |
+| 8     | P4/P5                                            | by data   |
 
 A usable Ultima engine exists after step 4 (~3 weeks in); the full program
 is ~6–9 weeks.
@@ -279,7 +292,14 @@ is ~6–9 weeks.
   libraries, so it ships only where wanted.
 - Version tagging: the repo carries pre-carve tags (latest `v0.0.6`), so
   `make build` currently injects `PackageVersion=0.0.6` — tag the first
-  release of this line (e.g. `v5.5.0`) to supersede them.
+  release of this line to supersede them. Caveat learned in N5: a tag
+  like `v5.5.0` is NOT consumable as a module version while the module
+  path lacks a `/vN` suffix ("should be v0 or v1" — Go rejects major >1
+  without one). Ultima currently pins `v0.0.0` under a directory
+  `replace`, which is advisory. First real release must either move to
+  `github.com/pschlump/gopher-lua/v5` (import-path churn for embedders)
+  or stay `v0.x`-line (`v0.5.0` say); decide before any consumer pulls by
+  version instead of replace.
 
 ## 8. Relationship to glasm
 

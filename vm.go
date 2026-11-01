@@ -128,6 +128,21 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 		return
 	}
 
+	// P1a: the deadline/budget probe runs every deadlineCheckEvery
+	// instructions, not every instruction. The per-instruction
+	// non-blocking select on a REAL context channel (a cancelable
+	// context's Done is an open channel — Background's nil channel
+	// short-circuits cheaply, production contexts do not) measured +63%
+	// on h_numloop and 1.3–1.7× the ctx-free loop on every compute lane
+	// (docs/Perf-P0-Baseline.md, Finding 1) — the single largest
+	// production-posture cost. Amortized counting keeps the contract:
+	// any unbounded execution — a loop (backward jump) or unbounded
+	// recursion — executes instructions continuously, so a crossed
+	// deadline still raises within deadlineCheckEvery instruction
+	// boundaries (µs at worst for realistic ops; the mapped daemon
+	// contract — bare text, Line 0 — is unchanged, only the raise's
+	// instruction granularity moves, which nothing gates byte-exactly).
+	check := 0
 	for {
 		cf = L.currentFrame
 		inst = cf.Fn.Proto.Code[cf.Pc]
@@ -135,23 +150,35 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 		if L.hookMask&(hookMaskLine|hookMaskCount) != 0 {
 			L.traceHook(cf)
 		}
-		select {
-		case <-L.ctx.Done():
-			L.RaiseError("%s", L.ctx.Err().Error())
-			return
-		default:
+		if check--; check <= 0 {
+			check = deadlineCheckEvery
+			select {
+			case <-L.ctx.Done():
+				L.RaiseError("%s", L.ctx.Err().Error())
+				return
+			default:
+			}
 			// N2 memory budget: the boundary check beside the deadline's
-			// (see mainLoop).
+			// (see mainLoop) — same amortization.
 			if L.G.memLimit > 0 && L.memBudgetExceeded() {
 				L.memRaise()
 				return
 			}
-			if jumpTable[int(inst&0x7f)](L, inst, baseframe) == 1 {
-				return
-			}
+		}
+		if jumpTable[int(inst&0x7f)](L, inst, baseframe) == 1 {
+			return
 		}
 	}
 }
+
+// deadlineCheckEvery is the P1a amortization stride: one ctx/budget
+// probe per this many instructions. 64 amortizes the channel probe
+// (~5ns) to noise while bounding the probe gap to 64 instruction
+// boundaries — worst realistic per-op cost keeps detection µs-to-ms
+// scale, far inside the daemon's deadline/kill pacing (stock C Lua
+// cannot preempt at all; busy scripts there are killed between
+// instructions only by cooperation).
+const deadlineCheckEvery = 64
 
 // regv is the first target register to copy the return values to.
 // It can be reg.top, indicating that the copied values are going into new registers, or it can be below reg.top
@@ -292,6 +319,25 @@ func switchToParentThread(L *LState, nargs int, haserror bool, kill bool) {
 func callGFunction(L *LState, tailcall bool) bool {
 	frame := L.currentFrame
 	gfnret := frame.Fn.GFunction(L)
+	// P1a: with the loop's deadline probe amortized to every
+	// deadlineCheckEvery instructions, a G function that BLOCKED and
+	// observed ctx cancellation (channellib's reflect.Select races
+	// L.ctx.Done()) can return NORMALLY — channelReceive comes back
+	// (false, nil) instead of raising — and a script with fewer than
+	// deadlineCheckEvery instructions left would exit successfully.
+	// Go-call returns are exactly where cancellation gets observed, and
+	// the probe is noise against call cost, so check here too: same
+	// raise shape as the loop probe. Only on completion (gfnret >= 0):
+	// a suspended call (yield) must finish its resume bookkeeping below,
+	// and its parent's loop probes on its own cadence.
+	if gfnret >= 0 && L.ctx != nil {
+		select {
+		case <-L.ctx.Done():
+			L.RaiseError("%s", L.ctx.Err().Error())
+			return true
+		default:
+		}
+	}
 	if tailcall {
 		L.currentFrame = L.RemoveCallerFrame()
 	}

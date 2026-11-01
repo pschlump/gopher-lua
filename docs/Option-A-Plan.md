@@ -247,13 +247,17 @@ text, numerals — is a bug, not a trade).
   cancelable context (nil-channel Background: +30%). Register
   bookkeeping (#2) and call overhead (#6) confirmed on fib/callret
   profiles. New first step below.
-- **P1a — amortized deadline check (days, promoted above P1 by the P0
-  record):** check `ctx`/budget on back-edges and calls (or every
-  Nth instruction) instead of every instruction — infinite loops are
-  backward jumps or unbounded recursion, so kill/deadline latency stays
-  µs-scale; only the raise's instruction granularity changes (nothing
-  gates it byte-exactly). Expected to reclaim most of the warm/interp
-  gap (numloop 22.2×C → ~14×C).
+- **P1a — amortized deadline check — DONE (2026-11-01,
+  `docs/Perf-P1a-Deadline-Check.md`):** the loop probe runs every 64
+  instructions (`deadlineCheckEvery` countdown) plus one probe at every
+  G-call **return** — the seam a bare stride strands: a blocked G
+  function (channellib's `reflect.Select` races ctx) observes
+  cancellation and returns *normally*, and the old per-instruction probe
+  was what converted that into the raise (TestCancelChannelReceive/2
+  pinned it). All gates green, goldens byte-exact. Landed: warm −12% to
+  −39% by lane (numloop 22.2×C → 14.6×C, tco 10.7×C → 6.5×C, concat
+  1.25×C → 1.03×C); the warm/interp gap closed to ≈2% everywhere. P1
+  register windows is now the top measured cost center.
 - **P1 — register-window slicing (1–2 weeks, est 10–25%):** frame setup
   knows `NumUsedRegisters`; slice the register window once per frame and
   make handlers store without `checkSize`/top bookkeeping (explicit top
@@ -272,9 +276,9 @@ text, numerals — is a bug, not a trade).
 - **P4 — call path (data-scoped):** frame setup cost (push, capacity
   check, nil-fill, vararg shuffle). Glasm's U9/U10 lessons on call-path
   costs apply in shape even where the wasm mechanisms don't transfer.
-- **P5 — misc (data-scoped):** `mainLoopWithContext`'s per-instruction
-  `select` (make the deadline check count-sampled); `LNumber.String`
-  `fmt.Sprint` path; `stringConcat`'s `[]string`+join.
+- **P5 — misc (data-scoped):** ~~`mainLoopWithContext`'s per-instruction
+  `select`~~ (done by P1a); `LNumber.String` `fmt.Sprint` path;
+  `stringConcat`'s `[]string`+join.
 
 ## 6. Sequencing
 
@@ -284,7 +288,7 @@ text, numerals — is a bug, not a trade).
 | done  | N3a golden-corpus gate (58 goldens, byte-stable) | —         |
 | done  | N1 embed core (`host/`, race-gated)              | —         |
 | done  | P0 measurement rig (Perf-P0-Baseline.md)         | —         |
-| 2     | P1a amortized deadline check (P0 finding)        | days      |
+| done  | P1a amortized deadline check (Perf-P1a-Deadline-Check.md) | days |
 | 3     | P1 register windows                              | 1–2 weeks |
 | 4     | done N2 sandbox (budget, protection, stdlib)     | ~3–5 days |
 | 5     | P2 table engine                                  | 2–4 weeks |

@@ -237,9 +237,23 @@ benchstat A/B against the previous commit — no divergence without a ledger
 row (a perf change that alters observable behavior — table order, error
 text, numerals — is a bug, not a trade).
 
-- **P0 — measurement rig (~1 day):** port glasm's `cmd/luabench`
-  interp-only (7 scripts + `-benchstat` + `-cpuprofile`); re-baseline;
-  pprof top-10 to confirm the 2026-09 cost-center ranking still holds.
+- **P0 — measurement rig — DONE (2026-11-01, `docs/Perf-P0-Baseline.md`):**
+  `cmd/luabench` ported from glasm (all 11 scripts, 4 postures,
+  output-checked; benchstat/cpuprofile flags). Baseline recorded. The
+  2026-09 ranking is **revised by measurement**: the #1 cost in the
+  production posture is the per-instruction context check (2026-09's
+  #9 "misc") — the warm leg runs 1.3–1.7× the ctx-free interp leg on
+  every compute lane; isolated A/B: +63% on h_numloop with a real
+  cancelable context (nil-channel Background: +30%). Register
+  bookkeeping (#2) and call overhead (#6) confirmed on fib/callret
+  profiles. New first step below.
+- **P1a — amortized deadline check (days, promoted above P1 by the P0
+  record):** check `ctx`/budget on back-edges and calls (or every
+  Nth instruction) instead of every instruction — infinite loops are
+  backward jumps or unbounded recursion, so kill/deadline latency stays
+  µs-scale; only the raise's instruction granularity changes (nothing
+  gates it byte-exactly). Expected to reclaim most of the warm/interp
+  gap (numloop 22.2×C → ~14×C).
 - **P1 — register-window slicing (1–2 weeks, est 10–25%):** frame setup
   knows `NumUsedRegisters`; slice the register window once per frame and
   make handlers store without `checkSize`/top bookkeeping (explicit top
@@ -269,7 +283,8 @@ text, numerals — is a bug, not a trade).
 | done  | N0 carve + this plan                             | —         |
 | done  | N3a golden-corpus gate (58 goldens, byte-stable) | —         |
 | done  | N1 embed core (`host/`, race-gated)              | —         |
-| 2     | P0 measurement rig + baseline                    | ~1 day    |
+| done  | P0 measurement rig (Perf-P0-Baseline.md)         | —         |
+| 2     | P1a amortized deadline check (P0 finding)        | days      |
 | 3     | P1 register windows                              | 1–2 weeks |
 | 4     | done N2 sandbox (budget, protection, stdlib)     | ~3–5 days |
 | 5     | P2 table engine                                  | 2–4 weeks |

@@ -1,0 +1,51 @@
+# The gate battery, run on every push to the release branches, every
+# tag, and every PR — the byte-exactness contract's standing enforcement
+# (CLAUDE.md "Laws"). Correctness gates only; the benchstat A/B half of
+# the perf law is manual by design (shared CI runners cannot do timing
+# comparisons).
+#
+# Free tier: public repos get GitHub Actions unlimited on the standard
+# Linux runners. This job is ~2–4 minutes (the golden leg is ~32s of
+# it). macOS runners are never used (10× minute multiplier were billing
+# ever to apply).
+name: gates
+
+on:
+  push:
+    branches: [master, v5.5]
+    tags: ['v*']
+  pull_request:
+    branches: [master, v5.5]
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Regenerate + format + full suite (goldens byte-exact)
+        run: make test
+
+      - name: Committed tree matches regenerated output
+        run: |
+          git diff --exit-code || {
+            echo "::error::working tree differs after go-inline/go fmt — regenerate (make build) and commit the result"
+            exit 1
+          }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Race battery (host/channel/context/golden-glua)
+        run: go test -race -run 'TestHost|TestChannel|TestContext|TestGoldenGlua' .
+
+      - name: CGO-free build (pure-Go law)
+        run: CGO_ENABLED=0 go build ./...

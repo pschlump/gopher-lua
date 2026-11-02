@@ -2018,9 +2018,8 @@ func init() {
 				cf.Pc = 0
 				cf.Base = RA
 				cf.LocalBase = RA + 1
-				cf.ReturnBase = cf.ReturnBase
+				// ReturnBase/NRet keep the reused frame's return window
 				cf.NArgs = nargs
-				cf.NRet = cf.NRet
 				cf.TailCall++
 				cf.CCmt = ccmt
 				// this section is inlined by go-inline

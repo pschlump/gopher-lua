@@ -12,10 +12,10 @@ name: gates
 
 on:
   push:
-    branches: [master, v5.5]
+    branches: [master]
     tags: ['v*']
   pull_request:
-    branches: [master, v5.5]
+    branches: [master]
 
 permissions:
   contents: read

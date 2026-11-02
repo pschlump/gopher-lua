@@ -1,7 +1,7 @@
 # Option A — gopher-lua as the standalone Lua 5.5.1 embed engine
 
-**Status:** decision made and carve executed 2026-11-01. This repo (branch
-`v5.5`) is the pure-Go Lua 5.5.1 virtual machine carved out of **glasm @
+**Status:** decision made and carve executed 2026-11-01. This repo is the
+pure-Go Lua 5.5.1 virtual machine carved out of **glasm @
 `0affa95e2177337baa3703fff449dd8738564aea`**. Glasm is preserved untouched as
 its own project — a Lua→wasm compiler, useful for computationally intensive
 standalone Lua — and remains the frozen source of this carve. This document

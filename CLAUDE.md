@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-**gopher-lua** (`github.com/pschlump/gopher-lua`, pschlump fork) — a **Lua 5.5.1 virtual machine and compiler in pure Go**, the embedded scripting engine for the Ultima project (a pure-Go Redis clone; EVAL/SCRIPT run on this engine). It was carved out of **glasm @ `0affa95`** on 2026-11-01 (branch `v5.5`): glasm's root-package interpreter had been upgraded in place to stock 5.5.1 and gated byte-exact against stock C Lua 5.5.1 — that verification is this repo's inheritance. Glasm itself (`../glasm`) continues as the Lua→wasm compiler project and is the frozen source of this carve; no backflow.
+**gopher-lua** (`github.com/pschlump/gopher-lua`, pschlump fork) — a **Lua 5.5.1 virtual machine and compiler in pure Go**, the embedded scripting engine for the Ultima project (a pure-Go Redis clone; EVAL/SCRIPT run on this engine). It was carved out of **glasm @ `0affa95`** on 2026-11-01 (the `v5.5` development branch was merged into `master` and deleted on 2026-11-02): glasm's root-package interpreter had been upgraded in place to stock 5.5.1 and gated byte-exact against stock C Lua 5.5.1 — that verification is this repo's inheritance. Glasm itself (`../glasm`) continues as the Lua→wasm compiler project and is the frozen source of this carve; no backflow.
 
 The roadmap is `docs/Option-A-Plan.md` (tracks N = embed package + gates, P = performance program). Read it before planning work here.
 

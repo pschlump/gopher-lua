@@ -323,9 +323,19 @@ text, numerals — is a bug, not a trade).
   engine time on that lane). NaN-boxing or a tagged union touches
   everything; needs a decision + its own milestone before P2-level
   effort is spent elsewhere. Flagged in `docs/Perf-P1-Findings.md`.
-- **P5 — misc (data-scoped):** ~~`mainLoopWithContext`'s per-instruction
-  `select`~~ (done by P1a); `LNumber.String` `fmt.Sprint` path;
-  `stringConcat`'s `[]string`+join.
+- **P5 — misc — DONE (2026-11-02, `docs/Perf-P5-Misc.md`):** the
+  `LNumber.String` fmt.Sprint item was stale — already resolved into
+  `numberToStringStock` (the C-exact strconv %g port) by the
+  byte-exactness pinning. The concat fold was rebuilt: type-check pass
+  finds the run (outer __concat/error continuation untouched) and
+  sizes a `strings.Builder`; one ascending pass appends strings free,
+  integers via `strconv.AppendInt` into a stack scratch, floats
+  through the stock spelling — one allocation per concat, zero temps,
+  no join pass. Charge model unchanged. **concat −7.7%, hostfn −6.6%
+  (the `"key:"..i` redis-call shape), tablechurn interp −4.5% (all
+  p≤0.004), geomean −1.80%**; no-concat lanes flat. Goldens caught a
+  wrong-bounds first build (3-operand runs dropped their first
+  piece). P6 is the only milestone left.
 
 ## 6. Sequencing
 
@@ -343,8 +353,8 @@ text, numerals — is a bug, not a trade).
 | 7     | done P3 string constants (Perf-P3-String-Constants.md) | —   |
 | done  | N3b embedcmp legs (Embedded-EVAL-Perf.md)        | —         |
 | done  | N5 Ultima cutover (differential 332/0 vs live Redis) | —     |
-| 8     | P5 misc; P6 LValue representation (decision pending — now the | by data |
-|       | dominant lane, numloop 14.6×C)                          |         |
+| 8     | done P5 misc (Perf-P5-Misc.md); P6 LValue representation | by data |
+|       | (decision pending — the last and biggest lever)           |         |
 
 A usable Ultima engine exists after step 4 (~3 weeks in); the full program
 is ~6–9 weeks.

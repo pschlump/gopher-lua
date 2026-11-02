@@ -3,6 +3,7 @@ package lua
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 )
 
@@ -2616,6 +2617,22 @@ func bitwiseInt(op int, x, y int64) int64 {
 // pre-decrements total, starts the loop at last-1 — the sync path's
 // `rhs = v; total--; i--`). Go-context dispatches (host-API Concat)
 // are always mmSync.
+// concatAppendPiece appends one type-checked concat operand to the fold
+// buffer: integers render through a stack scratch (no temp string
+// allocation), floats keep the stock tostring spelling. The caller has
+// already established convertibility (LVCanConvToString).
+func concatAppendPiece(bld *strings.Builder, v LValue) {
+	switch t := v.(type) {
+	case LString:
+		bld.WriteString(string(t))
+	case LInteger:
+		var scratch [20]byte // len("-9223372036854775808") == 20
+		bld.Write(strconv.AppendInt(scratch[:0], int64(t), 10))
+	default: // LNumber
+		bld.WriteString(numberToStringStock(float64(t.(LNumber))))
+	}
+}
+
 func stringConcat(L *LState, total, last int, cf *callFrame) (LValue, uint8) {
 	rhs := L.reg.Get(last)
 	total--
@@ -2656,18 +2673,39 @@ func stringConcat(L *LState, total, last int, cf *callFrame) (LValue, uint8) {
 				return LNil, mmSync
 			}
 		} else {
-			buf := make([]string, total+1)
-			buf[total] = LVAsString(rhs)
+			// P5: one builder, no per-piece temp strings and no join
+			// pass. The fold's extent is found with type checks only —
+			// leaving i/total/lhs exactly where the old buf loop left
+			// them for the outer __concat/error continuation — sizing
+			// the buffer as it goes (exact for strings, a 24-byte
+			// ceiling per number); the run is then appended ascending.
+			start := i
+			size := 24
+			if s, ok := rhs.(LString); ok {
+				size = len(s)
+			}
 			for total > 0 {
 				lhs = L.reg.Get(i)
 				if !LVCanConvToString(lhs) {
 					break
 				}
-				buf[total-1] = LVAsString(lhs)
+				if s, ok := lhs.(LString); ok {
+					size += len(s)
+				} else {
+					size += 24
+				}
 				i--
 				total--
 			}
-			joined := strings.Join(buf, "")
+			var bld strings.Builder
+			bld.Grow(size)
+			// the pass walked i DOWN past the folded pieces; they live
+			// at i+1 … start, appended here ascending, then rhs
+			for j := i + 1; j <= start; j++ {
+				concatAppendPiece(&bld, L.reg.Get(j))
+			}
+			concatAppendPiece(&bld, rhs)
+			joined := bld.String()
 			// N2: the concat fold's result is charged (one string object,
 			// len bytes + header); a crossed budget raises here rather
 			// than at the next boundary, so a doubling spin stops at the

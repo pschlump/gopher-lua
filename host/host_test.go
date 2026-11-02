@@ -9,6 +9,7 @@ package host
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -864,5 +865,62 @@ func TestCloseSemantics(t *testing.T) {
 	}
 	if _, err := e.NewVM(); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("NewVM after engine close: %v", err)
+	}
+}
+
+// --- P7: staging intern + crossing scratch ----------------------------------------
+
+// The staging intern must never cross-contaminate runs: a pooled VM
+// (same LState) runs scripts with different KEYS/ARGV back to back, and
+// every run must stage exactly its own payload — repeated strings reuse
+// the cached box, changed strings stage fresh. The >stagingInternMax
+// sweep exercises the bounded path (cache full: box without caching).
+func TestStagingInternReuse(t *testing.T) {
+	e := mustEngine(t, WithVMCacheSize(1)) // one VM: every run is a pool hit
+	src := `return #KEYS .. ':' .. KEYS[1] .. ':' .. ARGV[1]`
+	expect := func(keys, argv []string, want string) {
+		t.Helper()
+		res, err := runScript(t, e, src, RunOptions{Keys: keys, Argv: argv})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Values[0].Str != want {
+			t.Fatalf("staged %v/%v: got %q want %q", keys, argv, res.Values[0].Str, want)
+		}
+	}
+	expect([]string{"key:1", "key:2", "key:3"}, []string{"a", "b"}, "3:key:1:a")
+	expect([]string{"other:9"}, []string{"z"}, "1:other:9:z") // different payload, same VM
+	expect([]string{"key:1", "key:2", "key:3"}, []string{"a", "b"}, "3:key:1:a") // repeat hits the intern
+	// sweep past the intern bound: 600 distinct strings on the same VM
+	for i := 0; i < 60; i++ {
+		k := fmt.Sprintf("sweep:%d", i)
+		expect([]string{k, "tail"}, []string{"v"}, "2:"+k+":v")
+	}
+}
+
+// The hostfn args slice is engine scratch: sequential crossings on one
+// VM refill it, so a function that reads its args inline (the entire
+// redis.call class) must see exactly its own call's arguments — the
+// second call below refills the buffer while the first call's results
+// are already materialized Lua strings.
+func TestCrossingScratchArgs(t *testing.T) {
+	e := mustEngine(t)
+	if err := e.RegisterGlobal("bench", "join", func(vm *VM, args []Value) ([]Value, error) {
+		parts := make([]string, len(args))
+		for i, a := range args {
+			parts[i] = a.Str
+		}
+		return []Value{String(strings.Join(parts, "|"))}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := runScript(t, e,
+		`return bench.join('a','b') .. '/' .. bench.join('c','d','e') .. '/' .. bench.join('f')`,
+		RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Values[0].Str != "a|b/c|d|e/f" {
+		t.Fatalf("crossing args: %q", res.Values[0].Str)
 	}
 }

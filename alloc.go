@@ -102,6 +102,21 @@ func (al *allocator) LNumber2I(v LNumber) LValue {
 	return al.scratchValue
 }
 
+// IntegerValue boxes an integer as an LValue through the shared
+// small-integer cache ([-1024,1024) boxes are preallocated statics, so
+// count/length-class integers cross allocation-free; outside the window
+// it is a plain one-box conversion). This is the exported seam for
+// embedders — host-package crossings and any API boundary — the
+// interpreter itself uses the allocator method (LInteger2I), which
+// bulk-allocates the out-of-cache range instead.
+func IntegerValue(v LInteger) LValue {
+	if v >= LInteger(intCacheLo) && v < LInteger(intCacheHi) {
+		return intCache[v-intCacheLo]
+	}
+	var lv LValue = v
+	return lv
+}
+
 // LInteger2I is the integer twin of LNumber2I (U2/D1): small integers
 // (both signs) come from the shared cache, everything else from a
 // bulk-allocated int64 block.

@@ -40,7 +40,12 @@ func (vm *VM) trampoline(fn HostFunc) lua.LGFunction {
 		if n > maxFrameVals {
 			bareRaise(L, lua.LString(fmt.Sprintf("host function call: too many hostfn arguments (%d)", n)))
 		}
-		args := make([]Value, n)
+		// engine-owned scratch, refilled per crossing (see VM.argsScratch:
+		// the A9 law makes reuse safe; HostFuncs copy if they retain)
+		if cap(vm.argsScratch) < n {
+			vm.argsScratch = make([]Value, n, max(n, 8))
+		}
+		args := vm.argsScratch[:n]
 		for i := 1; i <= n; i++ {
 			a, err := fromLValue(L.Get(i))
 			if err != nil {

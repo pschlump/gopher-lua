@@ -53,7 +53,10 @@ import (
 // the same goroutine running the script — so it may inspect VM state
 // freely, but it must NOT call vm.Run (the lock is not reentrant;
 // ErrReentrant is raised if it does). Arguments and returns are seam
-// Values (owning copies — they alias nothing inside the VM).
+// Values (the values themselves own their strings and tables — they
+// alias nothing inside the VM). The args SLICE, however, is engine
+// scratch reused by the next crossing on this VM: a HostFunc that needs
+// it beyond its own return must copy it (slices.Clone).
 type HostFunc func(vm *VM, args []Value) ([]Value, error)
 
 // Option configures an Engine.

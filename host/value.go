@@ -286,7 +286,9 @@ func toLValueDepth(L *lua.LState, v Value, depth int) (lua.LValue, error) {
 	case KindNumber:
 		return lua.LNumber(v.Num), nil
 	case KindInteger:
-		return lua.LInteger(v.Int), nil
+		// through the shared small-integer cache (alloc.go IntegerValue):
+		// count/length-class integers cross allocation-free
+		return lua.IntegerValue(lua.LInteger(v.Int)), nil
 	case KindString:
 		return lua.LString(v.Str), nil
 	case KindTable:

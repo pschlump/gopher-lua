@@ -332,6 +332,18 @@ text, numerals — is a bug, not a trade).
   callret −13%, tco −13%, tablechurn −7%, geomean −7.41%** — the
   biggest milestone since P1a. Gate `boxing_p6_test.go`. The P-track
   is now complete: compounding geomean ≈ −35% vs pre-P1a.
+- **P7 — embed-seam allocation diet — DONE (2026-11-02,
+  `docs/Perf-P7-Embed-Seam.md`):** the embedcmp open items (pool-hit
+  floor, crossing cost) decomposed in-process; the fixable mass was
+  allocations. Per-VM staging intern for repeated KEYS/ARGV strings
+  (the bounded analog of C's string intern), pre-boxed staging names,
+  per-VM crossing scratch under A9, and exported `lua.IntegerValue`
+  through the P6 int cache. Host/-package only — no VM-loop
+  perturbation. **Staging −70% allocs, crossing −26% (e_call −5.8%
+  time in-process), pool-hit e_arg −40% allocs**; wall-clock flat to
+  −2% (it is a GC-pressure milestone, not a latency one). Gates
+  `TestStagingInternReuse` / `TestCrossingScratchArgs`; rig
+  `host/p7_bench_test.go`.
 - **P5 — misc — DONE (2026-11-02, `docs/Perf-P5-Misc.md`):** the
   `LNumber.String` fmt.Sprint item was stale — already resolved into
   `numberToStringStock` (the C-exact strconv %g port) by the
@@ -364,6 +376,7 @@ text, numerals — is a bug, not a trade).
 | done  | N5 Ultima cutover (differential 332/0 vs live Redis) | —     |
 | 8     | done P5 misc (Perf-P5-Misc.md); P6 boxing (Perf-P6-Boxing.md) | — |
 |       | P-track complete (compounding geomean ≈ −35% vs pre-P1a) |         |
+| 9     | done P7 embed-seam alloc diet (Perf-P7-Embed-Seam.md) | —         |
 
 A usable Ultima engine exists after step 4 (~3 weeks in); the full program
 is ~6–9 weeks.

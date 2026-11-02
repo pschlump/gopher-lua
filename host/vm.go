@@ -103,6 +103,22 @@ type VM struct {
 
 	// runs is the runs-served counter (pool recycling signal).
 	runs int
+
+	// intern is the staging-box cache: KEYS/ARGV strings that repeat
+	// across runs reuse their boxed LValue instead of re-allocating the
+	// 16-byte interface header per element per run (the bounded analog
+	// of stock Lua's global string table, which interns every string the
+	// same way). Only the lock-holding goroutine stages, so no lock.
+	// Bounded by stagingInternMax; a full map just boxes without caching.
+	intern map[string]lua.LValue
+
+	// argsScratch is the hostfn trampoline's argument buffer, reused
+	// across crossings (the A9 law makes this safe: only the
+	// lock-holding goroutine ever runs a trampoline, and same-VM
+	// re-entry is refused by the hostDepth guard, so no live crossing
+	// can observe a refill). HostFuncs that need to keep the slice past
+	// their return must copy it — the HostFunc contract says so.
+	argsScratch []Value
 }
 
 // runsServed reports the run count (pool recycling; white-box).
@@ -245,10 +261,13 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 	// construction, no quoting seam exists). The raw seam, not
 	// SetGlobal: under globals protection _G is readonly, and KEYS/ARGV
 	// are staged after the protect walk by design (guest-writable —
-	// the glasm contract).
+	// the glasm contract). The name LValues are pre-boxed package
+	// constants and the element boxes come from the VM's intern cache,
+	// so a pool-hit run with repeated keys/argv stages allocation-free
+	// beyond the two fresh tables themselves.
 	globals, _ := L.GetGlobal("_G").(*lua.LTable)
-	L.RawSet(globals, lua.LString("KEYS"), lua.LValue(stringTable(L, opt.Keys)))
-	L.RawSet(globals, lua.LString("ARGV"), lua.LValue(stringTable(L, opt.Argv)))
+	L.RawSet(globals, keyKEYS, lua.LValue(vm.stringTable(L, opt.Keys)))
+	L.RawSet(globals, keyARGV, lua.LValue(vm.stringTable(L, opt.Argv)))
 
 	if opt.Seed != 0 {
 		// determinism (D5 shape): math.randomseed(n) on the
@@ -275,13 +294,49 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 	return Result{Values: vals}, nil
 }
 
-// stringTable builds a fresh sequential table of strings.
-func stringTable(L *lua.LState, items []string) *lua.LTable {
+// stagingInternMax bounds the per-VM staging intern: hot scripts stage
+// the same key/argv strings run after run (hot-key traffic), and each
+// repeated element would otherwise cost a fresh 16-byte interface-box
+// allocation per run. The bound keeps a pathological never-repeating
+// workload from growing the cache without limit (stock C Lua interns
+// unconditionally; a daemon embedding cannot).
+const stagingInternMax = 512
+
+// The staged globals' names, pre-boxed (boxing LString into an LValue
+// interface allocates — do the two constants once, not per run).
+var (
+	keyKEYS = lua.LValue(lua.LString("KEYS"))
+	keyARGV = lua.LValue(lua.LString("ARGV"))
+)
+
+// stringTable builds a fresh sequential table of strings. The table (and
+// its array backing) is fresh every run — the script gets no alias into
+// a previous run's state — but the per-element LValue boxes come from
+// the VM's intern cache when the string was staged before: the box holds
+// an immutable string, so reuse is observationally identical to
+// re-boxing (Lua has no mutable strings).
+func (vm *VM) stringTable(L *lua.LState, items []string) *lua.LTable {
 	tbl := L.CreateTable(len(items), 0)
 	for i, s := range items {
-		tbl.RawSetInt(i+1, lua.LString(s))
+		tbl.RawSetInt(i+1, vm.internString(s))
 	}
 	return tbl
+}
+
+// internString returns the boxed LValue for s, caching it in the VM's
+// staging intern on first sight (bounded — see stagingInternMax).
+func (vm *VM) internString(s string) lua.LValue {
+	if lv, ok := vm.intern[s]; ok {
+		return lv
+	}
+	lv := lua.LValue(lua.LString(s))
+	if len(vm.intern) < stagingInternMax {
+		if vm.intern == nil {
+			vm.intern = make(map[string]lua.LValue, 16)
+		}
+		vm.intern[s] = lv
+	}
+	return lv
 }
 
 // reseed runs math.randomseed(n) in the guest.

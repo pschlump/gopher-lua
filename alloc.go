@@ -14,16 +14,25 @@ type iface struct {
 
 const preloadLimit LNumber = 128
 
+// intCache covers [-1024, 1024) — P6. Loop counters, indices and small
+// sums dominate integer boxing traffic, and NEGATIVES were never cached
+// before (the runtime's own box cache indexes by raw bits, so only
+// [0,256) ever hit). 2048 shared static slots, 32KB per process.
+const intCacheLo = -1024
+const intCacheHi = 1024
+
 var _fv float64
 var _uv uintptr
 
 var preloads [int(preloadLimit)]LValue
-var intPreloads [int(preloadLimit)]LValue
+var intCache [intCacheHi - intCacheLo]LValue
 
 func init() {
 	for i := 0; i < int(preloadLimit); i++ {
 		preloads[i] = LNumber(i)
-		intPreloads[i] = LInteger(i)
+	}
+	for i := range intCache {
+		intCache[i] = LInteger(int64(intCacheLo + i))
 	}
 }
 
@@ -93,14 +102,12 @@ func (al *allocator) LNumber2I(v LNumber) LValue {
 	return al.scratchValue
 }
 
-// LInteger2I is the integer twin of LNumber2I (U2/D1): small non-negative
-// integers come from the shared preload table, everything else from a
-// bulk-allocated int64 block. Go's runtime already caches boxed values
-// below 256, but LInteger needs no sign exclusion — every value in
-// [0,preloadLimit) is a distinct cache entry.
+// LInteger2I is the integer twin of LNumber2I (U2/D1): small integers
+// (both signs) come from the shared cache, everything else from a
+// bulk-allocated int64 block.
 func (al *allocator) LInteger2I(v LInteger) LValue {
-	if v >= 0 && v < LInteger(preloadLimit) {
-		return intPreloads[int(v)]
+	if v >= LInteger(intCacheLo) && v < LInteger(intCacheHi) {
+		return intCache[v-intCacheLo]
 	}
 
 	// check if we need a new alloc page

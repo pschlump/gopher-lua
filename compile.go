@@ -2747,11 +2747,14 @@ func constFold(exp ast.Expr) ast.Expr { // {{{
 			if !foldValidOp(op, lvalue, rvalue) {
 				return expr
 			}
-			if v, _, res := arithCompute(op, lvalue, rvalue); res == arithDone {
-				if f, isFloat := v.(LNumber); isFloat && (f != f || f == 0) {
+			if iv, fv, isInt, _, res := arithCompute(op, lvalue, rvalue); res == arithDone {
+				if isInt {
+					return &constLValueExpr{Value: iv}
+				}
+				if fv != fv || fv == 0 { // NaN or ±0: keep out of the pool
 					return expr
 				}
-				return &constLValueExpr{Value: v}
+				return &constLValueExpr{Value: fv}
 			}
 		}
 		return expr

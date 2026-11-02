@@ -3091,8 +3091,8 @@ func opArith(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADD..OP_SH
 	C := int(inst>>24) & 0xff  //GETC
 	lhs := reg.Get(lbase + B)
 	rhs := reg.Get(lbase + C)
-	if v, errText, res := arithCompute(opcode, lhs, rhs); res == arithDone {
-		if iv, isInt := v.(LInteger); isInt {
+	if iv, fv, isInt, errText, res := arithCompute(opcode, lhs, rhs); res == arithDone {
+		if isInt {
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) SetInteger(regi int, vali LInteger) ' in '_state.go'
 			{
@@ -3114,7 +3114,6 @@ func opArith(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADD..OP_SH
 				}
 			}
 		} else {
-			fv := v.(LNumber)
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) SetNumber(regi int, vali LNumber) ' in '_state.go'
 			{
@@ -3222,8 +3221,8 @@ func opArithK(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADDK..OP_
 	C := int(inst>>24) & 0xff                   //GETC
 	lhs := reg.Get(lbase + B)
 	rhs := cf.Fn.Proto.Constants[C]
-	if v, errText, res := arithCompute(opcode, lhs, rhs); res == arithDone {
-		if iv, isInt := v.(LInteger); isInt {
+	if iv, fv, isInt, errText, res := arithCompute(opcode, lhs, rhs); res == arithDone {
+		if isInt {
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) SetInteger(regi int, vali LInteger) ' in '_state.go'
 			{
@@ -3245,7 +3244,6 @@ func opArithK(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADDK..OP_
 				}
 			}
 		} else {
-			fv := v.(LNumber)
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) SetNumber(regi int, vali LNumber) ' in '_state.go'
 			{
@@ -4196,8 +4194,11 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue, reg1, reg2 int) (LValue
 		}
 		return v, mmSync
 	}
-	if v, errText, res := arithCompute(opcode, lhs, rhs); res == arithDone {
-		return v, mmSync
+	if iv, fv, isInt, errText, res := arithCompute(opcode, lhs, rhs); res == arithDone {
+		if isInt {
+			return L.reg.alloc.LInteger2I(iv), mmSync
+		}
+		return L.reg.alloc.LNumber2I(fv), mmSync
 	} else if res == arithRaise {
 		raiseArithError(L, errText, lhs, rhs, reg1, reg2)
 	}
@@ -4284,7 +4285,11 @@ const (
 // float operand promotes to float ('/' and '^' are always float); bitwise
 // ops convert through luaV_tointegerns F2Ieq (strings are NOT accepted
 // here — they take the slow path).
-func arithCompute(opcode int, lhs, rhs LValue) (v LValue, err string, res arithOutcome) {
+// arithCompute returns the result UNBOXED (P6: the hot callers used to
+// pay a plain interface conversion here — a mallocgc 8B box — and then
+// re-assert and re-box through the registry's allocator; one arena box
+// at the store site replaces both). isInt selects the integer payload.
+func arithCompute(opcode int, lhs, rhs LValue) (iv LInteger, fv LNumber, isInt bool, err string, res arithOutcome) {
 	li, liOK := lhs.(LInteger)
 	ri, riOK := rhs.(LInteger)
 	lf, lfOK := lhs.(LNumber)
@@ -4295,35 +4300,35 @@ func arithCompute(opcode int, lhs, rhs LValue) (v LValue, err string, res arithO
 	case OP_UNM: // luaO_arith's unary case (both slots hold the operand)
 		if lNum && rNum {
 			if liOK {
-				return LInteger(-int64(li)), "", arithDone
+				return -li, 0, true, "", arithDone
 			}
-			return LNumber(-float64(lf)), "", arithDone
+			return 0, -lf, false, "", arithDone
 		}
 	case OP_DIV, OP_POW: // float-only ops (int operands promote)
 		if lNum && rNum {
-			return LNumber(floatArith(opcode, asFloat(li, lf, liOK), asFloat(ri, rf, riOK))), "", arithDone
+			return 0, LNumber(floatArith(opcode, asFloat(li, lf, liOK), asFloat(ri, rf, riOK))), false, "", arithDone
 		}
 	case OP_ADD, OP_SUB, OP_MUL, OP_MOD, OP_IDIV:
 		if liOK && riOK {
-			if iv, ok := intArith(opcode, int64(li), int64(ri)); ok {
-				return LInteger(iv), "", arithDone
+			if v, ok := intArith(opcode, int64(li), int64(ri)); ok {
+				return LInteger(v), 0, true, "", arithDone
 			}
-			return nil, intArithError(opcode), arithRaise
+			return 0, 0, false, intArithError(opcode), arithRaise
 		}
 		if lNum && rNum {
-			return LNumber(floatArith(opcode, asFloat(li, lf, liOK), asFloat(ri, rf, riOK))), "", arithDone
+			return 0, LNumber(floatArith(opcode, asFloat(li, lf, liOK), asFloat(ri, rf, riOK))), false, "", arithDone
 		}
 	case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR:
 		if lNum && rNum {
 			i1, ok1 := toIntBitwise(lhs)
 			i2, ok2 := toIntBitwise(rhs)
 			if !ok1 || !ok2 {
-				return nil, "number has no integer representation", arithRaise
+				return 0, 0, false, "number has no integer representation", arithRaise
 			}
-			return LInteger(bitwiseInt(opcode, i1, i2)), "", arithDone
+			return LInteger(bitwiseInt(opcode, i1, i2)), 0, true, "", arithDone
 		}
 	}
-	return nil, "", arithSlow
+	return 0, 0, false, "", arithSlow
 }
 
 func asFloat(iv LInteger, fv LNumber, isInt bool) float64 {

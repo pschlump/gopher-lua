@@ -51,8 +51,12 @@ func strArith(L *LState, opcode int, mtname string) {
 	opname := mtname[2:]
 	if lv, ok1 := strArithTonum(L, 1); ok1 {
 		if rv, ok2 := strArithTonum(L, 2); ok2 {
-			if v, errText, res := arithCompute(opcode, lv, rv); res == arithDone {
-				L.Push(v)
+			if iv, fv, isInt, errText, res := arithCompute(opcode, lv, rv); res == arithDone {
+				if isInt {
+					L.Push(iv)
+				} else {
+					L.Push(fv)
+				}
 				return
 			} else if res == arithRaise {
 				L.RaiseError("%s", errText)

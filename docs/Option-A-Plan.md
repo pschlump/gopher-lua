@@ -317,12 +317,21 @@ text, numerals — is a bug, not a trade).
   representation (`[]*callFrame`) to kill the 13-word Push copy —
   invasive and, per the P1 lesson, likely a wash; the remaining fib
   cost is arith boxing (P6) and comparisons.
-- **P6 — LValue representation (new, biggest open lever):** numloop
-  14.6×C is boxed arithmetic — every result outside the [0,128) preload
-  arena-allocates (`arithCompute`+`LInteger2I`/`LNumber2I` ≈ 57% of
-  engine time on that lane). NaN-boxing or a tagged union touches
-  everything; needs a decision + its own milestone before P2-level
-  effort is spent elsewhere. Flagged in `docs/Perf-P1-Findings.md`.
+- **P6 — LValue representation — DONE as boxing-cost engineering
+  (2026-11-02, `docs/Perf-P6-Boxing.md`):** NaN-boxing/tagged union
+  REJECTED on the embeddability law — `LValue` is the exported
+  interface (Ultima's bridge, `host/`), and hidden pointers inside
+  float64 bits would defeat Go's GC. What was lawful and left:
+  (1) `arithCompute` returned a plain-converted LValue that
+  `opArith`/`opArithK` immediately unboxed and re-boxed through the
+  allocator — two boxes per arith, neither kept; it now returns
+  unboxed `(iv, fv, isInt, …)` and the store sites box once;
+  (2) `intCache [-1024,1024)` — negatives were never cached by any
+  layer (the runtime's box cache indexes raw bits, so only [0,256)).
+  **numloop −21…−23% (all postures, p=0.002; 22.2×C at P0 → 11.7×C),
+  callret −13%, tco −13%, tablechurn −7%, geomean −7.41%** — the
+  biggest milestone since P1a. Gate `boxing_p6_test.go`. The P-track
+  is now complete: compounding geomean ≈ −35% vs pre-P1a.
 - **P5 — misc — DONE (2026-11-02, `docs/Perf-P5-Misc.md`):** the
   `LNumber.String` fmt.Sprint item was stale — already resolved into
   `numberToStringStock` (the C-exact strconv %g port) by the
@@ -353,8 +362,8 @@ text, numerals — is a bug, not a trade).
 | 7     | done P3 string constants (Perf-P3-String-Constants.md) | —   |
 | done  | N3b embedcmp legs (Embedded-EVAL-Perf.md)        | —         |
 | done  | N5 Ultima cutover (differential 332/0 vs live Redis) | —     |
-| 8     | done P5 misc (Perf-P5-Misc.md); P6 LValue representation | by data |
-|       | (decision pending — the last and biggest lever)           |         |
+| 8     | done P5 misc (Perf-P5-Misc.md); P6 boxing (Perf-P6-Boxing.md) | — |
+|       | P-track complete (compounding geomean ≈ −35% vs pre-P1a) |         |
 
 A usable Ultima engine exists after step 4 (~3 weeks in); the full program
 is ~6–9 weeks.

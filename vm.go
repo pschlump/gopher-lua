@@ -394,7 +394,10 @@ func callGFunction(L *LState, tailcall bool) bool {
 	// before the results move, its frame still current (the hook's
 	// getinfo(2) names it: "return sethook"); the transfer window is the
 	// results themselves (firstres = top - gfnret, stock precallC→rethook)
-	L.hookReturnEvent(frame, L.reg.Top()-gfnret, gfnret)
+	// — mask guard inline (P4)
+	if L.hookMask != 0 {
+		L.hookReturnEvent(frame, L.reg.Top()-gfnret, gfnret)
+	}
 
 	wantret := frame.NRet
 	if wantret == MultRet {
@@ -1744,18 +1747,30 @@ func init() {
 			}
 			lv := reg.Get(RA)
 			nret := C - 1
-			// U5d (row 22): the pcall/xpcall/pairs builtins intercept as
-			// marker frames — a yield crossing them suspends the thread
-			if kind := markerKind(L, lv, RA, nargs); kind != 0 {
-				if pushPcallMarker(L, cf, lv, RA, nargs, nret, kind, false) {
-					return 1
+			// P4 fast path: a Lua callee — the overwhelming shape of calls —
+			// is never a marker and never a __call chain. That is exactly
+			// markerKind's and resolveCall's fast out, inlined; the G and
+			// non-function callees take the calls below.
+			callable, _ := lv.(*LFunction)
+			callee, ccmt := lv, 0
+			if callable == nil || callable.IsG {
+				// U5d (row 22): the pcall/xpcall/pairs builtins intercept as
+				// marker frames — a yield crossing them suspends the thread
+				if kind := markerKind(L, lv, RA, nargs); kind != 0 {
+					if pushPcallMarker(L, cf, lv, RA, nargs, nret, kind, false) {
+						return 1
+					}
+					return 0
 				}
-				return 0
+				// U5c: the full __call chain (row 83) — resolveCall inserts
+				// each link as an extra first argument, so the frame takes
+				// the args post-chain and no meta insert. A G callee is
+				// resolveCall's fast arm already ((fn, callee, 0), inlined
+				// above); only a non-function can start a chain.
+				if callable == nil {
+					callable, callee, ccmt = L.resolveCall(lv, RA+1)
+				}
 			}
-			// U5c: the full __call chain (row 83) — resolveCall inserts
-			// each link as an extra first argument, so the frame takes
-			// the args post-chain and no meta insert
-			callable, callee, ccmt := L.resolveCall(lv, RA+1)
 			nargs += ccmt
 			// this section is inlined by go-inline
 			// source function is 'func (ls *LState) pushCallFrame(cf callFrame, fn LValue, meta bool) ' in '_state.go'
@@ -1772,11 +1787,26 @@ func init() {
 					// U2f re-pin: luaG_typeerror names the callee's type
 					ls.raiseCallError(fn)
 				}
-				if ls.stack.IsFull() {
-					ls.RaiseError("stack overflow")
+				// P4: the fixed (default) frame stack takes a direct path — the
+				// Push+Last pair is two itab dispatches otherwise, and Push's body
+				// (13-word copy + Idx + sp) inlines here. The growing
+				// (MinimizeStackMemory) stack keeps the interface path, unchanged.
+				var newcf *callFrame
+				if fs, ok := ls.stack.(*fixedCallFrameStack); ok {
+					if fs.sp >= len(fs.array) {
+						ls.RaiseError("stack overflow")
+					}
+					fs.array[fs.sp] = cf
+					fs.array[fs.sp].Idx = fs.sp
+					fs.sp++
+					newcf = &fs.array[fs.sp-1]
+				} else {
+					if ls.stack.IsFull() {
+						ls.RaiseError("stack overflow")
+					}
+					ls.stack.Push(cf)
+					newcf = ls.stack.Last()
 				}
-				ls.stack.Push(cf)
-				newcf := ls.stack.Last()
 				// this section is inlined by go-inline
 				// source function is 'func (ls *LState) initCallFrame(cf *callFrame) ' in '_state.go'
 				{
@@ -1836,8 +1866,12 @@ func init() {
 				ls.currentFrame = newcf
 			}
 			// U5f: the call hook fires at the callee's first instruction
-			// (precallC for a G callee, luaG_tracecall otherwise)
-			L.hookCallEvent(L.currentFrame)
+			// (precallC for a G callee, luaG_tracecall otherwise) — the
+			// mask guard is inline, so the common no-hook posture skips
+			// the call (hookCallEvent's own first check)
+			if L.hookMask != 0 {
+				L.hookCallEvent(L.currentFrame)
+			}
 			if callable.IsG && callGFunction(L, false) {
 				return 1
 			}
@@ -1855,39 +1889,49 @@ func init() {
 				nargs = reg.Top() - (RA + 1)
 			}
 			lv := reg.Get(RA)
-			// U5d (row 22): a marker callee replaces this frame wholesale
-			// (stock: a tailcall to C returns to OUR caller) — the closes
-			// run first, Go-driven, per the TAILCALL ruling
-			if kind := markerKind(L, lv, RA, nargs); kind != 0 {
-				// this section is inlined by go-inline
-				// source function is 'func (ls *LState) closeUpvalues(idx int) ' in '_state.go'
-				{
-					ls := L
-					idx := lbase
-					if ls.uvcache != nil {
-						var prev *Upvalue
-						for uv := ls.uvcache; uv != nil; uv = uv.next {
-							if uv.index >= idx {
-								if prev != nil {
-									prev.next = nil
-								} else {
-									ls.uvcache = nil
+			// P4 fast path: a Lua callee is neither marker nor __call
+			// chain — markerKind's and resolveCall's fast out, inlined
+			// (see OP_CALL)
+			callable, _ := lv.(*LFunction)
+			callee, ccmt := lv, 0
+			if callable == nil || callable.IsG {
+				// U5d (row 22): a marker callee replaces this frame wholesale
+				// (stock: a tailcall to C returns to OUR caller) — the closes
+				// run first, Go-driven, per the TAILCALL ruling
+				if kind := markerKind(L, lv, RA, nargs); kind != 0 {
+					// this section is inlined by go-inline
+					// source function is 'func (ls *LState) closeUpvalues(idx int) ' in '_state.go'
+					{
+						ls := L
+						idx := lbase
+						if ls.uvcache != nil {
+							var prev *Upvalue
+							for uv := ls.uvcache; uv != nil; uv = uv.next {
+								if uv.index >= idx {
+									if prev != nil {
+										prev.next = nil
+									} else {
+										ls.uvcache = nil
+									}
+									uv.Close()
 								}
-								uv.Close()
+								prev = uv
 							}
-							prev = uv
 						}
 					}
+					L.closeTBC(lbase)
+					if pushPcallMarker(L, cf, lv, RA, nargs, cf.NRet, kind, true) {
+						return 1
+					}
+					return 0
 				}
-				L.closeTBC(lbase)
-				if pushPcallMarker(L, cf, lv, RA, nargs, cf.NRet, kind, true) {
-					return 1
+				// U5c: the full __call chain (row 83) — inserts at RA+1, the
+				// reused frame's argument window. A G callee is resolveCall's
+				// fast arm already; only a non-function can start a chain.
+				if callable == nil {
+					callable, callee, ccmt = L.resolveCall(lv, RA+1)
 				}
-				return 0
 			}
-			// U5c: the full __call chain (row 83) — inserts at RA+1, the
-			// reused frame's argument window
-			callable, callee, ccmt := L.resolveCall(lv, RA+1)
 			nargs += ccmt
 			if callable == nil {
 				// U2f re-pin: luaG_typeerror names the callee's type —
@@ -1936,7 +1980,9 @@ func init() {
 					CCmt:       ccmt,
 				}, callee, false)
 				// U5f: the tailcalled C callee's call hook (precallC)
-				L.hookCallEvent(L.currentFrame)
+				if L.hookMask != 0 {
+					L.hookCallEvent(L.currentFrame)
+				}
 				if callGFunction(L, true) {
 					return 1
 				}
@@ -2061,7 +2107,9 @@ func init() {
 				cf.LocalBase = base + 1
 				// U5f: the reused frame reports "tail call" (TailCall > 0);
 				// a vararg callee defers to its OP_VARARGPREP
-				L.hookCallEvent(cf)
+				if L.hookMask != 0 {
+					L.hookCallEvent(cf)
+				}
 			}
 			return 0
 		},
@@ -2524,11 +2572,26 @@ func init() {
 					// U2f re-pin: luaG_typeerror names the callee's type
 					ls.raiseCallError(fn)
 				}
-				if ls.stack.IsFull() {
-					ls.RaiseError("stack overflow")
+				// P4: the fixed (default) frame stack takes a direct path — the
+				// Push+Last pair is two itab dispatches otherwise, and Push's body
+				// (13-word copy + Idx + sp) inlines here. The growing
+				// (MinimizeStackMemory) stack keeps the interface path, unchanged.
+				var newcf *callFrame
+				if fs, ok := ls.stack.(*fixedCallFrameStack); ok {
+					if fs.sp >= len(fs.array) {
+						ls.RaiseError("stack overflow")
+					}
+					fs.array[fs.sp] = cf
+					fs.array[fs.sp].Idx = fs.sp
+					fs.sp++
+					newcf = &fs.array[fs.sp-1]
+				} else {
+					if ls.stack.IsFull() {
+						ls.RaiseError("stack overflow")
+					}
+					ls.stack.Push(cf)
+					newcf = ls.stack.Last()
 				}
-				ls.stack.Push(cf)
-				newcf := ls.stack.Last()
 				// this section is inlined by go-inline
 				// source function is 'func (ls *LState) initCallFrame(cf *callFrame) ' in '_state.go'
 				{
@@ -2865,8 +2928,10 @@ func init() {
 				tb.RawSetString("n", LInteger(nextra))
 				reg.Set(lbase+np, tb)
 				// U5f: stock OP_VARARGPREP's trap arm — the deferred call
-				// hook fires after the table build
-				L.hookVarargCallEvent(cf)
+				// hook fires after the table build (mask guard inline, P4)
+				if L.hookMask != 0 {
+					L.hookVarargCallEvent(cf)
+				}
 				return 0
 			}
 			newbase := lbase + np + nextra // just above all the arguments
@@ -2882,8 +2947,10 @@ func init() {
 			reg.array[newbase+np] = LNil // the vararg parameter slot
 			cf.LocalBase = newbase
 			// U5f: stock OP_VARARGPREP's trap arm — the deferred call
-			// hook fires after the shuffle, oldpc=1
-			L.hookVarargCallEvent(cf)
+			// hook fires after the shuffle, oldpc=1 (mask guard inline, P4)
+			if L.hookMask != 0 {
+				L.hookVarargCallEvent(cf)
+			}
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_EXTRAARG
@@ -3600,6 +3667,13 @@ func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) i
 			}
 		}
 	}
+	if cf.Pcall == 0 && (L.tbclist == nil || L.tbclist.idx < lbase) {
+		// P4 fast path: the overwhelming shape of returns — no marker
+		// continuation, and no tbc entry at this frame's depth (the
+		// exact negation of closeTBCVM's loop condition, inlined so the
+		// call is skipped). doReturnTail is all that is left.
+		return doReturnTail(L, cf, baseframe, RA, nres, b)
+	}
 	if cf.Pcall == 4 || cf.Pcall == 5 || cf.Pcall == 7 {
 		// a VM-called __close returned (its results are discarded —
 		// NRet=0): the close body's own tbc variables close Go-driven
@@ -3685,8 +3759,12 @@ func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) i
 func doReturnTail(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) int {
 	// U5f: the RETURN event before the results move (stock rethook at
 	// luaD_poscall; for a tbc frame moveresults runs it after the
-	// closes — exactly the state doReturn reaches this tail in)
-	L.hookReturnEvent(cf, RA, nres)
+	// closes — exactly the state doReturn reaches this tail in) — the
+	// mask guard is inline, so the common no-hook posture skips the
+	// call (hookReturnEvent's own first check)
+	if L.hookMask != 0 {
+		L.hookReturnEvent(cf, RA, nres)
+	}
 	reg := L.reg
 	n := cf.NRet
 	if cf.NRet == MultRet {
@@ -3802,7 +3880,17 @@ func doReturnTail(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b in
 		switchToParentThread(L, n, false, true)
 		return 1
 	}
-	islast := baseframe == L.stack.Pop() || L.stack.IsEmpty()
+	// P4: the return tail's three stack ops (Pop, IsEmpty, Last) are itab
+	// dispatches on the interface field; asserted once for the fixed
+	// (default) stack, they run direct. Semantics identical: Pop returns
+	// the popped slot, Last nils at depth zero.
+	var islast bool
+	if fs, ok := L.stack.(*fixedCallFrameStack); ok {
+		fs.sp--
+		islast = baseframe == &fs.array[fs.sp] || fs.sp == 0
+	} else {
+		islast = baseframe == L.stack.Pop() || L.stack.IsEmpty()
+	}
 	// this section is inlined by go-inline
 	// source function is 'func copyReturnValues(L *LState, regv, start, n, b int) ' in '_vm.go'
 	{
@@ -3908,7 +3996,15 @@ func doReturnTail(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b in
 			}
 		}
 	}
-	L.currentFrame = L.stack.Last()
+	if fs, ok := L.stack.(*fixedCallFrameStack); ok {
+		if fs.sp == 0 {
+			L.currentFrame = nil
+		} else {
+			L.currentFrame = &fs.array[fs.sp-1]
+		}
+	} else {
+		L.currentFrame = L.stack.Last()
+	}
 	if !islast && L.currentFrame != nil && L.currentFrame.Pcall >= 1 && L.currentFrame.Pcall <= 3 {
 		// U5d (row 22): the body of a pcall/xpcall/pairs marker returned
 		// — complete it (prefix + restage at its return window, cascade

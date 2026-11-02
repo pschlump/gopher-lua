@@ -1558,11 +1558,26 @@ func (ls *LState) pushCallFrame(cf callFrame, fn LValue, meta bool) { // +inline
 		// U2f re-pin: luaG_typeerror names the callee's type
 		ls.raiseCallError(fn)
 	}
-	if ls.stack.IsFull() {
-		ls.RaiseError("stack overflow")
+	// P4: the fixed (default) frame stack takes a direct path — the
+	// Push+Last pair is two itab dispatches otherwise, and Push's body
+	// (13-word copy + Idx + sp) inlines here. The growing
+	// (MinimizeStackMemory) stack keeps the interface path, unchanged.
+	var newcf *callFrame
+	if fs, ok := ls.stack.(*fixedCallFrameStack); ok {
+		if fs.sp >= len(fs.array) {
+			ls.RaiseError("stack overflow")
+		}
+		fs.array[fs.sp] = cf
+		fs.array[fs.sp].Idx = fs.sp
+		fs.sp++
+		newcf = &fs.array[fs.sp-1]
+	} else {
+		if ls.stack.IsFull() {
+			ls.RaiseError("stack overflow")
+		}
+		ls.stack.Push(cf)
+		newcf = ls.stack.Last()
 	}
-	ls.stack.Push(cf)
-	newcf := ls.stack.Last()
 	// this section is inlined by go-inline
 	// source function is 'func (ls *LState) initCallFrame(cf *callFrame) ' in '_state.go'
 	{

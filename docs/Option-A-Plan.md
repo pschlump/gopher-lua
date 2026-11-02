@@ -290,13 +290,19 @@ text, numerals — is a bug, not a trade).
   measured lanes — the honest number is the −18…−20% above.
 - **P3 — string interning (~1 week, est 5–15%):** intern at compile time
   (constants) and table-key store; per-VM pool; pointer-equality compares.
-- **P4 — call path (promoted by P1's refutation; data-scoped ~5–10% on
-  call lanes):** fib's measured costs are the per-call generality —
-  `doReturn`/`doReturnTail` cum ~35% (marker/tbc/yield guard sequence +
-  generic result staging), frame `Push` ~5% (13-word `callFrame`
-  by-value copy), `resolveCall`/`markerKind` ~2.5%. Fast paths for the
-  plain Lua→Lua call/return (no marker, no tbc, fixed arity) are the
-  vehicle; glasm's U9/U10 lessons apply in shape.
+- **P4 — call path — DONE (2026-11-02, `docs/Perf-P4-Call-Path.md`):**
+  the per-call generality measured on fib is gone from the profile:
+  Lua-callee fast paths at OP_CALL/OP_TAILCALL (markerKind's and
+  resolveCall's fast out, inlined), a `Pcall==0 && tbc-list-empty`
+  return fast path (closeTBCVM's own loop condition negated, inlined),
+  inline `hookMask` guards at all five hot hook sites, and the
+  frame-stack trio (Push/Pop/Last) devirtualized for the fixed
+  (default) stack with the `MinimizeStackMemory` path unchanged.
+  Benchstat: **fib −22% (≈6.1×C), callret −16% (≈7.0×C), tco −4%,
+  geomean −5.32%**; non-call lanes flat. Not done, deliberately: frame
+  representation (`[]*callFrame`) to kill the 13-word Push copy —
+  invasive and, per the P1 lesson, likely a wash; the remaining fib
+  cost is arith boxing (P6) and comparisons.
 - **P6 — LValue representation (new, biggest open lever):** numloop
   14.6×C is boxed arithmetic — every result outside the [0,128) preload
   arena-allocates (`arithCompute`+`LInteger2I`/`LNumber2I` ≈ 57% of
@@ -319,7 +325,7 @@ text, numerals — is a bug, not a trade).
 | closed | P1 register windows — measured refutation (Perf-P1-Findings.md) | — |
 | 4     | done N2 sandbox (budget, protection, stdlib)     | ~3–5 days |
 | 5     | done P2 table engine (Perf-P2-Table-Engine.md)   | —         |
-| 6     | P4 call path (promoted by P1 findings)           | by data   |
+| 6     | done P4 call path (Perf-P4-Call-Path.md)         | —         |
 | 7     | P3 interning                                     | ~1 week   |
 | done  | N3b embedcmp legs (Embedded-EVAL-Perf.md)        | —         |
 | done  | N5 Ultima cutover (differential 332/0 vs live Redis) | —     |

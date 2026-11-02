@@ -196,11 +196,40 @@ type LTable struct {
 	// seed tables, which are built before their Global exists).
 	acct *Global
 
-	array   []LValue
-	dict    map[LValue]LValue
-	strdict map[string]LValue
-	keys    []LValue
-	k2i     map[LValue]int
+	array []LValue
+
+	// P2 hash part: one open-addressed node array holds every hash-part
+	// key — strings and everything else share a single first-insertion
+	// order (the invariant the old strdict/dict + keys/k2i quartet kept,
+	// at four allocations and a per-write double bookkeeping). A slot is
+	// storage, not order: iteration order rides the intrusive ins links
+	// (first…tail), so rehashing never reorders anything. A nil key
+	// marks a never-used slot; deletion writes LNil over the value (a
+	// tombstone) and leaves key and link alone, so a deleted-then-
+	// reinserted key lands back in its original position — the order
+	// behavior the official suite and the P2 probe pin.
+	nodes []hnode // len is a power of two; nil until the first hash write
+	mask  uint32  // len(nodes)-1
+	first int32   // insertion chain head; -1 when no hash entry ever
+	tail  int32   // insertion chain tail; -1 likewise
+	used  int32   // nodes holding a key (live + tombstones)
+	// strKeys counts live string keys (the old len(strdict)); the two
+	// *Charged flags mirror the old strdict==nil / dict==nil one-shot
+	// materialization events so the per-VM budget charges (including
+	// their firing order relative to the key kinds) stay identical.
+	strKeys     int32
+	strdCharged bool
+	dictCharged bool
+}
+
+// hnode is one hash-part slot: two interface cells, the cached hash and
+// the order link — 40 bytes. hash is stored so a rehash never re-hashes
+// a string, and it filters the full interface compare while probing.
+type hnode struct {
+	key  LValue // nil interface = never-used; a deleted key stays (tombstone)
+	val  LValue // LNil = tombstone; live entries never hold LNil
+	hash uint32
+	ins  int32 // insertion-order link to the next node; -1 = tail
 }
 
 func (tb *LTable) String() string   { return fmt.Sprintf("table: %p", tb) }

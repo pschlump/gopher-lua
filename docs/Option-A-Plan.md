@@ -273,13 +273,21 @@ text, numerals — is a bug, not a trade).
   representation change, biggest open lever, needs its own milestone),
   **P4 call path** (fib's ~35% cum return-path + push costs — promoted),
   P2 tables (unchanged).
-- **P2 — table engine rewrite (2–4 weeks, est 1.5–3× on hash-heavy):**
-  (i) replace `keys`/`k2i` double-map with intrusive insertion-order links;
-  (ii) precomputed string-key hashes + own open-addressing table (kills
-  per-op re-hashing, gives native `next()`); (iii) ≤8-slot linear
-  small-table fast path (where most EVAL-shaped tables live); (iv) inline
-  the no-metatable check into get/set field. `Next()` order observability
-  is test-pinned — it is part of the byte-exact contract.
+- **P2 — table engine — DONE (2026-11-01, `docs/Perf-P2-Table-Engine.md`):**
+  the `strdict`/`dict`/`keys`/`k2i` quartet is one open-addressed `[]hnode`
+  (≤3/4 load, cached hash, 40B/slot) with intrusive first-insertion links
+  and tombstone deletes — re-insert keeps the original iteration position,
+  rehash never reorders, `next()` is a chain walk. Charge model
+  byte-identical (creation, both one-shot seams, per-key +48, the
+  `hcap≠0` birth case OP_VARARG depends on). Items (i)+(ii-cached-hash)
+  built; (iii) realized as the 8-slot initial table (a separate linear
+  mode measured-unnecessary by construction); (iv) not needed — `metaOp1`
+  already fast-outs, call lanes flat. Benchstat: **tablechurn −18%,
+  concat −20%, h_tiny interp −37%, geomean −6.73%**; non-table lanes
+  flat. Gates: goldens byte-exact, order probe identical, new
+  churn-vs-model gate (`table_p2_test.go`), race, CGO-free. Est 1.5–3×
+  on hash-heavy was wrong-scale for what tables actually cost the
+  measured lanes — the honest number is the −18…−20% above.
 - **P3 — string interning (~1 week, est 5–15%):** intern at compile time
   (constants) and table-key store; per-VM pool; pointer-equality compares.
 - **P4 — call path (promoted by P1's refutation; data-scoped ~5–10% on
@@ -310,7 +318,7 @@ text, numerals — is a bug, not a trade).
 | done  | P1a amortized deadline check (Perf-P1a-Deadline-Check.md) | days |
 | closed | P1 register windows — measured refutation (Perf-P1-Findings.md) | — |
 | 4     | done N2 sandbox (budget, protection, stdlib)     | ~3–5 days |
-| 5     | P2 table engine                                  | 2–4 weeks |
+| 5     | done P2 table engine (Perf-P2-Table-Engine.md)   | —         |
 | 6     | P4 call path (promoted by P1 findings)           | by data   |
 | 7     | P3 interning                                     | ~1 week   |
 | done  | N3b embedcmp legs (Embedded-EVAL-Perf.md)        | —         |

@@ -130,15 +130,21 @@ func (w *weakSweep) markTable(tb *LTable) {
 			for _, v := range tb.array {
 				w.mark(v)
 			}
-			for _, v := range tb.dict {
-				w.mark(v)
-			}
-			for _, v := range tb.strdict {
-				w.mark(v)
+			// values stay strong (both key kinds); tombstones hold no
+			// live entry, so like the old dict/strdict walks they mark
+			// nothing — a deleted key must not pin its referent
+			for i := tb.first; i >= 0; i = tb.nodes[i].ins {
+				if v := tb.nodes[i].val; v != LNil {
+					w.mark(v)
+				}
 			}
 		case vmode && !kmode:
-			for k := range tb.dict {
-				w.mark(k)
+			// keys stay strong (string keys are eternal, so marking
+			// every node key matches the old dict-keys-only walk)
+			for i := tb.first; i >= 0; i = tb.nodes[i].ins {
+				if v := tb.nodes[i].val; v != LNil {
+					w.mark(tb.nodes[i].key)
+				}
 			}
 		}
 		return
@@ -146,12 +152,11 @@ func (w *weakSweep) markTable(tb *LTable) {
 	for _, v := range tb.array {
 		w.mark(v)
 	}
-	for k, v := range tb.dict {
-		w.mark(k)
-		w.mark(v)
-	}
-	for _, v := range tb.strdict {
-		w.mark(v)
+	for i := tb.first; i >= 0; i = tb.nodes[i].ins {
+		if v := tb.nodes[i].val; v != LNil {
+			w.mark(tb.nodes[i].key)
+			w.mark(v)
+		}
 	}
 }
 
@@ -217,15 +222,17 @@ func (w *weakSweep) clear() {
 			}
 		}
 		if kmode || vmode {
-			for k, v := range tb.dict {
-				if (vmode && v != LNil && weakCollectable(v) && !w.marked[v]) ||
-					(kmode && weakCollectable(k) && !w.marked[k]) {
-					tb.RawSetH(k, LNil)
+			// live nodes only — a string-keyed entry clears through
+			// RawSetH → RawSetString, and deletion is a tombstone, so
+			// the walk mutates values only and the chain stays intact
+			for i := tb.first; i >= 0; i = tb.nodes[i].ins {
+				n := &tb.nodes[i]
+				if n.val == LNil {
+					continue
 				}
-			}
-			for s, v := range tb.strdict {
-				if vmode && v != LNil && weakCollectable(v) && !w.marked[v] {
-					tb.RawSetString(s, LNil)
+				if (vmode && weakCollectable(n.val) && !w.marked[n.val]) ||
+					(kmode && weakCollectable(n.key) && !w.marked[n.key]) {
+					tb.RawSetH(n.key, LNil)
 				}
 			}
 		}

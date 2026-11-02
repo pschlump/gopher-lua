@@ -2875,7 +2875,6 @@ func (ls *LState) Get(idx int) LValue {
 			return LNil
 		}
 	}
-	return LNil
 }
 
 func (ls *LState) Push(value LValue) {

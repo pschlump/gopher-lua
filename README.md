@@ -66,11 +66,14 @@ It builds on that foundation with:
 ## How about performance?
 
 All numbers below are from one Apple M4 Max (arm64, go1.27.0) in one
-2026-11-02 session, tree at the P6 perf milestone; the C reference is
+2026-11-02 session, tree at the P6 engine milestone plus the P7
+embed-seam milestone (host-side only — the engine lanes are unchanged
+by P7); the C reference is
 **stock C Lua 5.5.1** built `-O2` (`clang 21`). Full methodology and
 raw runs: [docs/Perf-P0-Baseline.md](docs/Perf-P0-Baseline.md) (the
 same-session C calibration), [docs/Perf-P6-Boxing.md](docs/Perf-P6-Boxing.md)
-(engine numbers), and [docs/Embedded-EVAL-Perf.md](docs/Embedded-EVAL-Perf.md)
+(engine numbers), [docs/Perf-P7-Embed-Seam.md](docs/Perf-P7-Embed-Seam.md)
+(the embed seam), and [docs/Embedded-EVAL-Perf.md](docs/Embedded-EVAL-Perf.md)
 (the embedded suite). The meaningful column is always the *ratio* —
 absolute numbers move with the machine. (`cmd/luabench` and
 `cmd/embedcmp` reproduce any of it.)
@@ -100,7 +103,7 @@ small script, run it, return) a pooled gopher-lua VM **beats the C
 CLI** — it re-runs an already-compiled chunk while C re-parses. Where
 the work is per-instruction compute, `-O2` C's dispatch wins: string
 and table lanes within ~2×, call-shaped lanes ~6×, tight numeric
-boxing-heavy loops ~12× (a 5.1→11.7× improvement across this fork's
+boxing-heavy loops ~12× (a 22.2→11.7× improvement across this fork's
 perf program; numloop was 22.2×C at its baseline).
 
 ### Embedded usage — the EVAL shape (`cmd/embedcmp`)
@@ -114,28 +117,29 @@ mismatches across the suite):
 
 | script (short EVAL-shape) | C, state reuse | C, fresh state | gopher-lua, fresh VM | gopher-lua, pooled VM | pooled ×C |
 |--------------------------|----------------|----------------|----------------------|-----------------------|-----------|
-| e_arg (arg arithmetic)       | 0.4 µs  | 15.4 µs | 13.8 µs  | 2.7 µs  | 7.2×  |
-| e_sum (KEYS aggregation)     | 0.8 µs  | 17.0 µs | 15.8 µs  | 4.6 µs  | 6.1×  |
-| e_tag (reply array build)    | 1.3 µs  | 17.3 µs | 16.4 µs  | 5.4 µs  | 4.0×  |
-| e_norm (string normalize)    | 0.5 µs  | 16.6 µs | 18.2 µs  | 7.2 µs  | 15.8× |
-| e_hash (40-field hash loop)  | 5.4 µs  | 23.5 µs | 22.5 µs  | 11.9 µs | 2.2×  |
-| e_call (200 Go-fn crossings) | 14.8 µs | 38.7 µs | 52.6 µs  | 44.3 µs | 3.0×  |
-| e_sort (500-element sort)    | 44.7 µs | 58.8 µs | 142.0 µs | 132.6 µs| 3.0×  |
+| e_arg (arg arithmetic)       | 0.3 µs  | 15.8 µs | 14.0 µs  | 2.7 µs  | 8.0×  |
+| e_sum (KEYS aggregation)     | 0.8 µs  | 18.0 µs | 16.0 µs  | 4.7 µs  | 6.2×  |
+| e_tag (reply array build)    | 1.3 µs  | 18.8 µs | 17.0 µs  | 5.3 µs  | 4.0×  |
+| e_norm (string normalize)    | 0.5 µs  | 17.1 µs | 18.9 µs  | 7.1 µs  | 15.4× |
+| e_hash (40-field hash loop)  | 6.1 µs  | 24.9 µs | 23.6 µs  | 11.7 µs | 1.9×  |
+| e_call (200 Go-fn crossings) | 16.1 µs | 42.0 µs | 50.3 µs  | 42.0 µs | 2.6×  |
+| e_sort (500-element sort)    | 45.2 µs | 62.5 µs | 143.5 µs | 132.8 µs| 2.9×  |
 
 Reading it:
 
 - Against the state-reuse embedder, scripts that do real work run at
-  **2–3× C**; the residual on trivial scripts is a fixed ~2.6 µs
+  **2–3× C**; the residual on trivial scripts is a fixed ~2.7 µs
   per-run floor (pool dispatch + KEYS/ARGV staging + result
-  collection) against C's ~0.2 µs, not per-instruction slowness.
-- A host-function crossing costs **~0.21 µs** (vs C's ~72 ns through
-  its C API): a Go closure, argument conversion, no wire.
+  collection) against C's ~0.3 µs, not per-instruction slowness.
+- A host-function crossing costs **~0.20 µs** in this suite, ~0.16 µs
+  in the isolated in-process rig (vs C's ~72 ns through its C API): a
+  Go closure, argument conversion, no wire.
 - Fresh-VM-per-run — the maximum-isolation posture, no shared guest
-  state at all — lands at 13.8–18.2 µs on trivial scripts, **on par
-  with C's own newstate-per-run** (and a fresh VM here is a µs-scale
-  `LState` build, not a process).
-- First run after daemon start: 33–186 µs in-process; compile is
-  32–41 µs vs C's 8–10 µs loadbuffer (the known parser gap — it is a
+  state at all — lands at 14–19 µs on trivial scripts, **on par with
+  C's own newstate-per-run** (faster on 4 of 7 lanes; and a fresh VM
+  here is a µs-scale `LState` build, not a process).
+- First run after daemon start: 42–181 µs in-process; compile is
+  26–43 µs vs C's 8–10 µs loadbuffer (the known parser gap — it is a
   real parse, no cache tier, paid once per script).
 
 ### Memory utilization
@@ -145,9 +149,15 @@ the loop):
 
 | posture              | C Lua 5.5.1 | gopher-lua |
 |----------------------|-------------|------------|
-| one-shot process     | 2.0–2.1 MB  | 7.2–7.6 MB |
-| warm loop            | 2.1–2.5 MB  | 8.2–8.8 MB |
+| one-shot process     | 2.0–2.1 MB  | 7.3–7.5 MB |
+| warm loop            | 2.1–2.4 MB  | 8.1–8.8 MB |
 | live heap after loop | ~20 KB Lua heap | ~0.5 MB Go heap |
+
+Allocation *rate* is a separate axis the P7 milestone cut: a pooled
+run stages KEYS/ARGV and collects results with **−40% of the
+allocations** it used to, and each host-function crossing (the
+redis.call shape) **−26%** — less garbage per EVAL for the Go GC under
+sustained load.
 
 The ~4× RSS is the Go runtime floor plus one `LState` and the
 standard library tables — it is a **process** number, not a per-VM
@@ -173,10 +183,11 @@ with none of it)".
 ### The perf program
 
 These numbers are the product of a measured, milestone-gated program
-(P0–P6, [docs/Option-A-Plan.md](docs/Option-A-Plan.md)) — context
+(P0–P7, [docs/Option-A-Plan.md](docs/Option-A-Plan.md)) — context
 checks, the table engine, the call path, string-constant hashing, the
-concat fold, and boxing — compounding to **≈ −35% geomean** against
-its own baseline, every step benchstat-gated and byte-exactness-gated.
+concat fold, boxing, and the embed-seam allocation diet — compounding
+to **≈ −35% geomean** against its own baseline, every step
+benchstat-gated and byte-exactness-gated.
 
 ## Installation
 

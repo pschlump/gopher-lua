@@ -76,7 +76,18 @@ func goldenRun(c goldenCase, suiteFlags bool) []string {
 		IncludeGoStackTrace: true,
 	})
 	defer L.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// The per-case context is a HANG GUARD (closure.lua-class hangs
+	// convert to an error, not a stuck suite), not a semantic gate —
+	// 60s holds on a dev machine but a 2-vCPU shared CI runner runs the
+	// heavyweight cases (calls.lua's binary-chunk leg) 5–10× slower, so
+	// the timeout is env-tunable and CI sets it generously.
+	caseTimeout := 60 * time.Second
+	if v := os.Getenv("GOLDEN_CASE_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			caseTimeout = time.Duration(n) * time.Second
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), caseTimeout)
 	defer cancel()
 	L.SetContext(ctx)
 

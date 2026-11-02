@@ -32,6 +32,11 @@ jobs:
           go-version-file: go.mod
 
       - name: Regenerate + format + full suite (goldens byte-exact)
+        env:
+          # Shared 2-vCPU runners run the heavyweight golden cases
+          # (calls.lua's binary-chunk leg) 5-10x slower than a dev
+          # machine; the hang-guard timeout scales accordingly.
+          GOLDEN_CASE_TIMEOUT: "600"
         run: make test
 
       - name: Committed tree matches regenerated output

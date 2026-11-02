@@ -82,6 +82,15 @@ type FunctionProto struct {
 	DbgUpvalues        []string
 
 	stringConstants []string
+
+	// strConstHash holds uint32(maphash.String(mhseed, s)) for every
+	// string constant (0 for non-strings), parallel to Constants —
+	// P3: the constant-key ops (GETFIELD/GETTABUP/SELF/SETFIELD/
+	// SETTABUP) look the same string constant up every dispatch, so
+	// its hash is computed once here instead of per access. Filled at
+	// compile finalize and at undump; a hand-built proto leaves it nil
+	// and the VM falls back to hashing per access.
+	strConstHash []uint32
 }
 
 /* Upvalue {{{ */

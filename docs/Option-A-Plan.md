@@ -288,8 +288,22 @@ text, numerals — is a bug, not a trade).
   churn-vs-model gate (`table_p2_test.go`), race, CGO-free. Est 1.5–3×
   on hash-heavy was wrong-scale for what tables actually cost the
   measured lanes — the honest number is the −18…−20% above.
-- **P3 — string interning (~1 week, est 5–15%):** intern at compile time
-  (constants) and table-key store; per-VM pool; pointer-equality compares.
+- **P3 — string constants — DONE (2026-11-02, `docs/Perf-P3-String-Constants.md`):**
+  the plan's interning premise was ranked against the pre-P2 engine; a
+  micro-bench showed the hash is 3.67ns of a 5.52ns lookup, so the win
+  is only in killing the per-op re-hash of *constant* keys.
+  `FunctionProto.strConstHash` (filled at compile finalize and at
+  undump — the maphash seed is per-process) rides the five constant-key
+  ops through a hash-taking `rawGetStringH`. Benchstat: **str −4.4%,
+  strlong −3.4%, hostfn −4.2% (all p≤0.004), geomean −0.54%**; fib/
+  callret/concat flat. The milestone's real finding is the **null
+  experiment**: identical code with the fill disabled still pays
+  +1.2% geomean — a ~1–2% no-op floor on any `_vm.go` perturbation
+  that future milestones must clear (and sub-2% lane "regressions"
+  must not be chased). Pool interning and inline direct-slot probes
+  measured as non-wins (store-side interning is a loss on
+  fresh-concat keys; probes' marginal str gain was eaten by the
+  floor) — both recorded in the doc.
 - **P4 — call path — DONE (2026-11-02, `docs/Perf-P4-Call-Path.md`):**
   the per-call generality measured on fib is gone from the profile:
   Lua-callee fast paths at OP_CALL/OP_TAILCALL (markerKind's and
@@ -326,10 +340,11 @@ text, numerals — is a bug, not a trade).
 | 4     | done N2 sandbox (budget, protection, stdlib)     | ~3–5 days |
 | 5     | done P2 table engine (Perf-P2-Table-Engine.md)   | —         |
 | 6     | done P4 call path (Perf-P4-Call-Path.md)         | —         |
-| 7     | P3 interning                                     | ~1 week   |
+| 7     | done P3 string constants (Perf-P3-String-Constants.md) | —   |
 | done  | N3b embedcmp legs (Embedded-EVAL-Perf.md)        | —         |
 | done  | N5 Ultima cutover (differential 332/0 vs live Redis) | —     |
-| 8     | P5 misc / P6 LValue representation (decision pending) | by data |
+| 8     | P5 misc; P6 LValue representation (decision pending — now the | by data |
+|       | dominant lane, numloop 14.6×C)                          |         |
 
 A usable Ultima engine exists after step 4 (~3 weeks in); the full program
 is ~6–9 weeks.

@@ -13,6 +13,7 @@ package lua
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/maphash"
 	"math"
 )
 
@@ -502,6 +503,10 @@ func (s *loadState) constants(p *FunctionProto) error {
 		return err
 	}
 	p.Constants = make([]LValue, n)
+	// P3: undumped protos get their constant-hash side table here —
+	// maphash's seed is per-process, so a hash carried in the dump
+	// would be wrong (silent wrong-slot probes); it is always derived.
+	p.strConstHash = make([]uint32, n)
 	for i := 0; i < n; i++ {
 		t, err := s.byte_()
 		if err != nil {
@@ -535,6 +540,7 @@ func (s *loadState) constants(p *FunctionProto) error {
 				return s.fail("bad format for constant string")
 			}
 			p.Constants[i] = LString(v)
+			p.strConstHash[i] = uint32(maphash.String(mhseed, v))
 		default:
 			return s.fail("invalid constant")
 		}

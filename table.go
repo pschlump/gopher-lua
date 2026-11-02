@@ -565,10 +565,20 @@ func (tb *LTable) RawGetH(key LValue) LValue {
 // probe loop lives here: hash, mask, compare — no LValue boxing of the
 // query, no method-call layer.
 func (tb *LTable) RawGetString(key string) LValue {
+	return tb.rawGetStringH(key, 0)
+}
+
+// rawGetStringH is RawGetString taking the key's hash when the caller
+// already has it (the VM's constant-key ops carry the per-proto
+// precomputed hash). h==0 means "none supplied" — a constant whose true
+// hash IS zero just recomputes it here, correctly.
+func (tb *LTable) rawGetStringH(key string, h uint32) LValue {
 	if tb.nodes == nil {
 		return LNil
 	}
-	h := uint32(maphash.String(mhseed, key))
+	if h == 0 {
+		h = uint32(maphash.String(mhseed, key))
+	}
 	i := h & tb.mask
 	for {
 		n := &tb.nodes[i]

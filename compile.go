@@ -2,6 +2,7 @@ package lua
 
 import (
 	"fmt"
+	"hash/maphash"
 	"math"
 	"reflect"
 
@@ -3016,6 +3017,7 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 			sv = string(slv)
 		}
 		context.Proto.stringConstants = append(context.Proto.stringConstants, sv)
+		context.Proto.strConstHash = append(context.Proto.strConstHash, uint32(maphash.String(mhseed, sv)))
 	}
 	patchCode(context)
 } // }}}

@@ -2588,12 +2588,14 @@ func (ls *LState) getField(obj LValue, key LValue, hint varinfoHint) (LValue, ui
 	return nil, mmSync
 }
 
-func (ls *LState) getFieldString(obj LValue, key string, hint varinfoHint) (LValue, uint8) {
+// h is the key's hash when the caller has it (the VM's constant-key ops
+// carry the per-proto precomputed hash); 0 = compute inside.
+func (ls *LState) getFieldString(obj LValue, key string, h uint32, hint varinfoHint) (LValue, uint8) {
 	curobj := obj
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
-			ret := tb.RawGetString(key)
+			ret := tb.rawGetStringH(key, h)
 			if ret != LNil {
 				return ret, mmSync
 			}
@@ -2662,7 +2664,7 @@ func (ls *LState) setField(obj LValue, key LValue, value LValue, hint varinfoHin
 	return mmSync
 }
 
-func (ls *LState) setFieldString(obj LValue, key string, value LValue, hint varinfoHint) uint8 {
+func (ls *LState) setFieldString(obj LValue, key string, h uint32, value LValue, hint varinfoHint) uint8 {
 	curobj := obj
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
@@ -2670,7 +2672,7 @@ func (ls *LState) setFieldString(obj LValue, key string, value LValue, hint vari
 			if tb.readonly {
 				ls.RaiseError("Attempt to modify a readonly table")
 			}
-			if tb.RawGetString(key) != LNil {
+			if tb.rawGetStringH(key, h) != LNil {
 				tb.RawSetString(key, value)
 				return mmSync
 			}
@@ -3453,7 +3455,7 @@ func (ls *LState) RawGetInt(tb *LTable, key int) LValue {
 }
 
 func (ls *LState) GetField(obj LValue, skey string) LValue {
-	v, _ := ls.getFieldString(obj, skey, varinfoHint{})
+	v, _ := ls.getFieldString(obj, skey, 0, varinfoHint{})
 	return v
 }
 
@@ -3476,7 +3478,7 @@ func (ls *LState) RawSetInt(tb *LTable, key int, value LValue) {
 }
 
 func (ls *LState) SetField(obj LValue, key string, value LValue) {
-	_ = ls.setFieldString(obj, key, value, varinfoHint{})
+	_ = ls.setFieldString(obj, key, 0, value, varinfoHint{})
 }
 
 func (ls *LState) SetTable(obj LValue, key LValue, value LValue) {

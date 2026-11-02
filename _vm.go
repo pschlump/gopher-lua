@@ -585,7 +585,13 @@ func init() {
 			C := int(inst>>24) & 0xff //GETC
 			t := cf.Fn.Upvalues[B].Value()
 			k := cf.Fn.Proto.Constants[C]
-			v, st := L.getFieldString(t, string(k.(LString)), upvalHint(cf, B))
+			// P3: the constant's hash rides the proto's side table
+			// (0 for a hand-built proto → hashed inside)
+			h := uint32(0)
+			if ch := cf.Fn.Proto.strConstHash; ch != nil {
+				h = ch[C]
+			}
+			v, st := L.getFieldString(t, string(k.(LString)), h, upvalHint(cf, B))
 			if st != mmSync {
 				return mmSignal(st)
 			}
@@ -630,7 +636,11 @@ func init() {
 			RA := lbase + A
 			B := int(inst>>16) & 0xff  //GETB
 			C := int(inst>>24) & 0xff //GETC
-			v, st := L.getFieldString(reg.Get(lbase+B), string(cf.Fn.Proto.Constants[C].(LString)), regHint(cf, B))
+			h := uint32(0)
+			if ch := cf.Fn.Proto.strConstHash; ch != nil {
+				h = ch[C]
+			}
+			v, st := L.getFieldString(reg.Get(lbase+B), string(cf.Fn.Proto.Constants[C].(LString)), h, regHint(cf, B))
 			if st != mmSync {
 				return mmSignal(st)
 			}
@@ -647,13 +657,17 @@ func init() {
 			k := int(inst>>15) & 1    //GETK
 			t := cf.Fn.Upvalues[A].Value()
 			key := string(cf.Fn.Proto.Constants[B].(LString))
+			h := uint32(0)
+			if ch := cf.Fn.Proto.strConstHash; ch != nil {
+				h = ch[B]
+			}
 			var v LValue
 			if k != 0 {
 				v = cf.Fn.Proto.Constants[C]
 			} else {
 				v = reg.Get(lbase + C)
 			}
-			if st := L.setFieldString(t, key, v, upvalHint(cf, A)); st != mmSync {
+			if st := L.setFieldString(t, key, h, v, upvalHint(cf, A)); st != mmSync {
 				return mmSignal(st)
 			}
 			return 0
@@ -708,13 +722,17 @@ func init() {
 			C := int(inst>>24) & 0xff //GETC
 			k := int(inst>>15) & 1    //GETK
 			key := string(cf.Fn.Proto.Constants[B].(LString))
+			h := uint32(0)
+			if ch := cf.Fn.Proto.strConstHash; ch != nil {
+				h = ch[B]
+			}
 			var v LValue
 			if k != 0 {
 				v = cf.Fn.Proto.Constants[C]
 			} else {
 				v = reg.Get(lbase + C)
 			}
-			if st := L.setFieldString(reg.Get(RA), key, v, regHint(cf, A)); st != mmSync {
+			if st := L.setFieldString(reg.Get(RA), key, h, v, regHint(cf, A)); st != mmSync {
 				return mmSignal(st)
 			}
 			return 0
@@ -760,7 +778,11 @@ func init() {
 			// own body); vmFinishMM's SELF arm then only stages the
 			// __index result at RA
 			// +inline-call reg.Set RA+1 selfobj
-			v, st := L.getFieldString(selfobj, string(cf.Fn.Proto.Constants[C].(LString)), regHint(cf, B))
+			h := uint32(0)
+			if ch := cf.Fn.Proto.strConstHash; ch != nil {
+				h = ch[C]
+			}
+			v, st := L.getFieldString(selfobj, string(cf.Fn.Proto.Constants[C].(LString)), h, regHint(cf, B))
 			if st != mmSync {
 				return mmSignal(st)
 			}

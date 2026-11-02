@@ -85,18 +85,18 @@ the `lua` CLI re-`loadfile`ing per run — the best its CLI can do,
 since it has no pooling surface; the gopher-lua leg is the daemon
 posture (pooled VM, live cancelable context):
 
-| script (shape)                      | C Lua 5.5.1 | gopher-lua | ×C    |
-|-------------------------------------|-------------|------------|-------|
-| h_tiny (startup only)               | 14.0 µs     | **1.8 µs** | **0.13×** |
-| h_concat (concat-heavy)             | 620 µs      | **470 µs** | **0.76×** |
-| h_str (short string ops)            | 36 µs       | 57 µs      | 1.6×  |
-| h_tablechurn (table alloc churn)    | 3.9 ms      | 7.4 ms     | 1.9×  |
-| h_strlong (150 KB text processing)  | 387 µs      | 1.0 ms     | 2.6×  |
-| h_tco (tail-recursive countdown)    | 1.6 ms      | 8.9 ms     | 5.5×  |
-| h_fib(30) (call-heavy recursion)    | 20.2 ms     | 119 ms     | 5.9×  |
-| h_callret (call-heavy)              | 2.4 ms      | 15.0 ms    | 6.2×  |
-| h_nsieve (numeric + table stores)   | 6.0 ms      | 58 ms      | 9.7×  |
-| h_numloop (4 M-iteration numeric)   | 8.5 ms      | 99 ms      | 11.7× |
+| script (shape)                     | C Lua 5.5.1 | gopher-lua | ×C        |
+|------------------------------------|-------------|------------|-----------|
+| h_tiny (startup only)              | 14.0 µs     | **1.8 µs** | **0.13×** |
+| h_concat (concat-heavy)            | 620 µs      | **470 µs** | **0.76×** |
+| h_str (short string ops)           | 36 µs       | 57 µs      | 1.6×      |
+| h_tablechurn (table alloc churn)   | 3.9 ms      | 7.4 ms     | 1.9×      |
+| h_strlong (150 KB text processing) | 387 µs      | 1.0 ms     | 2.6×      |
+| h_tco (tail-recursive countdown)   | 1.6 ms      | 8.9 ms     | 5.5×      |
+| h_fib(30) (call-heavy recursion)   | 20.2 ms     | 119 ms     | 5.9×      |
+| h_callret (call-heavy)             | 2.4 ms      | 15.0 ms    | 6.2×      |
+| h_nsieve (numeric + table stores)  | 6.0 ms      | 58 ms      | 9.7×      |
+| h_numloop (4 M-iteration numeric)  | 8.5 ms      | 99 ms      | 11.7×     |
 
 The shape is the story. Where the work is setup-shaped (compile a
 small script, run it, return) a pooled gopher-lua VM **beats the C
@@ -115,15 +115,15 @@ call — and races it against `host/` over the same scripts with
 byte-identical staged arguments and cross-checked results (zero
 mismatches across the suite):
 
-| script (short EVAL-shape) | C, state reuse | C, fresh state | gopher-lua, fresh VM | gopher-lua, pooled VM | pooled ×C |
-|--------------------------|----------------|----------------|----------------------|-----------------------|-----------|
-| e_arg (arg arithmetic)       | 0.3 µs  | 15.8 µs | 14.0 µs  | 2.7 µs  | 8.0×  |
-| e_sum (KEYS aggregation)     | 0.8 µs  | 18.0 µs | 16.0 µs  | 4.7 µs  | 6.2×  |
-| e_tag (reply array build)    | 1.3 µs  | 18.8 µs | 17.0 µs  | 5.3 µs  | 4.0×  |
-| e_norm (string normalize)    | 0.5 µs  | 17.1 µs | 18.9 µs  | 7.1 µs  | 15.4× |
-| e_hash (40-field hash loop)  | 6.1 µs  | 24.9 µs | 23.6 µs  | 11.7 µs | 1.9×  |
-| e_call (200 Go-fn crossings) | 16.1 µs | 42.0 µs | 50.3 µs  | 42.0 µs | 2.6×  |
-| e_sort (500-element sort)    | 45.2 µs | 62.5 µs | 143.5 µs | 132.8 µs| 2.9×  |
+| script (short EVAL-shape)    | C, state reuse | C, fresh state | gopher-lua, fresh VM | gopher-lua, pooled VM | pooled ×C |
+|------------------------------|----------------|----------------|----------------------|-----------------------|-----------|
+| e_arg (arg arithmetic)       | 0.3 µs         | 15.8 µs        | 14.0 µs              | 2.7 µs                | 8.0×      |
+| e_sum (KEYS aggregation)     | 0.8 µs         | 18.0 µs        | 16.0 µs              | 4.7 µs                | 6.2×      |
+| e_tag (reply array build)    | 1.3 µs         | 18.8 µs        | 17.0 µs              | 5.3 µs                | 4.0×      |
+| e_norm (string normalize)    | 0.5 µs         | 17.1 µs        | 18.9 µs              | 7.1 µs                | 15.4×     |
+| e_hash (40-field hash loop)  | 6.1 µs         | 24.9 µs        | 23.6 µs              | 11.7 µs               | 1.9×      |
+| e_call (200 Go-fn crossings) | 16.1 µs        | 42.0 µs        | 50.3 µs              | 42.0 µs               | 2.6×      |
+| e_sort (500-element sort)    | 45.2 µs        | 62.5 µs        | 143.5 µs             | 132.8 µs              | 2.9×      |
 
 Reading it:
 
@@ -147,10 +147,10 @@ Reading it:
 Peak process RSS over the same embedded suite (one Lua state / VM in
 the loop):
 
-| posture              | C Lua 5.5.1 | gopher-lua |
-|----------------------|-------------|------------|
-| one-shot process     | 2.0–2.1 MB  | 7.3–7.5 MB |
-| warm loop            | 2.1–2.4 MB  | 8.1–8.8 MB |
+| posture              | C Lua 5.5.1     | gopher-lua      |
+|----------------------|-----------------|-----------------|
+| one-shot process     | 2.0–2.1 MB      | 7.3–7.5 MB      |
+| warm loop            | 2.1–2.4 MB      | 8.1–8.8 MB      |
 | live heap after loop | ~20 KB Lua heap | ~0.5 MB Go heap |
 
 Allocation *rate* is a separate axis the P7 milestone cut: a pooled

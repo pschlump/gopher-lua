@@ -181,7 +181,7 @@ its own baseline, every step benchstat-gated and byte-exactness-gated.
 ## Installation
 
 ```bash
-go get github.com/pschlump/gopher-lua@v0.0.7
+go get github.com/pschlump/gopher-lua@v0.0.8
 ```
 
 ## Usage
@@ -438,7 +438,7 @@ up rewriting.
 ## Standalone interpreter
 
 ```bash
-go install github.com/pschlump/gopher-lua/cmd/glua@v0.0.7
+go install github.com/pschlump/gopher-lua/cmd/glua@v0.0.8
 glua script.lua   # no args: REPL
 ```
 
